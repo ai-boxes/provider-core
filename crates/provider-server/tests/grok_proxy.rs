@@ -9,7 +9,8 @@ use axum::{
 };
 use futures_util::stream;
 use provider_core::ProxyService;
-use provider_grok::GrokProvider;
+use provider_grok::{GrokProvider, grok_models};
+use provider_runtime::ProviderRuntime;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -54,8 +55,15 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .with_state(captured.clone());
     let (upstream_url, upstream_server) = spawn(upstream).await;
 
-    let provider = GrokProvider::for_test("mock-token", format!("{upstream_url}/v1"));
-    let service = ProxyService::new(Arc::new(provider));
+    let runtime = ProviderRuntime::new("grok", grok_models().to_vec());
+    runtime
+        .register(Arc::new(GrokProvider::for_test(
+            "mock-token",
+            format!("{upstream_url}/v1"),
+        )))
+        .await
+        .expect("register Grok account");
+    let service = ProxyService::new(Arc::new(runtime.clone()));
     let (server_url, server) = spawn(provider_server::router(service)).await;
     let client = reqwest::Client::new();
 
@@ -100,6 +108,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     assert_eq!(captured[0]["stream"], true);
     assert_eq!(captured[1]["input"][0]["role"], "user");
 
+    runtime.shutdown();
     server.abort();
     upstream_server.abort();
 }

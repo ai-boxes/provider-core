@@ -13,6 +13,8 @@ axum.workspace = true
 bytes.workspace = true
 provider-core.workspace = true
 provider-grok.workspace = true
+provider-runtime.workspace = true
+provider-storage.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

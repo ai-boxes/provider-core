@@ -26,6 +26,7 @@ pub enum ProviderErrorKind {
 pub struct ProviderError {
     kind: ProviderErrorKind,
     message: String,
+    upstream_status: Option<u16>,
 }
 
 impl ProviderError {
@@ -34,7 +35,14 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
+            upstream_status: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_upstream_status(mut self, status: u16) -> Self {
+        self.upstream_status = Some(status);
+        self
     }
 
     #[must_use]
@@ -45,6 +53,11 @@ impl ProviderError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    #[must_use]
+    pub const fn upstream_status(&self) -> Option<u16> {
+        self.upstream_status
     }
 }
 

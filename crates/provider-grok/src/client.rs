@@ -15,26 +15,32 @@ const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 /// HTTP client for the Grok CLI Responses upstream.
 #[derive(Clone)]
 pub struct GrokClient {
-    credentials: GrokCredentials,
     http: reqwest::Client,
     base_url: String,
 }
 
+impl Default for GrokClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrokClient {
     #[must_use]
-    pub fn new(credentials: GrokCredentials) -> Self {
-        Self::with_base_url(credentials, DEFAULT_BASE_URL)
+    pub fn new() -> Self {
+        Self::with_base_url(DEFAULT_BASE_URL)
     }
 
     pub async fn execute_stream(
         &self,
+        credentials: &GrokCredentials,
         payload: bytes::Bytes,
         metadata: &RequestMetadata,
     ) -> Result<ProviderStream, ProviderError> {
         let mut request = self
             .http
             .post(format!("{}/responses", self.base_url))
-            .bearer_auth(self.credentials.access_token().expose_secret())
+            .bearer_auth(credentials.access_token().expose_secret())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CONNECTION, "Keep-Alive")
@@ -77,9 +83,8 @@ impl GrokClient {
         Ok(Box::pin(stream))
     }
 
-    pub(crate) fn with_base_url(credentials: GrokCredentials, base_url: impl Into<String>) -> Self {
+    pub(crate) fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            credentials,
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
@@ -96,6 +101,7 @@ fn status_error(status: StatusCode) -> ProviderError {
     };
 
     ProviderError::new(kind, format!("Grok upstream returned HTTP {status}"))
+        .with_upstream_status(status.as_u16())
 }
 
 #[cfg(test)]
@@ -185,16 +191,14 @@ mod tests {
             .route("/v1/responses", post(streaming_handler))
             .with_state(capture.clone());
         let (base_url, server) = spawn_server(router).await;
-        let client = GrokClient::with_base_url(
-            GrokCredentials::from_access_token("upstream-token"),
-            base_url,
-        );
+        let client = GrokClient::with_base_url(base_url);
+        let credentials = GrokCredentials::from_access_token("upstream-token");
         let payload = Bytes::from_static(br#"{"model":"grok-4.5","stream":true}"#);
         let mut metadata = RequestMetadata::default();
         metadata.session_id = Some("session-1".to_owned());
 
         let chunks = client
-            .execute_stream(payload.clone(), &metadata)
+            .execute_stream(&credentials, payload.clone(), &metadata)
             .await
             .expect("stream response")
             .collect::<Vec<_>>()
@@ -226,13 +230,15 @@ mod tests {
     async fn maps_unauthorized_status_without_response_body() {
         let router = Router::new().route("/v1/responses", post(unauthorized_handler));
         let (base_url, server) = spawn_server(router).await;
-        let client = GrokClient::with_base_url(
-            GrokCredentials::from_access_token("upstream-token"),
-            base_url,
-        );
+        let client = GrokClient::with_base_url(base_url);
+        let credentials = GrokCredentials::from_access_token("upstream-token");
 
         let error = match client
-            .execute_stream(Bytes::from_static(b"{}"), &RequestMetadata::default())
+            .execute_stream(
+                &credentials,
+                Bytes::from_static(b"{}"),
+                &RequestMetadata::default(),
+            )
             .await
         {
             Ok(_) => panic!("expected unauthorized response"),

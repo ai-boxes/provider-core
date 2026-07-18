@@ -1,24 +1,32 @@
-use std::{fs::File, io::Read, path::Path};
+use std::fmt;
+
+#[cfg(test)]
+use std::io::Read;
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde_json::{Map, Value};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-/// Validated credentials loaded from a CLIProxyAPI xAI auth file.
-#[derive(Clone, Debug)]
+use crate::refresh::RefreshedGrokTokens;
+
+/// Validated credentials for one Grok provider account.
+#[derive(Clone)]
 pub struct GrokCredentials {
+    document: Map<String, Value>,
     access_token: SecretString,
+    refresh_token: Option<SecretString>,
+    token_endpoint: Option<String>,
 }
 
 impl GrokCredentials {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, GrokAuthError> {
-        let path = path.as_ref();
-        let file = File::open(path).map_err(|source| GrokAuthError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        Self::from_reader(file)
+    pub fn from_json(credential_json: &SecretString) -> Result<Self, GrokAuthError> {
+        let document: Value = serde_json::from_str(credential_json.expose_secret())?;
+        let document = document
+            .as_object()
+            .cloned()
+            .ok_or(GrokAuthError::NotObject)?;
+        Self::from_document(document)
     }
 
     #[must_use]
@@ -26,56 +34,164 @@ impl GrokCredentials {
         &self.access_token
     }
 
+    #[must_use]
+    pub(crate) fn refresh_token(&self) -> Option<&SecretString> {
+        self.refresh_token.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn token_endpoint(&self) -> Option<&str> {
+        self.token_endpoint.as_deref()
+    }
+
+    pub(crate) fn refreshed(
+        &self,
+        tokens: &RefreshedGrokTokens,
+        refreshed_at: i64,
+    ) -> Result<(Self, i64), GrokAuthError> {
+        let expires_in = i64::from(tokens.expires_in);
+        let expires_at = refreshed_at
+            .checked_add(expires_in)
+            .ok_or(GrokAuthError::TimestampOutOfRange)?;
+        let expired = timestamp_rfc3339(expires_at)?;
+        let last_refresh = timestamp_rfc3339(refreshed_at)?;
+        let mut document = self.document.clone();
+
+        document.insert("type".to_owned(), Value::String("xai".to_owned()));
+        document.insert("auth_kind".to_owned(), Value::String("oauth".to_owned()));
+        document.insert(
+            "access_token".to_owned(),
+            Value::String(tokens.access_token.expose_secret().to_owned()),
+        );
+        if let Some(refresh_token) = tokens.refresh_token.as_ref() {
+            document.insert(
+                "refresh_token".to_owned(),
+                Value::String(refresh_token.expose_secret().to_owned()),
+            );
+        }
+        if let Some(id_token) = tokens.id_token.as_ref() {
+            document.insert(
+                "id_token".to_owned(),
+                Value::String(id_token.expose_secret().to_owned()),
+            );
+        }
+        if let Some(token_type) = tokens.token_type.as_ref() {
+            document.insert("token_type".to_owned(), Value::String(token_type.clone()));
+        }
+        document.insert("expires_in".to_owned(), Value::from(tokens.expires_in));
+        document.insert("expired".to_owned(), Value::String(expired));
+        document.insert("last_refresh".to_owned(), Value::String(last_refresh));
+        document.insert("disabled".to_owned(), Value::Bool(false));
+
+        Ok((Self::from_document(document)?, expires_at))
+    }
+
+    pub(crate) fn to_json(&self) -> Result<SecretString, GrokAuthError> {
+        serde_json::to_string(&Value::Object(self.document.clone()))
+            .map(SecretString::from)
+            .map_err(GrokAuthError::Json)
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn from_access_token(access_token: impl Into<String>) -> Self {
-        Self {
-            access_token: SecretString::from(access_token.into()),
+        let access_token = access_token.into();
+        let mut document = Map::new();
+        document.insert("type".to_owned(), Value::String("xai".to_owned()));
+        document.insert("auth_kind".to_owned(), Value::String("oauth".to_owned()));
+        document.insert("access_token".to_owned(), Value::String(access_token));
+        document.insert("disabled".to_owned(), Value::Bool(false));
+        match Self::from_document(document) {
+            Ok(credentials) => credentials,
+            Err(_) => unreachable!("test credential must be valid"),
         }
     }
 
-    fn from_reader(reader: impl Read) -> Result<Self, GrokAuthError> {
-        let stored: StoredGrokCredentials = serde_json::from_reader(reader)?;
+    #[cfg(test)]
+    fn from_reader(mut reader: impl Read) -> Result<Self, GrokAuthError> {
+        let mut credential_json = String::new();
+        reader.read_to_string(&mut credential_json)?;
+        Self::from_json(&SecretString::from(credential_json))
+    }
 
-        if !stored.provider_type.trim().eq_ignore_ascii_case("xai") {
+    fn from_document(document: Map<String, Value>) -> Result<Self, GrokAuthError> {
+        if !string_field(&document, "type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("xai"))
+        {
             return Err(GrokAuthError::InvalidProviderType);
         }
-        if !stored.auth_kind.trim().eq_ignore_ascii_case("oauth") {
+        if !string_field(&document, "auth_kind")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("oauth"))
+        {
             return Err(GrokAuthError::InvalidAuthKind);
         }
-        if stored.disabled {
+        if document
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or_default()
+        {
             return Err(GrokAuthError::Disabled);
         }
-        if stored.access_token.expose_secret().trim().is_empty() {
-            return Err(GrokAuthError::MissingAccessToken);
-        }
+        let access_token =
+            required_secret(&document, "access_token").ok_or(GrokAuthError::MissingAccessToken)?;
+        let refresh_token = optional_secret(&document, "refresh_token");
+        let token_endpoint = string_field(&document, "token_endpoint")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
 
         Ok(Self {
-            access_token: stored.access_token,
+            document,
+            access_token,
+            refresh_token,
+            token_endpoint,
         })
     }
 }
 
-#[derive(Deserialize)]
-struct StoredGrokCredentials {
-    #[serde(rename = "type")]
-    provider_type: String,
-    auth_kind: String,
-    #[serde(default)]
-    access_token: SecretString,
-    #[serde(default)]
-    disabled: bool,
+impl fmt::Debug for GrokCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrokCredentials")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_endpoint", &self.token_endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+fn string_field<'a>(document: &'a Map<String, Value>, field: &str) -> Option<&'a str> {
+    document.get(field).and_then(Value::as_str)
+}
+
+fn required_secret(document: &Map<String, Value>, field: &str) -> Option<SecretString> {
+    optional_secret(document, field).filter(|value| !value.expose_secret().trim().is_empty())
+}
+
+fn optional_secret(document: &Map<String, Value>, field: &str) -> Option<SecretString> {
+    string_field(document, field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| SecretString::from(value.to_owned()))
+}
+
+fn timestamp_rfc3339(timestamp: i64) -> Result<String, GrokAuthError> {
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .map_err(|_| GrokAuthError::TimestampOutOfRange)?
+        .format(&Rfc3339)
+        .map_err(|_| GrokAuthError::TimestampOutOfRange)
 }
 
 #[derive(Debug, Error)]
 pub enum GrokAuthError {
-    #[error("failed to open Grok auth file {path}: {source}")]
-    Open {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("failed to read Grok auth JSON: {0}")]
+    Read(#[from] std::io::Error),
     #[error("failed to parse Grok auth JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Grok auth JSON must be an object")]
+    NotObject,
     #[error("Grok auth JSON must have type xai")]
     InvalidProviderType,
     #[error("Grok auth JSON must have auth_kind oauth")]
@@ -84,6 +200,12 @@ pub enum GrokAuthError {
     Disabled,
     #[error("Grok auth JSON is missing access_token")]
     MissingAccessToken,
+    #[error("stored provider account is not a Grok account")]
+    InvalidStoredProvider,
+    #[error("unsupported Grok credential format version {0}")]
+    UnsupportedCredentialFormat(u32),
+    #[error("Grok credential timestamp is out of range")]
+    TimestampOutOfRange,
 }
 
 #[cfg(test)]

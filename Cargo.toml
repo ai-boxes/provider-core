@@ -2,6 +2,8 @@
 members = [
     "crates/provider-core",
     "crates/provider-grok",
+    "crates/provider-runtime",
+    "crates/provider-storage",
     "crates/provider-server",
 ]
 default-members = ["crates/provider-server"]
@@ -20,13 +22,18 @@ futures-core = "0.3.32"
 futures-util = "0.3.32"
 provider-core = { path = "crates/provider-core" }
 provider-grok = { path = "crates/provider-grok" }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "stream"] }
+provider-runtime = { path = "crates/provider-runtime" }
+provider-storage = { path = "crates/provider-storage" }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "stream", "form"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 thiserror = "2.0.18"
 tiktoken-rs = "0.12.0"
-tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "sync"] }
+time = { version = "0.3.53", default-features = false, features = ["formatting"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["rt", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
