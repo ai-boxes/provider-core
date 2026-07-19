@@ -7,20 +7,23 @@ use std::{
 
 use async_trait::async_trait;
 use provider_core::{
-    AccountAuthState, AccountId, AccountRepository, AccountRuntimeState, CredentialUpdate,
-    CredentialWriteOutcome, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
-    ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
-    RefreshTrigger, StoredProviderAccount, TokenCounter, WireFormat,
+    AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
+    CredentialKind, CredentialUpdate, CredentialWriteOutcome, ManagedProviderDriver, NewCredential,
+    NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
+    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
+    ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
+    StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
 };
 
 use super::{
     client::GrokClient,
     credentials::{GrokAuthError, GrokCredentials},
-    models::grok_models,
-    refresh::GrokRefreshClient,
+    models::{GrokModelClient, grok_models},
+    oauth::GrokOAuthClient,
+    refresh::{GrokRefreshClient, validate_token_endpoint},
     request::prepare_request,
-    token_count::Cl100kTokenCounter,
 };
+use crate::token_count::Cl100kTokenCounter;
 
 const GROK_CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const REFRESH_LEAD_SECONDS: i64 = 5 * 60;
@@ -30,6 +33,8 @@ const PERSISTENCE_RETRY_SECONDS: i64 = 30;
 pub struct GrokDriver {
     client: GrokClient,
     refresh_client: GrokRefreshClient,
+    model_client: GrokModelClient,
+    oauth_client: GrokOAuthClient,
     token_counter: Cl100kTokenCounter,
 }
 
@@ -65,6 +70,8 @@ impl GrokDriver {
         Self {
             client: GrokClient::new(),
             refresh_client: GrokRefreshClient::new(),
+            model_client: GrokModelClient::new(),
+            oauth_client: GrokOAuthClient::new(),
             token_counter: Cl100kTokenCounter,
         }
     }
@@ -85,6 +92,8 @@ impl GrokDriver {
         Arc::new(Self {
             client: GrokClient::with_base_url(base_url),
             refresh_client: GrokRefreshClient::new(),
+            model_client: GrokModelClient::for_test(),
+            oauth_client: GrokOAuthClient::for_test("http://127.0.0.1/unused"),
             token_counter: Cl100kTokenCounter,
         })
     }
@@ -142,13 +151,109 @@ impl ProviderDriver for GrokDriver {
     }
 }
 
+#[async_trait]
+impl ManagedProviderDriver for GrokDriver {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Grok
+    }
+
+    fn prepare_account(
+        &self,
+        input: AccountProvisioningInput,
+    ) -> Result<NewProviderAccount, ProviderConfigurationError> {
+        let AccountProvisioningInput::CredentialJson {
+            id,
+            label,
+            credential_json,
+        } = input
+        else {
+            return Err(ProviderConfigurationError::new(
+                "Grok accounts require OAuth credential JSON",
+            ));
+        };
+        let label = label.trim().to_owned();
+        if label.is_empty() {
+            return Err(ProviderConfigurationError::new(
+                "Grok account label must not be empty",
+            ));
+        }
+        let credentials = GrokCredentials::from_json(&credential_json)
+            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
+        if credentials.refresh_token().is_none() {
+            return Err(ProviderConfigurationError::new(
+                "Grok credential is missing refresh_token",
+            ));
+        }
+        let token_endpoint = credentials.token_endpoint().ok_or_else(|| {
+            ProviderConfigurationError::new("Grok credential is missing token_endpoint")
+        })?;
+        validate_token_endpoint(token_endpoint, false)
+            .map_err(|error| ProviderConfigurationError::new(error.message()))?;
+        let expires_at = credentials
+            .expires_at()
+            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
+        let last_refreshed_at = credentials
+            .last_refreshed_at()
+            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
+
+        Ok(NewProviderAccount {
+            id,
+            provider: ProviderKind::Grok,
+            label,
+            config_json: "{}".to_owned(),
+            enabled: true,
+            credential: NewCredential {
+                kind: CredentialKind::Oauth,
+                format_version: GROK_CREDENTIAL_FORMAT_VERSION,
+                credential_json,
+                expires_at,
+                last_refreshed_at,
+            },
+        })
+    }
+
+    fn build_account(
+        self: Arc<Self>,
+        account: StoredProviderAccount,
+        repository: Arc<dyn AccountRepository>,
+    ) -> Result<Arc<dyn ProviderAccount>, ProviderConfigurationError> {
+        GrokAccount::from_stored(self, account, repository)
+            .map(|account| Arc::new(account) as Arc<dyn ProviderAccount>)
+            .map_err(|error| ProviderConfigurationError::new(error.to_string()))
+    }
+
+    fn prepare_account_update(
+        &self,
+        mut update: ProviderAccountUpdate,
+    ) -> Result<ProviderAccountUpdate, ProviderConfigurationError> {
+        update.label = update.label.trim().to_owned();
+        if update.label.is_empty() {
+            return Err(ProviderConfigurationError::new(
+                "Grok account label must not be empty",
+            ));
+        }
+        if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&update.config_json)
+            .is_err()
+        {
+            return Err(ProviderConfigurationError::new(
+                "Grok configuration must be a JSON object",
+            ));
+        }
+        Ok(update)
+    }
+
+    async fn start_oauth(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
+        self.oauth_client.start().await
+    }
+}
+
 impl GrokAccount {
     fn from_stored(
         driver: Arc<GrokDriver>,
         account: StoredProviderAccount,
         repository: Arc<dyn AccountRepository>,
     ) -> Result<Self, GrokAuthError> {
-        if account.provider.trim() != "grok" {
+        if account.provider != ProviderKind::Grok {
             return Err(GrokAuthError::InvalidStoredProvider);
         }
         if account.credential.format_version != GROK_CREDENTIAL_FORMAT_VERSION {
@@ -296,6 +401,18 @@ impl ProviderAccount for GrokAccount {
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
         self.driver.count_tokens(request)
     }
+
+    async fn discover_models(
+        &self,
+    ) -> Result<Vec<provider_core::DiscoveredProviderModel>, ProviderError> {
+        let credentials = self.snapshot();
+        self.driver.model_client.discover(&credentials).await
+    }
+
+    fn fallback_models(&self) -> &[ProviderModel] {
+        self.driver.models()
+    }
+
     async fn refresh_credentials(
         &self,
         _trigger: RefreshTrigger,
@@ -349,6 +466,7 @@ impl ProviderAccount for GrokAccount {
         })?;
         let update = CredentialUpdate {
             expected_revision: current.revision,
+            kind: CredentialKind::Oauth,
             format_version: current.format_version,
             credential_json,
             expires_at: Some(expires_at),

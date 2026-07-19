@@ -1,29 +1,17 @@
 [package]
-name = "provider-drivers"
+name = "provider-management"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[features]
-test-util = []
-
 [dependencies]
-async-trait.workspace = true
-bytes.workspace = true
-futures-util.workspace = true
 provider-core.workspace = true
-reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tiktoken-rs.workspace = true
-time.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-axum.workspace = true
-tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

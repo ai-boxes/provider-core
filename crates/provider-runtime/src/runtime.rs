@@ -1,7 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    hash::{DefaultHasher, Hash, Hasher},
-    sync::{Arc, Weak},
+    collections::{BTreeMap, HashMap, hash_map::RandomState},
+    hash::{BuildHasher, DefaultHasher, Hash, Hasher},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -31,6 +34,8 @@ pub struct ProviderRuntime {
 struct RuntimeInner {
     driver: Arc<dyn ProviderDriver>,
     accounts: RwLock<BTreeMap<AccountId, Arc<AccountEntry>>>,
+    selection_state: RandomState,
+    selection_counter: AtomicU64,
     refresh_limit: Arc<Semaphore>,
     scheduler_tx: mpsc::UnboundedSender<SchedulerCommand>,
     cancellation: CancellationToken,
@@ -65,6 +70,8 @@ impl ProviderRuntime {
         let inner = Arc::new(RuntimeInner {
             driver,
             accounts: RwLock::new(BTreeMap::new()),
+            selection_state: RandomState::new(),
+            selection_counter: AtomicU64::new(0),
             refresh_limit: Arc::new(Semaphore::new(DEFAULT_REFRESH_CONCURRENCY)),
             scheduler_tx,
             cancellation: cancellation.clone(),
@@ -132,6 +139,37 @@ impl ProviderRuntime {
         self.inner.cancellation.cancel();
     }
 
+    #[must_use]
+    pub fn provider_name(&self) -> &'static str {
+        self.inner.driver.name()
+    }
+
+    #[must_use]
+    pub fn native_format(&self) -> WireFormat {
+        self.inner.driver.native_format()
+    }
+
+    pub async fn execute_stream_for(
+        &self,
+        account_id: &AccountId,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let entry = self.request_account(account_id).await?;
+        self.execute_entry(entry, request).await
+    }
+
+    pub async fn count_tokens_for(
+        &self,
+        account_id: &AccountId,
+        request: ProviderRequest,
+    ) -> Result<u64, ProviderError> {
+        self.request_account(account_id)
+            .await?
+            .account
+            .count_tokens(request)
+            .await
+    }
+
     async fn selected_account(&self) -> Result<Arc<AccountEntry>, ProviderError> {
         let accounts = self.inner.accounts.read().await;
         let available: Vec<_> = accounts
@@ -140,16 +178,58 @@ impl ProviderRuntime {
             .cloned()
             .collect();
 
-        match available.as_slice() {
-            [account] => Ok(account.clone()),
-            [] => Err(ProviderError::new(
+        if available.is_empty() {
+            return Err(ProviderError::new(
                 ProviderErrorKind::Authentication,
                 "no active provider account is available",
-            )),
-            _ => Err(ProviderError::new(
+            ));
+        }
+        let index = random_index(
+            &self.inner.selection_state,
+            &self.inner.selection_counter,
+            available.len(),
+        );
+        Ok(available[index].clone())
+    }
+
+    async fn request_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Arc<AccountEntry>, ProviderError> {
+        let entry = self.account_entry(account_id).await.ok_or_else(|| {
+            ProviderError::new(
                 ProviderErrorKind::Internal,
-                "multiple active provider accounts require a selection policy",
-            )),
+                "provider account is not registered",
+            )
+        })?;
+        if !entry.account.runtime_state().available_for_requests() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "provider account is not available",
+            ));
+        }
+        Ok(entry)
+    }
+
+    async fn execute_entry(
+        &self,
+        entry: Arc<AccountEntry>,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let generation = entry.account.runtime_state().generation;
+        let first_request = request.clone();
+
+        match entry.account.execute_stream(first_request).await {
+            Err(error) if error.upstream_status() == Some(401) => {
+                let account_id = entry.account.account_id().clone();
+                let refresh = self
+                    .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
+                    .await;
+                self.report_refresh_result(account_id, &refresh);
+                refresh.map_err(refresh_provider_error)?;
+                entry.account.execute_stream(request).await
+            }
+            result => result,
         }
     }
 
@@ -216,21 +296,7 @@ impl Provider for ProviderRuntime {
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.selected_account().await?;
-        let generation = entry.account.runtime_state().generation;
-        let first_request = request.clone();
-
-        match entry.account.execute_stream(first_request).await {
-            Err(error) if error.upstream_status() == Some(401) => {
-                let account_id = entry.account.account_id().clone();
-                let refresh = self
-                    .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
-                    .await;
-                self.report_refresh_result(account_id, &refresh);
-                refresh.map_err(refresh_provider_error)?;
-                entry.account.execute_stream(request).await
-            }
-            result => result,
-        }
+        self.execute_entry(entry, request).await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
@@ -240,6 +306,11 @@ impl Provider for ProviderRuntime {
             .count_tokens(request)
             .await
     }
+}
+
+fn random_index(state: &RandomState, counter: &AtomicU64, length: usize) -> usize {
+    let value = counter.fetch_add(1, Ordering::Relaxed);
+    usize::try_from(state.hash_one(value)).unwrap_or_default() % length
 }
 
 fn refresh_provider_error(error: RefreshError) -> ProviderError {

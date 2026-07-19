@@ -136,9 +136,23 @@ impl GrokRefreshClient {
     }
 }
 
-fn validate_token_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), RefreshError> {
+pub(crate) fn validate_token_endpoint(
+    endpoint: &str,
+    allow_insecure: bool,
+) -> Result<(), RefreshError> {
+    validate_oauth_endpoint(endpoint, "token_endpoint", allow_insecure)
+}
+
+pub(crate) fn validate_oauth_endpoint(
+    endpoint: &str,
+    field: &str,
+    allow_insecure: bool,
+) -> Result<(), RefreshError> {
     let endpoint = reqwest::Url::parse(endpoint).map_err(|_| {
-        RefreshError::new(RefreshErrorKind::Internal, "Grok token_endpoint is invalid")
+        RefreshError::new(
+            RefreshErrorKind::Internal,
+            format!("Grok OAuth {field} is invalid"),
+        )
     })?;
     let host = endpoint.host_str().unwrap_or_default().to_ascii_lowercase();
     let secure_xai = endpoint.scheme() == "https" && (host == "x.ai" || host.ends_with(".x.ai"));
@@ -148,7 +162,7 @@ fn validate_token_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), R
     if !secure_xai && !local_test {
         return Err(RefreshError::new(
             RefreshErrorKind::Internal,
-            "Grok token_endpoint must use HTTPS on an x.ai host",
+            format!("Grok OAuth {field} must use HTTPS on an x.ai host"),
         ));
     }
     Ok(())

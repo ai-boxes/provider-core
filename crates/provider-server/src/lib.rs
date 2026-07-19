@@ -5,6 +5,7 @@
 mod app;
 mod config;
 mod http;
+mod management_http;
 
 pub use app::run;
-pub use http::router;
+pub use http::{router, router_with_management};

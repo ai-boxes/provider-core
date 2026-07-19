@@ -2,8 +2,11 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use provider_core::{
-    AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialUpdate,
-    CredentialWriteOutcome, StoredCredential, StoredProviderAccount,
+    AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
+    CredentialUpdate, CredentialWriteOutcome, DiscoveredProviderModel, NewProviderAccount,
+    ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
+    ProviderManagementRepository, ProviderModelOverride, StoredCredential, StoredProviderAccount,
+    StoredProviderModel,
 };
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{
@@ -46,8 +49,9 @@ impl SqliteAccountRepository {
         Ok(Self { pool })
     }
 
-    #[cfg(test)]
-    async fn in_memory() -> Result<Self, AccountRepositoryError> {
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn in_memory() -> Result<Self, AccountRepositoryError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -72,12 +76,14 @@ impl AccountRepository for SqliteAccountRepository {
                 a.id,
                 a.provider,
                 a.label,
+                a.config_json,
                 a.enabled,
                 a.auth_state,
                 a.safe_error_code,
                 a.created_at,
                 a.updated_at,
                 c.revision,
+                c.credential_kind,
                 c.format_version,
                 c.credential_json,
                 c.expires_at,
@@ -118,6 +124,7 @@ impl AccountRepository for SqliteAccountRepository {
             UPDATE provider_credentials
             SET
                 revision = revision + 1,
+                credential_kind = ?,
                 format_version = ?,
                 credential_json = ?,
                 expires_at = ?,
@@ -126,6 +133,7 @@ impl AccountRepository for SqliteAccountRepository {
             WHERE account_id = ? AND revision = ?
             "#,
         )
+        .bind(update.kind.as_str())
         .bind(format_version)
         .bind(update.credential_json.expose_secret())
         .bind(update.expires_at)
@@ -198,6 +206,323 @@ impl AccountRepository for SqliteAccountRepository {
     }
 }
 
+#[async_trait]
+impl ProviderManagementRepository for SqliteAccountRepository {
+    async fn list_provider_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                a.id,
+                a.provider,
+                a.label,
+                a.config_json,
+                a.enabled,
+                a.auth_state,
+                a.safe_error_code,
+                a.created_at,
+                a.updated_at,
+                c.credential_kind
+            FROM provider_accounts AS a
+            INNER JOIN provider_credentials AS c ON c.account_id = a.id
+            ORDER BY a.created_at, a.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to list provider accounts", error))?;
+
+        rows.into_iter().map(account_summary).collect()
+    }
+
+    async fn load_provider_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<StoredProviderAccount>, AccountRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                a.id,
+                a.provider,
+                a.label,
+                a.config_json,
+                a.enabled,
+                a.auth_state,
+                a.safe_error_code,
+                a.created_at,
+                a.updated_at,
+                c.revision,
+                c.credential_kind,
+                c.format_version,
+                c.credential_json,
+                c.expires_at,
+                c.last_refreshed_at,
+                c.updated_at AS credential_updated_at
+            FROM provider_accounts AS a
+            LEFT JOIN provider_credentials AS c ON c.account_id = a.id
+            WHERE a.id = ?
+            "#,
+        )
+        .bind(account_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to load provider account", error))?;
+
+        row.map(stored_account).transpose()
+    }
+
+    async fn create_provider_account(
+        &self,
+        account: NewProviderAccount,
+    ) -> Result<ProviderAccountCreateOutcome, AccountRepositoryError> {
+        let format_version = i64::from(account.credential.format_version);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| repository_error("failed to start account transaction", error))?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+                (id, provider, label, config_json, enabled, auth_state)
+            VALUES (?, ?, ?, ?, ?, 'active')
+            ON CONFLICT(id) DO NOTHING
+            "#,
+        )
+        .bind(account.id.as_str())
+        .bind(account.provider.as_str())
+        .bind(account.label)
+        .bind(account.config_json)
+        .bind(database_bool(account.enabled))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to create provider account", error))?;
+
+        if inserted.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back duplicate account", error)
+            })?;
+            return Ok(ProviderAccountCreateOutcome::Conflict);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credentials
+                (account_id, credential_kind, revision, format_version, credential_json,
+                 expires_at, last_refreshed_at)
+            VALUES (?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(account.id.as_str())
+        .bind(account.credential.kind.as_str())
+        .bind(format_version)
+        .bind(account.credential.credential_json.expose_secret())
+        .bind(account.credential.expires_at)
+        .bind(account.credential.last_refreshed_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to create provider credential", error))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| repository_error("failed to commit provider account", error))?;
+        Ok(ProviderAccountCreateOutcome::Created)
+    }
+
+    async fn update_provider_account(
+        &self,
+        account_id: &AccountId,
+        update: ProviderAccountUpdate,
+    ) -> Result<bool, AccountRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET label = ?, config_json = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(update.label)
+        .bind(update.config_json)
+        .bind(update.updated_at)
+        .bind(account_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to update provider account", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_provider_account_enabled(
+        &self,
+        account_id: &AccountId,
+        enabled: bool,
+        updated_at: i64,
+    ) -> Result<bool, AccountRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET enabled = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(database_bool(enabled))
+        .bind(updated_at)
+        .bind(account_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to update provider account status", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_provider_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<bool, AccountRepositoryError> {
+        let result = sqlx::query("DELETE FROM provider_accounts WHERE id = ?")
+            .bind(account_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| repository_error("failed to delete provider account", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_provider_models(
+        &self,
+        account_id: Option<&AccountId>,
+    ) -> Result<Vec<StoredProviderModel>, AccountRepositoryError> {
+        let rows = if let Some(account_id) = account_id {
+            sqlx::query(
+                r#"
+                SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+                       last_seen_at, created_at, updated_at
+                FROM provider_models
+                WHERE account_id = ?
+                ORDER BY upstream_model
+                "#,
+            )
+            .bind(account_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+                       last_seen_at, created_at, updated_at
+                FROM provider_models
+                ORDER BY account_id, upstream_model
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| repository_error("failed to list provider models", error))?;
+
+        rows.into_iter().map(stored_model).collect()
+    }
+
+    async fn synchronize_provider_models(
+        &self,
+        account_id: &AccountId,
+        models: Vec<DiscoveredProviderModel>,
+        synced_at: i64,
+    ) -> Result<Vec<StoredProviderModel>, AccountRepositoryError> {
+        if models
+            .iter()
+            .any(|model| model.upstream_model.trim().is_empty())
+        {
+            return Err(AccountRepositoryError::new(
+                "discovered provider model must not be empty",
+            ));
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| repository_error("failed to start model transaction", error))?;
+        let account_exists = sqlx::query("SELECT 1 FROM provider_accounts WHERE id = ?")
+            .bind(account_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| repository_error("failed to verify provider account", error))?
+            .is_some();
+        if !account_exists {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back missing account model sync", error)
+            })?;
+            return Err(AccountRepositoryError::new(
+                "provider account was not found while synchronizing models",
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE provider_models SET available = 0, updated_at = ? WHERE account_id = ?",
+        )
+        .bind(synced_at)
+        .bind(account_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to mark provider models unavailable", error))?;
+
+        for model in models {
+            let upstream_model = model.upstream_model.trim();
+            sqlx::query(
+                r#"
+                INSERT INTO provider_models
+                    (account_id, upstream_model, enabled, available, routable, metadata_json,
+                     last_seen_at, updated_at)
+                VALUES (?, ?, 1, 1, ?, ?, ?, ?)
+                ON CONFLICT(account_id, upstream_model) DO UPDATE SET
+                    available = 1,
+                    routable = excluded.routable,
+                    metadata_json = excluded.metadata_json,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(account_id.as_str())
+            .bind(upstream_model)
+            .bind(database_bool(model.routable))
+            .bind(model.metadata_json)
+            .bind(synced_at)
+            .bind(synced_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| repository_error("failed to synchronize provider model", error))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| repository_error("failed to commit provider models", error))?;
+        self.list_provider_models(Some(account_id)).await
+    }
+
+    async fn update_provider_model(
+        &self,
+        account_id: &AccountId,
+        upstream_model: &str,
+        update: ProviderModelOverride,
+    ) -> Result<bool, AccountRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE provider_models
+            SET alias = ?, enabled = ?, updated_at = ?
+            WHERE account_id = ? AND upstream_model = ?
+            "#,
+        )
+        .bind(update.alias)
+        .bind(database_bool(update.enabled))
+        .bind(update.updated_at)
+        .bind(account_id.as_str())
+        .bind(upstream_model)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to update provider model", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
 fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountRepositoryError> {
     let id = row_value::<String>(&row, "id")?;
     let id = AccountId::new(id).map_err(|error| {
@@ -207,6 +532,14 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
     let auth_state = AccountAuthState::from_str(&auth_state).map_err(|error| {
         AccountRepositoryError::new(format!("invalid provider account auth state: {error}"))
     })?;
+    let provider = row_value::<String>(&row, "provider")?;
+    let provider = ProviderKind::from_str(&provider).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider account type: {error}"))
+    })?;
+    let credential_kind = required_joined_value::<String>(&row, "credential_kind", &id)?;
+    let credential_kind = CredentialKind::from_str(&credential_kind).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider credential type: {error}"))
+    })?;
     let revision = required_joined_value::<i64>(&row, "revision", &id)?;
     let format_version = required_joined_value::<i64>(&row, "format_version", &id)?;
     let credential_json = required_joined_value::<String>(&row, "credential_json", &id)?;
@@ -214,14 +547,16 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
 
     Ok(StoredProviderAccount {
         id,
-        provider: row_value(&row, "provider")?,
+        provider,
         label: row_value(&row, "label")?,
+        config_json: row_value(&row, "config_json")?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
         safe_error_code: row_value(&row, "safe_error_code")?,
         created_at: row_value(&row, "created_at")?,
         updated_at: row_value(&row, "updated_at")?,
         credential: StoredCredential {
+            kind: credential_kind,
             revision: non_negative_u64(revision, "credential revision")?,
             format_version: positive_u32(format_version, "credential format version")?,
             credential_json: SecretString::from(credential_json),
@@ -229,6 +564,57 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
             last_refreshed_at: row_value(&row, "last_refreshed_at")?,
             updated_at: credential_updated_at,
         },
+    })
+}
+
+fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepositoryError> {
+    let id = row_value::<String>(&row, "id")?;
+    let id = AccountId::new(id).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider account ID: {error}"))
+    })?;
+    let provider = row_value::<String>(&row, "provider")?;
+    let provider = ProviderKind::from_str(&provider).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider account type: {error}"))
+    })?;
+    let credential_kind = row_value::<String>(&row, "credential_kind")?;
+    let credential_kind = CredentialKind::from_str(&credential_kind).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider credential type: {error}"))
+    })?;
+    let auth_state = row_value::<String>(&row, "auth_state")?;
+    let auth_state = AccountAuthState::from_str(&auth_state).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider account auth state: {error}"))
+    })?;
+
+    Ok(ProviderAccountSummary {
+        id,
+        provider,
+        label: row_value(&row, "label")?,
+        config_json: row_value(&row, "config_json")?,
+        credential_kind,
+        enabled: row_value::<i64>(&row, "enabled")? != 0,
+        auth_state,
+        safe_error_code: row_value(&row, "safe_error_code")?,
+        created_at: row_value(&row, "created_at")?,
+        updated_at: row_value(&row, "updated_at")?,
+    })
+}
+
+fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepositoryError> {
+    let account_id = row_value::<String>(&row, "account_id")?;
+    let account_id = AccountId::new(account_id).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider account ID: {error}"))
+    })?;
+    Ok(StoredProviderModel {
+        account_id,
+        upstream_model: row_value(&row, "upstream_model")?,
+        alias: row_value(&row, "alias")?,
+        enabled: row_value::<i64>(&row, "enabled")? != 0,
+        available: row_value::<i64>(&row, "available")? != 0,
+        routable: row_value::<i64>(&row, "routable")? != 0,
+        metadata_json: row_value(&row, "metadata_json")?,
+        last_seen_at: row_value(&row, "last_seen_at")?,
+        created_at: row_value(&row, "created_at")?,
+        updated_at: row_value(&row, "updated_at")?,
     })
 }
 
@@ -274,6 +660,10 @@ fn positive_u32(value: i64, field: &str) -> Result<u32, AccountRepositoryError> 
 fn database_integer(value: u64, field: &str) -> Result<i64, AccountRepositoryError> {
     i64::try_from(value)
         .map_err(|_| AccountRepositoryError::new(format!("{field} is out of range")))
+}
+
+const fn database_bool(value: bool) -> i64 {
+    if value { 1 } else { 0 }
 }
 
 fn repository_error(operation: &str, error: impl std::fmt::Display) -> AccountRepositoryError {
@@ -366,6 +756,8 @@ mod tests {
             .expect("load accounts");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.as_str(), "grok-main");
+        assert_eq!(accounts[0].provider, ProviderKind::Grok);
+        assert_eq!(accounts[0].credential.kind, CredentialKind::Oauth);
         assert_eq!(accounts[0].credential.revision, 0);
         assert!(accounts[0].created_at > 0);
         assert!(accounts[0].updated_at > 0);
@@ -373,6 +765,7 @@ mod tests {
 
         let update = CredentialUpdate {
             expected_revision: 0,
+            kind: CredentialKind::Oauth,
             format_version: 1,
             credential_json: SecretString::from(r#"{"access_token":"new"}"#.to_owned()),
             expires_at: Some(200),
@@ -399,6 +792,121 @@ mod tests {
         assert_eq!(
             reloaded[0].credential.credential_json.expose_secret(),
             r#"{"access_token":"new"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_accounts_and_preserves_model_overrides_during_sync() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let account_id = AccountId::new("grok-models").expect("account ID");
+        let account = NewProviderAccount {
+            id: account_id.clone(),
+            provider: ProviderKind::Grok,
+            label: "Grok Models".to_owned(),
+            config_json: "{}".to_owned(),
+            enabled: true,
+            credential: provider_core::NewCredential {
+                kind: CredentialKind::Oauth,
+                format_version: 1,
+                credential_json: SecretString::from(
+                    r#"{"type":"xai","auth_kind":"oauth","access_token":"secret"}"#.to_owned(),
+                ),
+                expires_at: None,
+                last_refreshed_at: None,
+            },
+        };
+        assert_eq!(
+            repository
+                .create_provider_account(account.clone())
+                .await
+                .expect("create account"),
+            ProviderAccountCreateOutcome::Created
+        );
+        assert_eq!(
+            repository
+                .create_provider_account(account)
+                .await
+                .expect("duplicate account"),
+            ProviderAccountCreateOutcome::Conflict
+        );
+
+        repository
+            .synchronize_provider_models(
+                &account_id,
+                vec![
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-a".to_owned(),
+                        metadata_json: r#"{"version":1}"#.to_owned(),
+                        routable: true,
+                    },
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-b".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        routable: true,
+                    },
+                ],
+                10,
+            )
+            .await
+            .expect("initial model sync");
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-a",
+                    ProviderModelOverride {
+                        alias: Some("grok-latest".to_owned()),
+                        enabled: false,
+                        updated_at: 11,
+                    },
+                )
+                .await
+                .expect("model override")
+        );
+
+        let models = repository
+            .synchronize_provider_models(
+                &account_id,
+                vec![
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-a".to_owned(),
+                        metadata_json: r#"{"version":2}"#.to_owned(),
+                        routable: true,
+                    },
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-c".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        routable: true,
+                    },
+                ],
+                20,
+            )
+            .await
+            .expect("second model sync");
+
+        let model_a = models
+            .iter()
+            .find(|model| model.upstream_model == "grok-a")
+            .expect("grok-a");
+        assert_eq!(model_a.alias.as_deref(), Some("grok-latest"));
+        assert!(!model_a.enabled);
+        assert!(model_a.available);
+        assert_eq!(model_a.metadata_json, r#"{"version":2}"#);
+        assert!(
+            !models
+                .iter()
+                .find(|model| model.upstream_model == "grok-b")
+                .expect("grok-b")
+                .available
+        );
+        assert!(
+            models
+                .iter()
+                .find(|model| model.upstream_model == "grok-c")
+                .expect("grok-c")
+                .available
         );
     }
 }

@@ -2,9 +2,13 @@ use std::{fmt, str::FromStr};
 
 use async_trait::async_trait;
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ProviderError, ProviderRequest, ProviderStream};
+use crate::{
+    DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel, ProviderRequest,
+    ProviderStream,
+};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AccountId(String);
@@ -42,6 +46,85 @@ impl FromStr for AccountId {
 #[error("account ID must not be empty")]
 pub struct AccountIdError;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Grok,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    AnthropicCompatible,
+}
+
+impl ProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grok => "grok",
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::AnthropicCompatible => "anthropic_compatible",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderKind {
+    type Err = ProviderKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "grok" => Ok(Self::Grok),
+            "openai_compatible" => Ok(Self::OpenAiCompatible),
+            "anthropic_compatible" => Ok(Self::AnthropicCompatible),
+            _ => Err(ProviderKindError),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("unsupported provider type")]
+pub struct ProviderKindError;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    Oauth,
+    ApiKey,
+    None,
+}
+
+impl CredentialKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Oauth => "oauth",
+            Self::ApiKey => "api_key",
+            Self::None => "none",
+        }
+    }
+}
+
+impl FromStr for CredentialKind {
+    type Err = CredentialKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "oauth" => Ok(Self::Oauth),
+            "api_key" => Ok(Self::ApiKey),
+            "none" => Ok(Self::None),
+            _ => Err(CredentialKindError),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("unsupported credential type")]
+pub struct CredentialKindError;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AccountAuthState {
     #[default]
@@ -77,6 +160,7 @@ pub struct AccountAuthStateError;
 
 #[derive(Clone, Debug)]
 pub struct StoredCredential {
+    pub kind: CredentialKind,
     pub revision: u64,
     pub format_version: u32,
     pub credential_json: SecretString,
@@ -88,8 +172,9 @@ pub struct StoredCredential {
 #[derive(Clone, Debug)]
 pub struct StoredProviderAccount {
     pub id: AccountId,
-    pub provider: String,
+    pub provider: ProviderKind,
     pub label: String,
+    pub config_json: String,
     pub enabled: bool,
     pub auth_state: AccountAuthState,
     pub safe_error_code: Option<String>,
@@ -99,8 +184,55 @@ pub struct StoredProviderAccount {
 }
 
 #[derive(Clone, Debug)]
+pub struct NewCredential {
+    pub kind: CredentialKind,
+    pub format_version: u32,
+    pub credential_json: SecretString,
+    pub expires_at: Option<i64>,
+    pub last_refreshed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewProviderAccount {
+    pub id: AccountId,
+    pub provider: ProviderKind,
+    pub label: String,
+    pub config_json: String,
+    pub enabled: bool,
+    pub credential: NewCredential,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAccountSummary {
+    pub id: AccountId,
+    pub provider: ProviderKind,
+    pub label: String,
+    pub config_json: String,
+    pub credential_kind: CredentialKind,
+    pub enabled: bool,
+    pub auth_state: AccountAuthState,
+    pub safe_error_code: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderAccountUpdate {
+    pub label: String,
+    pub config_json: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAccountCreateOutcome {
+    Created,
+    Conflict,
+}
+
+#[derive(Clone, Debug)]
 pub struct CredentialUpdate {
     pub expected_revision: u64,
+    pub kind: CredentialKind,
     pub format_version: u32,
     pub credential_json: SecretString,
     pub expires_at: Option<i64>,
@@ -190,6 +322,17 @@ pub trait ProviderAccount: Send + Sync {
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
 
+    async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
+        Err(ProviderError::new(
+            ProviderErrorKind::Upstream,
+            "provider model discovery is not available",
+        ))
+    }
+
+    fn fallback_models(&self) -> &[ProviderModel] {
+        &[]
+    }
+
     async fn refresh_credentials(
         &self,
         trigger: RefreshTrigger,
@@ -230,4 +373,58 @@ pub trait AccountRepository: Send + Sync {
         safe_error_code: Option<&str>,
         updated_at: i64,
     ) -> Result<(), AccountRepositoryError>;
+}
+
+#[async_trait]
+pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
+    async fn list_provider_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
+
+    async fn load_provider_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<StoredProviderAccount>, AccountRepositoryError>;
+
+    async fn create_provider_account(
+        &self,
+        account: NewProviderAccount,
+    ) -> Result<ProviderAccountCreateOutcome, AccountRepositoryError>;
+
+    async fn update_provider_account(
+        &self,
+        account_id: &AccountId,
+        update: ProviderAccountUpdate,
+    ) -> Result<bool, AccountRepositoryError>;
+
+    async fn set_provider_account_enabled(
+        &self,
+        account_id: &AccountId,
+        enabled: bool,
+        updated_at: i64,
+    ) -> Result<bool, AccountRepositoryError>;
+
+    async fn delete_provider_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<bool, AccountRepositoryError>;
+
+    async fn list_provider_models(
+        &self,
+        account_id: Option<&AccountId>,
+    ) -> Result<Vec<crate::StoredProviderModel>, AccountRepositoryError>;
+
+    async fn synchronize_provider_models(
+        &self,
+        account_id: &AccountId,
+        models: Vec<crate::DiscoveredProviderModel>,
+        synced_at: i64,
+    ) -> Result<Vec<crate::StoredProviderModel>, AccountRepositoryError>;
+
+    async fn update_provider_model(
+        &self,
+        account_id: &AccountId,
+        upstream_model: &str,
+        update: crate::ProviderModelOverride,
+    ) -> Result<bool, AccountRepositoryError>;
 }

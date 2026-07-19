@@ -1,9 +1,8 @@
 use provider_core::{TokenCountError, TokenCounter};
 use tiktoken_rs::cl100k_base_singleton;
 
-/// Approximate Grok input token counter backed by cl100k_base.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Cl100kTokenCounter;
+pub(crate) struct Cl100kTokenCounter;
 
 impl TokenCounter for Cl100kTokenCounter {
     fn count(&self, input: &str) -> Result<u64, TokenCountError> {

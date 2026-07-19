@@ -7,6 +7,7 @@ use crate::{ProviderError, ProviderRequest, ProviderStream, ProxyRequest};
 #[serde(rename_all = "snake_case")]
 pub enum WireFormat {
     OpenAiResponses,
+    OpenAiChatCompletions,
     ClaudeMessages,
 }
 
@@ -30,6 +31,8 @@ impl PreparedProviderRequest {
 
 /// Converts an inbound request into the native format of a selected provider.
 pub trait ProtocolBridge: Send + Sync {
+    fn supports(&self, source: WireFormat, target: WireFormat) -> bool;
+
     fn prepare(
         &self,
         request: ProxyRequest,

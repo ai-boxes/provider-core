@@ -1,4 +1,4 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -76,6 +76,34 @@ pub trait Provider: Send + Sync {
     ) -> Result<ProviderStream, ProviderError>;
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
+}
+
+/// One concrete provider account selected for a request.
+#[async_trait]
+pub trait ProviderRoute: Send + Sync {
+    fn provider_name(&self) -> &'static str;
+
+    fn native_format(&self) -> WireFormat;
+
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError>;
+
+    async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
+}
+
+#[derive(Clone)]
+pub struct ProviderRouteCandidate {
+    pub upstream_model: String,
+    pub route: Arc<dyn ProviderRoute>,
+}
+
+/// In-memory model index used before protocol conversion and provider execution.
+pub trait ProviderRouter: Send + Sync {
+    fn models(&self) -> Vec<ProviderModel>;
+
+    fn routes(&self, model: &str) -> Vec<ProviderRouteCandidate>;
 }
 
 /// Shared metadata and native protocol implemented by one upstream driver.

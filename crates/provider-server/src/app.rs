@@ -1,40 +1,61 @@
 use std::{error::Error, sync::Arc};
 
-use provider_core::{AccountRepository, ProxyService};
-use provider_drivers::grok::GrokDriver;
+use provider_core::{AccountRepository, ProviderControl, ProxyService};
+use provider_drivers::{
+    anthropic_compatible::AnthropicCompatibleDriver, grok::GrokDriver,
+    openai_compatible::OpenAiCompatibleDriver,
+};
+use provider_management::{ModelCatalogService, ProviderManager};
 use provider_protocol::DefaultProtocolBridge;
-use provider_runtime::ProviderRuntime;
+use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::SqliteAccountRepository;
 use tokio::net::TcpListener;
 
 use crate::{
     config::{DATABASE_PATH, LISTEN_ADDRESS},
-    router,
+    router_with_management,
 };
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
-    let driver = Arc::new(GrokDriver::new());
-    let runtime = ProviderRuntime::new(driver.clone());
+    let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+    runtime.register_driver(Arc::new(GrokDriver::new()))?;
+    runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
+    runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
+    let model_catalog = ModelCatalogService::new(repository.clone());
     for account in repository.load_enabled_accounts().await? {
-        if account.provider.trim() != "grok" {
-            return Err(format!(
-                "enabled provider account {} uses unsupported provider {}",
-                account.id, account.provider
-            )
-            .into());
+        let kind = account.provider;
+        let account = runtime.build_account(account)?;
+        let models = model_catalog
+            .refresh(account.as_ref(), unix_timestamp())
+            .await?;
+        if let Some(warning) = models.warning.as_deref() {
+            eprintln!(
+                "provider model discovery used {:?} catalog for account {}: {warning}",
+                models.source,
+                account.account_id()
+            );
         }
         runtime
-            .register(driver.load_account(account, repository.clone())?)
+            .activate_account(kind, account, models.models)
             .await?;
     }
 
-    let service = ProxyService::new(Arc::new(runtime.clone()), Arc::new(DefaultProtocolBridge));
+    let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+    let manager = ProviderManager::new(repository, runtime.clone());
     let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
 
     println!("provider-core listening on http://{LISTEN_ADDRESS}");
-    let result = axum::serve(listener, router(service)).await;
+    let result = axum::serve(listener, router_with_management(service, manager)).await;
     runtime.shutdown();
     result?;
     Ok(())
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
 }

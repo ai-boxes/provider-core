@@ -17,6 +17,7 @@ pub struct GrokCredentials {
     access_token: SecretString,
     refresh_token: Option<SecretString>,
     token_endpoint: Option<String>,
+    base_url: Option<String>,
 }
 
 impl GrokCredentials {
@@ -42,6 +43,19 @@ impl GrokCredentials {
     #[must_use]
     pub(crate) fn token_endpoint(&self) -> Option<&str> {
         self.token_endpoint.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    pub(crate) fn expires_at(&self) -> Result<Option<i64>, GrokAuthError> {
+        timestamp_field(&self.document, "expired")
+    }
+
+    pub(crate) fn last_refreshed_at(&self) -> Result<Option<i64>, GrokAuthError> {
+        timestamp_field(&self.document, "last_refresh")
     }
 
     pub(crate) fn refreshed(
@@ -138,12 +152,17 @@ impl GrokCredentials {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
+        let base_url = string_field(&document, "base_url")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
 
         Ok(Self {
             document,
             access_token,
             refresh_token,
             token_endpoint,
+            base_url,
         })
     }
 }
@@ -158,6 +177,7 @@ impl fmt::Debug for GrokCredentials {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("token_endpoint", &self.token_endpoint)
+            .field("base_url", &self.base_url)
             .finish_non_exhaustive()
     }
 }
@@ -184,6 +204,21 @@ fn timestamp_rfc3339(timestamp: i64) -> Result<String, GrokAuthError> {
         .map_err(|_| GrokAuthError::TimestampOutOfRange)
 }
 
+fn timestamp_field(
+    document: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<i64>, GrokAuthError> {
+    let Some(value) = string_field(document, field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(|timestamp| Some(timestamp.unix_timestamp()))
+        .map_err(|_| GrokAuthError::InvalidTimestamp(field.to_owned()))
+}
+
 #[derive(Debug, Error)]
 pub enum GrokAuthError {
     #[error("failed to read Grok auth JSON: {0}")]
@@ -206,6 +241,8 @@ pub enum GrokAuthError {
     UnsupportedCredentialFormat(u32),
     #[error("Grok credential timestamp is out of range")]
     TimestampOutOfRange,
+    #[error("Grok auth JSON has invalid {0} timestamp")]
+    InvalidTimestamp(String),
 }
 
 #[cfg(test)]

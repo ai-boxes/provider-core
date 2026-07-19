@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod management;
 pub mod model;
 pub mod protocol;
 pub mod provider;
@@ -11,12 +12,24 @@ pub mod token_count;
 
 pub use account::{
     AccountAuthState, AccountAuthStateError, AccountId, AccountIdError, AccountRepository,
-    AccountRepositoryError, AccountRuntimeState, CredentialUpdate, CredentialWriteOutcome,
-    ProviderAccount, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
-    StoredCredential, StoredProviderAccount,
+    AccountRepositoryError, AccountRuntimeState, CredentialKind, CredentialKindError,
+    CredentialUpdate, CredentialWriteOutcome, NewCredential, NewProviderAccount, ProviderAccount,
+    ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
+    ProviderKindError, ProviderManagementRepository, RefreshError, RefreshErrorKind,
+    RefreshOutcome, RefreshTrigger, StoredCredential, StoredProviderAccount,
 };
-pub use model::ProviderModel;
+pub use management::{
+    AccountProvisioningInput, ManagedProviderDriver, PendingProviderOAuth,
+    ProviderConfigurationError, ProviderControl, ProviderControlError, ProviderOAuthChallenge,
+    StartedProviderOAuth,
+};
+pub use model::{
+    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, StoredProviderModel,
+};
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
-pub use provider::{Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderStream};
+pub use provider::{
+    Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderRoute,
+    ProviderRouteCandidate, ProviderRouter, ProviderStream,
+};
 pub use proxy::{ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
 pub use token_count::{TokenCountError, TokenCounter};

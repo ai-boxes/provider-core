@@ -9,6 +9,7 @@ use axum::{
 use provider_core::{
     ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService, WireFormat,
 };
+use provider_management::ProviderManager;
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -24,6 +25,10 @@ pub fn router(service: ProxyService) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .with_state(AppState { service })
+}
+
+pub fn router_with_management(service: ProxyService, manager: ProviderManager) -> Router {
+    router(service).merge(crate::management_http::router(manager))
 }
 
 async fn health() -> Json<Value> {
@@ -136,7 +141,7 @@ impl HttpError {
 
     fn new(protocol: WireFormat, status: StatusCode, error_type: &str, message: &str) -> Self {
         let body = match protocol {
-            WireFormat::OpenAiResponses => json!({
+            WireFormat::OpenAiResponses | WireFormat::OpenAiChatCompletions => json!({
                 "error": { "type": error_type, "message": message }
             }),
             WireFormat::ClaudeMessages => json!({
