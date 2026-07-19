@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod auth_http;
 mod config;
 mod http;
 mod management_http;

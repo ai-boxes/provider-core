@@ -489,15 +489,19 @@ mod tests {
         http::{HeaderMap, StatusCode, header},
         routing::get,
     };
+    use provider_auth::{ApiKeyAuthenticator, AuthService};
     use provider_core::ProxyService;
     use provider_drivers::openai_compatible::OpenAiCompatibleDriver;
     use provider_management::ProviderManager;
     use provider_protocol::DefaultProtocolBridge;
     use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
+    use secrecy::{ExposeSecret, SecretString};
     use tokio::net::TcpListener;
 
     use crate::router_with_management;
+
+    use super::unix_timestamp;
 
     #[tokio::test]
     async fn creates_compatible_accounts_without_returning_credentials() {
@@ -536,6 +540,19 @@ mod tests {
         runtime
             .register_driver(Arc::new(OpenAiCompatibleDriver::new()))
             .expect("register driver");
+        let auth = AuthService::new(repository.clone());
+        let grant = auth
+            .setup(
+                "admin".to_owned(),
+                SecretString::from("secret".to_owned()),
+                unix_timestamp(),
+            )
+            .await
+            .expect("initial setup");
+        let access_token = grant.access_token.expose_secret().to_owned();
+        let api_keys = ApiKeyAuthenticator::load(repository.clone())
+            .await
+            .expect("API key index");
         let manager = ProviderManager::new(repository, runtime.clone());
         let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -543,7 +560,11 @@ mod tests {
             .expect("bind management server");
         let address = listener.local_addr().expect("management address");
         let server = tokio::spawn(
-            axum::serve(listener, router_with_management(service, manager)).into_future(),
+            axum::serve(
+                listener,
+                router_with_management(service, manager, auth, api_keys),
+            )
+            .into_future(),
         );
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/api/v1/providers");
@@ -551,6 +572,7 @@ mod tests {
 
         let with_key = client
             .post(&endpoint)
+            .bearer_auth(&access_token)
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -571,6 +593,7 @@ mod tests {
 
         let without_key = client
             .post(&endpoint)
+            .bearer_auth(&access_token)
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({

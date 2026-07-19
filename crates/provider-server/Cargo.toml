@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 bytes.workspace = true
+provider-auth.workspace = true
 provider-core.workspace = true
 provider-drivers.workspace = true
 provider-management.workspace = true

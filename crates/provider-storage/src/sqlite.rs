@@ -1,6 +1,11 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
+use provider_auth::{
+    ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome,
+    NewApiKey, NewSession, NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession,
+    StoredUser, UserId, UserRole, UserSummary,
+};
 use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
     CredentialUpdate, CredentialWriteOutcome, DiscoveredProviderModel, NewProviderAccount,
@@ -523,6 +528,441 @@ impl ProviderManagementRepository for SqliteAccountRepository {
     }
 }
 
+#[async_trait]
+impl AuthRepository for SqliteAccountRepository {
+    async fn setup_required(&self) -> Result<bool, AuthRepositoryError> {
+        let row = sqlx::query("SELECT initial_user_id FROM auth_setup WHERE singleton = 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| auth_repository_error("failed to load setup state", error))?;
+        Ok(auth_row_value::<Option<String>>(&row, "initial_user_id")?.is_none())
+    }
+
+    async fn create_initial_user(
+        &self,
+        user: NewUser,
+    ) -> Result<InitialUserCreateOutcome, AuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start initial user transaction", error)
+        })?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO users
+                (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(user.id.as_str())
+        .bind(user.username)
+        .bind(user.password_hash)
+        .bind(user.role.as_str())
+        .bind(database_bool(user.enabled))
+        .bind(user.created_at)
+        .bind(user.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to create initial user", error))?;
+        if inserted.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back initial user conflict", error)
+            })?;
+            return Ok(InitialUserCreateOutcome::AlreadyConfigured);
+        }
+
+        let claimed = sqlx::query(
+            r#"
+            UPDATE auth_setup
+            SET initial_user_id = ?
+            WHERE singleton = 1 AND initial_user_id IS NULL
+            "#,
+        )
+        .bind(user.id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to claim initial setup", error))?;
+        if claimed.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back completed setup", error)
+            })?;
+            return Ok(InitialUserCreateOutcome::AlreadyConfigured);
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET owner_user_id = ?, visibility = 'private'
+            WHERE owner_user_id IS NULL
+            "#,
+        )
+        .bind(user.id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            auth_repository_error("failed to assign existing providers to initial user", error)
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| auth_repository_error("failed to commit initial user", error))?;
+        Ok(InitialUserCreateOutcome::Created)
+    }
+
+    async fn load_user_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredUser>, AuthRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, username, password_hash, role, enabled, created_at, updated_at
+            FROM users
+            WHERE username = ?
+            "#,
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load user by username", error))?;
+        row.map(stored_user).transpose()
+    }
+
+    async fn load_user(&self, user_id: &UserId) -> Result<Option<StoredUser>, AuthRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, username, password_hash, role, enabled, created_at, updated_at
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load user", error))?;
+        row.map(stored_user).transpose()
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserSummary>, AuthRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, username, role, enabled, created_at, updated_at
+            FROM users
+            ORDER BY created_at, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to list users", error))?;
+        rows.into_iter().map(user_summary).collect()
+    }
+
+    async fn create_user(&self, user: NewUser) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO users
+                (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(user.id.as_str())
+        .bind(user.username)
+        .bind(user.password_hash)
+        .bind(user.role.as_str())
+        .bind(database_bool(user.enabled))
+        .bind(user.created_at)
+        .bind(user.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to create user", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_user_enabled(
+        &self,
+        user_id: &UserId,
+        enabled: bool,
+        updated_at: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?")
+            .bind(database_bool(enabled))
+            .bind(updated_at)
+            .bind(user_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| auth_repository_error("failed to update user status", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_user_password(
+        &self,
+        user_id: &UserId,
+        password_hash: String,
+        updated_at: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(updated_at)
+            .bind(user_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| auth_repository_error("failed to update user password", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn create_session(&self, session: NewSession) -> Result<(), AuthRepositoryError> {
+        sqlx::query(
+            r#"
+            INSERT INTO user_sessions
+                (id, user_id, access_token_hash, refresh_token_hash, access_expires_at,
+                 refresh_expires_at, absolute_expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(session.id.as_str())
+        .bind(session.user_id.as_str())
+        .bind(session.access_token_hash.as_slice())
+        .bind(session.refresh_token_hash.as_slice())
+        .bind(session.access_expires_at)
+        .bind(session.refresh_expires_at)
+        .bind(session.absolute_expires_at)
+        .bind(session.created_at)
+        .bind(session.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to create user session", error))?;
+        Ok(())
+    }
+
+    async fn load_session_by_access_hash(
+        &self,
+        access_token_hash: &[u8; 32],
+    ) -> Result<Option<StoredSession>, AuthRepositoryError> {
+        load_session(&self.pool, SESSION_BY_ACCESS_SQL, access_token_hash).await
+    }
+
+    async fn load_session_by_refresh_hash(
+        &self,
+        refresh_token_hash: &[u8; 32],
+    ) -> Result<Option<StoredSession>, AuthRepositoryError> {
+        load_session(&self.pool, SESSION_BY_REFRESH_SQL, refresh_token_hash).await
+    }
+
+    async fn rotate_session(
+        &self,
+        refresh_token_hash: &[u8; 32],
+        new_access_token_hash: [u8; 32],
+        new_refresh_token_hash: [u8; 32],
+        access_expires_at: i64,
+        refresh_expires_at: i64,
+        updated_at: i64,
+    ) -> Result<RefreshSessionOutcome, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE user_sessions
+            SET access_token_hash = ?, refresh_token_hash = ?, access_expires_at = ?,
+                refresh_expires_at = ?, updated_at = ?
+            WHERE refresh_token_hash = ?
+              AND revoked_at IS NULL
+              AND refresh_expires_at > ?
+              AND absolute_expires_at > ?
+            "#,
+        )
+        .bind(new_access_token_hash.as_slice())
+        .bind(new_refresh_token_hash.as_slice())
+        .bind(access_expires_at)
+        .bind(refresh_expires_at)
+        .bind(updated_at)
+        .bind(refresh_token_hash.as_slice())
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to rotate user session", error))?;
+        Ok(if result.rows_affected() > 0 {
+            RefreshSessionOutcome::Updated
+        } else {
+            RefreshSessionOutcome::Invalid
+        })
+    }
+
+    async fn revoke_session(
+        &self,
+        session_id: &SessionId,
+        revoked_at: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE user_sessions
+            SET revoked_at = ?, updated_at = ?
+            WHERE id = ? AND revoked_at IS NULL
+            "#,
+        )
+        .bind(revoked_at)
+        .bind(revoked_at)
+        .bind(session_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to revoke user session", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn create_api_key(&self, key: NewApiKey) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO api_keys
+                (id, owner_user_id, label, key_hash, enabled, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(key.id.as_str())
+        .bind(key.owner_user_id.as_str())
+        .bind(key.label)
+        .bind(key.key_hash.as_slice())
+        .bind(database_bool(key.enabled))
+        .bind(key.expires_at)
+        .bind(key.created_at)
+        .bind(key.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to create API key", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_api_keys(
+        &self,
+        owner_user_id: &UserId,
+    ) -> Result<Vec<ApiKeySummary>, AuthRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, owner_user_id, label, enabled, expires_at, last_used_at,
+                   created_at, updated_at
+            FROM api_keys
+            WHERE owner_user_id = ?
+            ORDER BY created_at, id
+            "#,
+        )
+        .bind(owner_user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to list API keys", error))?;
+        rows.into_iter().map(api_key_summary).collect()
+    }
+
+    async fn set_api_key_enabled(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+        enabled: bool,
+        updated_at: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET enabled = ?, updated_at = ?
+            WHERE id = ? AND owner_user_id = ?
+            "#,
+        )
+        .bind(database_bool(enabled))
+        .bind(updated_at)
+        .bind(key_id.as_str())
+        .bind(owner_user_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to update API key status", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_api_key(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+    ) -> Result<bool, AuthRepositoryError> {
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = ? AND owner_user_id = ?")
+            .bind(key_id.as_str())
+            .bind(owner_user_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| auth_repository_error("failed to delete API key", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT k.id, k.owner_user_id, k.label, k.key_hash, k.enabled, k.expires_at,
+                   k.last_used_at, k.created_at, k.updated_at
+            FROM api_keys AS k
+            INNER JOIN users AS u ON u.id = k.owner_user_id
+            WHERE k.enabled = 1 AND u.enabled = 1
+            ORDER BY k.created_at, k.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load active API keys", error))?;
+        rows.into_iter().map(stored_api_key).collect()
+    }
+}
+
+async fn load_session(
+    pool: &SqlitePool,
+    query: &'static str,
+    token_hash: &[u8; 32],
+) -> Result<Option<StoredSession>, AuthRepositoryError> {
+    let row = sqlx::query(query)
+        .bind(token_hash.as_slice())
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load user session", error))?;
+    row.map(stored_session).transpose()
+}
+
+const SESSION_BY_ACCESS_SQL: &str = r#"
+    SELECT
+        s.id,
+        s.access_token_hash,
+        s.refresh_token_hash,
+        s.access_expires_at,
+        s.refresh_expires_at,
+        s.absolute_expires_at,
+        s.revoked_at,
+        s.created_at,
+        s.updated_at,
+        u.id AS user_id,
+        u.username,
+        u.role,
+        u.enabled,
+        u.created_at AS user_created_at,
+        u.updated_at AS user_updated_at
+    FROM user_sessions AS s
+    INNER JOIN users AS u ON u.id = s.user_id
+    WHERE s.access_token_hash = ?
+    "#;
+
+const SESSION_BY_REFRESH_SQL: &str = r#"
+    SELECT
+        s.id,
+        s.access_token_hash,
+        s.refresh_token_hash,
+        s.access_expires_at,
+        s.refresh_expires_at,
+        s.absolute_expires_at,
+        s.revoked_at,
+        s.created_at,
+        s.updated_at,
+        u.id AS user_id,
+        u.username,
+        u.role,
+        u.enabled,
+        u.created_at AS user_created_at,
+        u.updated_at AS user_updated_at
+    FROM user_sessions AS s
+    INNER JOIN users AS u ON u.id = s.user_id
+    WHERE s.refresh_token_hash = ?
+    "#;
+
 fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountRepositoryError> {
     let id = row_value::<String>(&row, "id")?;
     let id = AccountId::new(id).map_err(|error| {
@@ -618,6 +1058,112 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
     })
 }
 
+fn stored_user(row: SqliteRow) -> Result<StoredUser, AuthRepositoryError> {
+    Ok(StoredUser {
+        id: auth_user_id(&row, "id")?,
+        username: auth_row_value(&row, "username")?,
+        password_hash: auth_row_value(&row, "password_hash")?,
+        role: auth_user_role(&row, "role")?,
+        enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
+        created_at: auth_row_value(&row, "created_at")?,
+        updated_at: auth_row_value(&row, "updated_at")?,
+    })
+}
+
+fn user_summary(row: SqliteRow) -> Result<UserSummary, AuthRepositoryError> {
+    Ok(UserSummary {
+        id: auth_user_id(&row, "id")?,
+        username: auth_row_value(&row, "username")?,
+        role: auth_user_role(&row, "role")?,
+        enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
+        created_at: auth_row_value(&row, "created_at")?,
+        updated_at: auth_row_value(&row, "updated_at")?,
+    })
+}
+
+fn stored_session(row: SqliteRow) -> Result<StoredSession, AuthRepositoryError> {
+    Ok(StoredSession {
+        id: auth_session_id(&row, "id")?,
+        user: UserSummary {
+            id: auth_user_id(&row, "user_id")?,
+            username: auth_row_value(&row, "username")?,
+            role: auth_user_role(&row, "role")?,
+            enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
+            created_at: auth_row_value(&row, "user_created_at")?,
+            updated_at: auth_row_value(&row, "user_updated_at")?,
+        },
+        access_token_hash: auth_hash(&row, "access_token_hash")?,
+        refresh_token_hash: auth_hash(&row, "refresh_token_hash")?,
+        access_expires_at: auth_row_value(&row, "access_expires_at")?,
+        refresh_expires_at: auth_row_value(&row, "refresh_expires_at")?,
+        absolute_expires_at: auth_row_value(&row, "absolute_expires_at")?,
+        revoked_at: auth_row_value(&row, "revoked_at")?,
+        created_at: auth_row_value(&row, "created_at")?,
+        updated_at: auth_row_value(&row, "updated_at")?,
+    })
+}
+
+fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
+    Ok(StoredApiKey {
+        id: auth_api_key_id(&row, "id")?,
+        owner_user_id: auth_user_id(&row, "owner_user_id")?,
+        label: auth_row_value(&row, "label")?,
+        key_hash: auth_hash(&row, "key_hash")?,
+        enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
+        expires_at: auth_row_value(&row, "expires_at")?,
+        last_used_at: auth_row_value(&row, "last_used_at")?,
+        created_at: auth_row_value(&row, "created_at")?,
+        updated_at: auth_row_value(&row, "updated_at")?,
+    })
+}
+
+fn api_key_summary(row: SqliteRow) -> Result<ApiKeySummary, AuthRepositoryError> {
+    Ok(ApiKeySummary {
+        id: auth_api_key_id(&row, "id")?,
+        owner_user_id: auth_user_id(&row, "owner_user_id")?,
+        label: auth_row_value(&row, "label")?,
+        enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
+        expires_at: auth_row_value(&row, "expires_at")?,
+        last_used_at: auth_row_value(&row, "last_used_at")?,
+        created_at: auth_row_value(&row, "created_at")?,
+        updated_at: auth_row_value(&row, "updated_at")?,
+    })
+}
+
+fn auth_user_id(row: &SqliteRow, column: &str) -> Result<UserId, AuthRepositoryError> {
+    UserId::new(auth_row_value::<String>(row, column)?)
+        .map_err(|error| AuthRepositoryError::new(format!("invalid user ID: {error}")))
+}
+
+fn auth_session_id(row: &SqliteRow, column: &str) -> Result<SessionId, AuthRepositoryError> {
+    SessionId::new(auth_row_value::<String>(row, column)?)
+        .map_err(|error| AuthRepositoryError::new(format!("invalid session ID: {error}")))
+}
+
+fn auth_api_key_id(row: &SqliteRow, column: &str) -> Result<ApiKeyId, AuthRepositoryError> {
+    ApiKeyId::new(auth_row_value::<String>(row, column)?)
+        .map_err(|error| AuthRepositoryError::new(format!("invalid API key ID: {error}")))
+}
+
+fn auth_user_role(row: &SqliteRow, column: &str) -> Result<UserRole, AuthRepositoryError> {
+    UserRole::from_str(&auth_row_value::<String>(row, column)?)
+        .map_err(|error| AuthRepositoryError::new(format!("invalid user role: {error}")))
+}
+
+fn auth_hash(row: &SqliteRow, column: &str) -> Result<[u8; 32], AuthRepositoryError> {
+    auth_row_value::<Vec<u8>>(row, column)?
+        .try_into()
+        .map_err(|_| AuthRepositoryError::new(format!("{column} must contain exactly 32 bytes")))
+}
+
+fn auth_row_value<T>(row: &SqliteRow, column: &str) -> Result<T, AuthRepositoryError>
+where
+    for<'row> T: sqlx::Decode<'row, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    row.try_get(column)
+        .map_err(|error| auth_repository_error("failed to decode authentication row", error))
+}
+
 fn row_value<T>(row: &SqliteRow, column: &str) -> Result<T, AccountRepositoryError>
 where
     for<'row> T: sqlx::Decode<'row, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
@@ -668,6 +1214,10 @@ const fn database_bool(value: bool) -> i64 {
 
 fn repository_error(operation: &str, error: impl std::fmt::Display) -> AccountRepositoryError {
     AccountRepositoryError::new(format!("{operation}: {error}"))
+}
+
+fn auth_repository_error(operation: &str, error: impl std::fmt::Display) -> AuthRepositoryError {
+    AuthRepositoryError::new(format!("{operation}: {error}"))
 }
 
 fn prepare_data_directory(path: &Path) -> Result<(), AccountRepositoryError> {
@@ -908,5 +1458,132 @@ mod tests {
                 .expect("grok-c")
                 .available
         );
+    }
+
+    #[tokio::test]
+    async fn initial_setup_is_single_use_and_claims_existing_providers() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+                (id, provider, label, enabled, auth_state)
+            VALUES ('existing-grok', 'grok', 'Existing Grok', 1, 'active')
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert existing provider");
+
+        let initial_user = NewUser {
+            id: UserId::new("user-initial").expect("user ID"),
+            username: "admin".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 100,
+        };
+        assert_eq!(
+            repository
+                .create_initial_user(initial_user.clone())
+                .await
+                .expect("create initial user"),
+            InitialUserCreateOutcome::Created
+        );
+        assert_eq!(
+            repository
+                .create_initial_user(NewUser {
+                    id: UserId::new("user-second").expect("user ID"),
+                    username: "second".to_owned(),
+                    ..initial_user
+                })
+                .await
+                .expect("reject second initial user"),
+            InitialUserCreateOutcome::AlreadyConfigured
+        );
+
+        let row = sqlx::query(
+            "SELECT owner_user_id, visibility FROM provider_accounts WHERE id = 'existing-grok'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load claimed provider");
+        assert_eq!(
+            row.try_get::<String, _>("owner_user_id")
+                .expect("provider owner"),
+            "user-initial"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("visibility")
+                .expect("provider visibility"),
+            "private"
+        );
+        assert!(
+            repository
+                .load_user_by_username("second")
+                .await
+                .expect("load user")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rotation_consumes_the_previous_token_once() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let user_id = UserId::new("user-session").expect("user ID");
+        assert_eq!(
+            repository
+                .create_initial_user(NewUser {
+                    id: user_id.clone(),
+                    username: "admin".to_owned(),
+                    password_hash: "password-hash".to_owned(),
+                    role: UserRole::SuperAdmin,
+                    enabled: true,
+                    created_at: 100,
+                })
+                .await
+                .expect("create initial user"),
+            InitialUserCreateOutcome::Created
+        );
+        repository
+            .create_session(NewSession {
+                id: SessionId::new("session-one").expect("session ID"),
+                user_id,
+                access_token_hash: [1; 32],
+                refresh_token_hash: [2; 32],
+                access_expires_at: 200,
+                refresh_expires_at: 300,
+                absolute_expires_at: 400,
+                created_at: 100,
+            })
+            .await
+            .expect("create session");
+
+        assert_eq!(
+            repository
+                .rotate_session(&[2; 32], [3; 32], [4; 32], 250, 350, 150)
+                .await
+                .expect("rotate session"),
+            RefreshSessionOutcome::Updated
+        );
+        assert_eq!(
+            repository
+                .rotate_session(&[2; 32], [5; 32], [6; 32], 260, 360, 160)
+                .await
+                .expect("reject reused refresh token"),
+            RefreshSessionOutcome::Invalid
+        );
+
+        let session = repository
+            .load_session_by_refresh_hash(&[4; 32])
+            .await
+            .expect("load rotated session")
+            .expect("rotated session");
+        assert_eq!(session.access_token_hash, [3; 32]);
+        assert_eq!(session.refresh_expires_at, 350);
+        assert_eq!(session.absolute_expires_at, 400);
     }
 }

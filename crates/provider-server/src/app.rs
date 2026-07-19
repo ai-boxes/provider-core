@@ -1,5 +1,6 @@
 use std::{error::Error, sync::Arc};
 
+use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::{AccountRepository, ProviderControl, ProxyService};
 use provider_drivers::{
     anthropic_compatible::AnthropicCompatibleDriver, grok::GrokDriver,
@@ -42,11 +43,17 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+    let auth = AuthService::new(repository.clone());
+    let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
     let manager = ProviderManager::new(repository, runtime.clone());
     let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
 
     println!("provider-core listening on http://{LISTEN_ADDRESS}");
-    let result = axum::serve(listener, router_with_management(service, manager)).await;
+    let result = axum::serve(
+        listener,
+        router_with_management(service, manager, auth, api_keys),
+    )
+    .await;
     runtime.shutdown();
     result?;
     Ok(())

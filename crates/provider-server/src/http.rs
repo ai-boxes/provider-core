@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::{
     ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService, WireFormat,
 };
@@ -27,8 +28,17 @@ pub fn router(service: ProxyService) -> Router {
         .with_state(AppState { service })
 }
 
-pub fn router_with_management(service: ProxyService, manager: ProviderManager) -> Router {
-    router(service).merge(crate::management_http::router(manager))
+pub fn router_with_management(
+    service: ProxyService,
+    manager: ProviderManager,
+    auth: AuthService,
+    api_keys: ApiKeyAuthenticator,
+) -> Router {
+    let auth_state = crate::auth_http::AuthHttpState::new(auth.clone(), api_keys);
+    let management = crate::auth_http::protect(crate::management_http::router(manager), auth);
+    router(service)
+        .merge(crate::auth_http::router(auth_state))
+        .merge(management)
 }
 
 async fn health() -> Json<Value> {
