@@ -12,7 +12,8 @@ path = "src/main.rs"
 axum.workspace = true
 bytes.workspace = true
 provider-core.workspace = true
-provider-grok.workspace = true
+provider-drivers.workspace = true
+provider-protocol.workspace = true
 provider-runtime.workspace = true
 provider-storage.workspace = true
 serde_json.workspace = true
@@ -21,7 +22,7 @@ tokio.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
-provider-grok = { workspace = true, features = ["test-util"] }
+provider-drivers = { workspace = true, features = ["test-util"] }
 reqwest.workspace = true
 
 [lints]

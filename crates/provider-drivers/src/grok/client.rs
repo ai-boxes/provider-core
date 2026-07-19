@@ -3,7 +3,7 @@ use provider_core::{ProviderError, ProviderErrorKind, ProviderStream, RequestMet
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
 
-use crate::GrokCredentials;
+use super::credentials::GrokCredentials;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 const CLIENT_VERSION: &str = "0.2.93";

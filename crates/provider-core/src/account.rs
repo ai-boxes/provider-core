@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::Provider;
+use crate::{ProviderError, ProviderRequest, ProviderStream};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AccountId(String);
@@ -176,10 +176,19 @@ pub struct RefreshOutcome {
 }
 
 #[async_trait]
-pub trait ProviderAccount: Provider {
+pub trait ProviderAccount: Send + Sync {
+    fn provider_name(&self) -> &'static str;
+
     fn account_id(&self) -> &AccountId;
 
     fn runtime_state(&self) -> AccountRuntimeState;
+
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError>;
+
+    async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
 
     async fn refresh_credentials(
         &self,

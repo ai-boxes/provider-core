@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::refresh::RefreshedGrokTokens;
+use super::refresh::RefreshedGrokTokens;
 
 /// Validated credentials for one Grok provider account.
 #[derive(Clone)]

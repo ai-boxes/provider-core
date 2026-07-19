@@ -5,9 +5,9 @@ use bytes::Bytes;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{ProviderModel, ProxyRequest};
+use crate::{ProviderModel, ProviderRequest, WireFormat};
 
-/// Stream returned by a provider after adapting events to the source protocol.
+/// Byte stream crossing the provider and protocol boundaries.
 pub type ProviderStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send + 'static>>;
 
@@ -66,9 +66,23 @@ impl ProviderError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
 
+    fn native_format(&self) -> WireFormat;
+
     fn models(&self) -> &[ProviderModel];
 
-    async fn execute_stream(&self, request: ProxyRequest) -> Result<ProviderStream, ProviderError>;
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError>;
 
-    async fn count_tokens(&self, request: ProxyRequest) -> Result<u64, ProviderError>;
+    async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
+}
+
+/// Shared metadata and native protocol implemented by one upstream driver.
+pub trait ProviderDriver: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn native_format(&self) -> WireFormat;
+
+    fn models(&self) -> &[ProviderModel];
 }

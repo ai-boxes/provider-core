@@ -16,7 +16,7 @@ pub use account::{
     StoredCredential, StoredProviderAccount,
 };
 pub use model::ProviderModel;
-pub use protocol::Protocol;
-pub use provider::{Provider, ProviderError, ProviderErrorKind, ProviderStream};
-pub use proxy::{ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
+pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
+pub use provider::{Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderStream};
+pub use proxy::{ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
 pub use token_count::{TokenCountError, TokenCounter};

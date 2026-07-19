@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use provider_core::{ProviderError, ProviderErrorKind, ProviderStream};
+use provider_core::{ProviderError, ProviderErrorKind, ProviderStream, ResponseTranslator};
 use serde_json::Value;
+
+use crate::sse::SseDecoder;
 
 #[derive(Debug)]
 pub(crate) struct ClaudeResponseContext {
@@ -17,7 +19,23 @@ impl ClaudeResponseContext {
     }
 }
 
-pub(crate) fn adapt_grok_stream_to_claude(
+pub(crate) struct ClaudeResponseTranslator {
+    context: ClaudeResponseContext,
+}
+
+impl ClaudeResponseTranslator {
+    pub(crate) fn new(context: ClaudeResponseContext) -> Self {
+        Self { context }
+    }
+}
+
+impl ResponseTranslator for ClaudeResponseTranslator {
+    fn translate_stream(self: Box<Self>, stream: ProviderStream) -> ProviderStream {
+        adapt_responses_stream_to_claude(stream, self.context)
+    }
+}
+
+fn adapt_responses_stream_to_claude(
     upstream: ProviderStream,
     context: ClaudeResponseContext,
 ) -> ProviderStream {
@@ -83,69 +101,10 @@ impl ClaudeStreamAdapter {
                 .extend(self.converter.convert(&event).into_iter().map(Ok)),
             Err(_) => self.output.push_back(Err(ProviderError::new(
                 ProviderErrorKind::Upstream,
-                "Grok upstream returned an invalid SSE JSON event",
+                "Responses upstream returned an invalid SSE JSON event",
             ))),
         }
     }
-}
-
-#[derive(Default)]
-struct SseDecoder {
-    buffer: BytesMut,
-}
-
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Vec<Bytes> {
-        self.buffer.extend_from_slice(chunk);
-        let mut output = Vec::new();
-        while let Some(end) = find_frame_end(&self.buffer) {
-            let frame = self.buffer.split_to(end);
-            let delimiter_len = if self.buffer.starts_with(b"\r\n\r\n") {
-                4
-            } else {
-                2
-            };
-            let _ = self.buffer.split_to(delimiter_len);
-            if let Some(data) = frame_data(&frame) {
-                output.push(data);
-            }
-        }
-        output
-    }
-
-    fn finish(&mut self) -> Option<Bytes> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-        let frame = self.buffer.split().freeze();
-        frame_data(&frame)
-    }
-}
-
-fn find_frame_end(buffer: &[u8]) -> Option<usize> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) => Some(lf.min(crlf)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
-}
-
-fn frame_data(frame: &[u8]) -> Option<Bytes> {
-    let mut data = Vec::new();
-    for line in frame.split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(value) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let value = value.strip_prefix(b" ").unwrap_or(value);
-        if !data.is_empty() {
-            data.push(b'\n');
-        }
-        data.extend_from_slice(value);
-    }
-    (!data.is_empty()).then(|| Bytes::from(data))
 }
 
 struct ClaudeEventConverter {
@@ -637,7 +596,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn converts_split_grok_events_to_claude_blocks() {
+    async fn converts_split_responses_events_to_claude_blocks() {
         let upstream: ProviderStream = Box::pin(stream::iter([
             Ok(Bytes::from_static(
                 b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.5\"}}\n\nevent: reasoning\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}\n\nevent: done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"sig_1\"}}\n\nevent: text\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hel",
@@ -646,7 +605,7 @@ mod tests {
                 b"lo\"}\n\nevent: text_done\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"output_text\"}}\n\nevent: tool\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\"}}\n\nevent: args\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}\n\nevent: tool_done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}\n\nevent: completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}}\n\n",
             )),
         ]));
-        let converted = adapt_grok_stream_to_claude(
+        let converted = adapt_responses_stream_to_claude(
             upstream,
             ClaudeResponseContext::new("grok-4.5".to_owned(), HashMap::new()),
         )

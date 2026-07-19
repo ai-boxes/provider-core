@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use provider_core::{
-    Protocol, ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService,
+    ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService, WireFormat,
 };
 use serde_json::{Value, json};
 
@@ -38,30 +38,30 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn responses(State(state): State<AppState>, body: Bytes) -> Result<Response, HttpError> {
-    proxy_stream(&state.service, Protocol::CodexResponses, body).await
+    proxy_stream(&state.service, WireFormat::OpenAiResponses, body).await
 }
 
 async fn messages(State(state): State<AppState>, body: Bytes) -> Result<Response, HttpError> {
-    proxy_stream(&state.service, Protocol::ClaudeMessages, body).await
+    proxy_stream(&state.service, WireFormat::ClaudeMessages, body).await
 }
 
 async fn count_tokens(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<Value>, HttpError> {
-    let request = proxy_request(Protocol::ClaudeMessages, body)?;
+    let request = proxy_request(WireFormat::ClaudeMessages, body)?;
     let count = state
         .service
         .count_tokens(request)
         .await
-        .map_err(|error| HttpError::from_provider(Protocol::ClaudeMessages, error))?;
+        .map_err(|error| HttpError::from_provider(WireFormat::ClaudeMessages, error))?;
 
     Ok(Json(json!({ "input_tokens": count })))
 }
 
 async fn proxy_stream(
     service: &ProxyService,
-    protocol: Protocol,
+    protocol: WireFormat,
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let request = proxy_request(protocol, body)?;
@@ -78,7 +78,7 @@ async fn proxy_stream(
         .map_err(|_| HttpError::internal(protocol))
 }
 
-fn proxy_request(protocol: Protocol, body: Bytes) -> Result<ProxyRequest, HttpError> {
+fn proxy_request(protocol: WireFormat, body: Bytes) -> Result<ProxyRequest, HttpError> {
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
     let model = payload
@@ -97,7 +97,7 @@ struct HttpError {
 }
 
 impl HttpError {
-    fn invalid_request(protocol: Protocol, message: &'static str) -> Self {
+    fn invalid_request(protocol: WireFormat, message: &'static str) -> Self {
         Self::new(
             protocol,
             StatusCode::BAD_REQUEST,
@@ -106,7 +106,7 @@ impl HttpError {
         )
     }
 
-    fn internal(protocol: Protocol) -> Self {
+    fn internal(protocol: WireFormat) -> Self {
         Self::new(
             protocol,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -115,7 +115,7 @@ impl HttpError {
         )
     }
 
-    fn from_proxy_request(protocol: Protocol, error: ProxyRequestError) -> Self {
+    fn from_proxy_request(protocol: WireFormat, error: ProxyRequestError) -> Self {
         Self::invalid_request(
             protocol,
             match error {
@@ -124,7 +124,7 @@ impl HttpError {
         )
     }
 
-    fn from_provider(protocol: Protocol, error: ProviderError) -> Self {
+    fn from_provider(protocol: WireFormat, error: ProviderError) -> Self {
         let (status, error_type) = match error.kind() {
             ProviderErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             ProviderErrorKind::Authentication => (StatusCode::UNAUTHORIZED, "authentication_error"),
@@ -134,12 +134,12 @@ impl HttpError {
         Self::new(protocol, status, error_type, error.message())
     }
 
-    fn new(protocol: Protocol, status: StatusCode, error_type: &str, message: &str) -> Self {
+    fn new(protocol: WireFormat, status: StatusCode, error_type: &str, message: &str) -> Self {
         let body = match protocol {
-            Protocol::CodexResponses => json!({
+            WireFormat::OpenAiResponses => json!({
                 "error": { "type": error_type, "message": message }
             }),
-            Protocol::ClaudeMessages => json!({
+            WireFormat::ClaudeMessages => json!({
                 "type": "error",
                 "error": { "type": error_type, "message": message }
             }),
@@ -160,7 +160,8 @@ mod tests {
 
     use async_trait::async_trait;
     use futures_util::stream;
-    use provider_core::{Provider, ProviderModel, ProviderStream};
+    use provider_core::{Provider, ProviderModel, ProviderRequest, ProviderStream};
+    use provider_protocol::DefaultProtocolBridge;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -180,35 +181,37 @@ mod tests {
             "test"
         }
 
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
+        }
+
         fn models(&self) -> &[ProviderModel] {
             &self.models
         }
 
         async fn execute_stream(
             &self,
-            request: ProxyRequest,
+            _request: ProviderRequest,
         ) -> Result<ProviderStream, ProviderError> {
-            let event = match request.protocol {
-                Protocol::CodexResponses => {
-                    Bytes::from_static(b"event: response.completed\ndata: {}\n\n")
-                }
-                Protocol::ClaudeMessages => Bytes::from_static(
-                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                ),
-            };
+            let event = Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            );
             Ok(Box::pin(stream::once(async move { Ok(event) })))
         }
 
-        async fn count_tokens(&self, _request: ProxyRequest) -> Result<u64, ProviderError> {
+        async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
             Ok(42)
         }
     }
 
     #[tokio::test]
     async fn exposes_phase_one_http_contract() {
-        let service = ProxyService::new(Arc::new(TestProvider {
-            models: vec![ProviderModel::new("grok-4.5", "xai")],
-        }));
+        let service = ProxyService::new(
+            Arc::new(TestProvider {
+                models: vec![ProviderModel::new("grok-4.5", "xai")],
+            }),
+            Arc::new(DefaultProtocolBridge),
+        );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");

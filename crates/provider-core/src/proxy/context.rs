@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::Protocol;
+use crate::WireFormat;
 
 /// Sanitized request metadata allowed to cross into provider adapters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -13,7 +13,7 @@ pub struct RequestMetadata {
 /// Provider-neutral request envelope that preserves the source JSON payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyRequest {
-    pub protocol: Protocol,
+    pub format: WireFormat,
     pub model: String,
     pub payload: Bytes,
     pub metadata: RequestMetadata,
@@ -21,7 +21,7 @@ pub struct ProxyRequest {
 
 impl ProxyRequest {
     pub fn new(
-        protocol: Protocol,
+        format: WireFormat,
         model: impl Into<String>,
         payload: Bytes,
     ) -> Result<Self, ProxyRequestError> {
@@ -31,7 +31,7 @@ impl ProxyRequest {
         }
 
         Ok(Self {
-            protocol,
+            format,
             model,
             payload,
             metadata: RequestMetadata::default(),
@@ -42,6 +42,27 @@ impl ProxyRequest {
     pub fn with_metadata(mut self, metadata: RequestMetadata) -> Self {
         self.metadata = metadata;
         self
+    }
+}
+
+/// Request encoded in the native wire format expected by a provider driver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRequest {
+    pub format: WireFormat,
+    pub model: String,
+    pub payload: Bytes,
+    pub metadata: RequestMetadata,
+}
+
+impl ProviderRequest {
+    #[must_use]
+    pub fn from_proxy(request: ProxyRequest, format: WireFormat) -> Self {
+        Self {
+            format,
+            model: request.model,
+            payload: request.payload,
+            metadata: request.metadata,
+        }
     }
 }
 

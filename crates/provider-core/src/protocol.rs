@@ -1,9 +1,43 @@
 use serde::{Deserialize, Serialize};
 
-/// Downstream protocol used by the calling agent.
+use crate::{ProviderError, ProviderRequest, ProviderStream, ProxyRequest};
+
+/// Request and response schema used on one side of the proxy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Protocol {
-    CodexResponses,
+pub enum WireFormat {
+    OpenAiResponses,
     ClaudeMessages,
+}
+
+/// Prepared native provider request and its per-request response translator.
+pub struct PreparedProviderRequest {
+    request: ProviderRequest,
+    response: Box<dyn ResponseTranslator>,
+}
+
+impl PreparedProviderRequest {
+    #[must_use]
+    pub fn new(request: ProviderRequest, response: Box<dyn ResponseTranslator>) -> Self {
+        Self { request, response }
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ProviderRequest, Box<dyn ResponseTranslator>) {
+        (self.request, self.response)
+    }
+}
+
+/// Converts an inbound request into the native format of a selected provider.
+pub trait ProtocolBridge: Send + Sync {
+    fn prepare(
+        &self,
+        request: ProxyRequest,
+        target: WireFormat,
+    ) -> Result<PreparedProviderRequest, ProviderError>;
+}
+
+/// Stateful response conversion created for one request.
+pub trait ResponseTranslator: Send {
+    fn translate_stream(self: Box<Self>, stream: ProviderStream) -> ProviderStream;
 }

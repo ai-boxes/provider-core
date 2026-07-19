@@ -1213,7 +1213,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "provider-grok"
+name = "provider-drivers"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1228,6 +1228,17 @@ dependencies = [
  "thiserror",
  "tiktoken-rs",
  "time",
+ "tokio",
+]
+
+[[package]]
+name = "provider-protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "provider-core",
+ "serde_json",
  "tokio",
 ]
 
@@ -1252,7 +1263,8 @@ dependencies = [
  "bytes",
  "futures-util",
  "provider-core",
- "provider-grok",
+ "provider-drivers",
+ "provider-protocol",
  "provider-runtime",
  "provider-storage",
  "reqwest",

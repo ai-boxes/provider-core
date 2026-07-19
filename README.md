@@ -1,11 +1,18 @@
 # provider-core
 
-A Rust-based provider core project.
+A local Rust service that exposes Codex- and Claude-compatible APIs for upstream AI providers.
+
+## Workspace
+
+- `crates/provider-core`: stable provider, account, and proxy contracts
+- `crates/provider-protocol`: downstream wire protocol conversion
+- `crates/provider-drivers`: built-in upstream provider drivers
+- `crates/provider-runtime`: live accounts and credential refresh coordination
+- `crates/provider-storage`: SQLx and SQLite persistence
+- `crates/provider-server`: Axum HTTP server and process composition
 
 ~~~bash
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ~~~
-
-The project is in its initial setup phase. Architecture, APIs, and runtime choices are not defined yet.

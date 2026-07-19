@@ -2,7 +2,7 @@ use provider_core::{RefreshError, RefreshErrorKind};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::GrokCredentials;
+use super::credentials::GrokCredentials;
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const MAX_TOKEN_RESPONSE_SIZE: usize = 64 * 1024;

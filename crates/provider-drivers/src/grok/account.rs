@@ -8,31 +8,37 @@ use std::{
 use async_trait::async_trait;
 use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRuntimeState, CredentialUpdate,
-    CredentialWriteOutcome, Protocol, Provider, ProviderAccount, ProviderError, ProviderErrorKind,
-    ProviderModel, ProviderStream, ProxyRequest, RefreshError, RefreshErrorKind, RefreshOutcome,
-    RefreshTrigger, StoredProviderAccount, TokenCounter,
+    CredentialWriteOutcome, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
+    ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
+    RefreshTrigger, StoredProviderAccount, TokenCounter, WireFormat,
 };
 
-use crate::{
-    Cl100kTokenCounter, GrokAuthError, GrokClient, GrokCredentials, grok_models,
+use super::{
+    client::GrokClient,
+    credentials::{GrokAuthError, GrokCredentials},
+    models::grok_models,
     refresh::GrokRefreshClient,
-    request::{prepare_claude_request, prepare_codex_request},
-    response::adapt_grok_stream_to_claude,
+    request::prepare_request,
+    token_count::Cl100kTokenCounter,
 };
 
 const GROK_CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const REFRESH_LEAD_SECONDS: i64 = 5 * 60;
 const PERSISTENCE_RETRY_SECONDS: i64 = 30;
 
-/// Grok adapter and credential state for one provider account.
-#[derive(Clone)]
-pub struct GrokProvider {
-    account_id: AccountId,
-    repository: Option<Arc<dyn AccountRepository>>,
-    state: Arc<RwLock<GrokState>>,
+/// Shared xAI implementation used by all Grok accounts.
+pub struct GrokDriver {
     client: GrokClient,
     refresh_client: GrokRefreshClient,
     token_counter: Cl100kTokenCounter,
+}
+
+/// Credential and persistence state for one Grok account.
+struct GrokAccount {
+    driver: Arc<GrokDriver>,
+    account_id: AccountId,
+    repository: Option<Arc<dyn AccountRepository>>,
+    state: RwLock<GrokState>,
 }
 
 #[derive(Clone)]
@@ -47,8 +53,98 @@ struct GrokState {
     pending_update: Option<CredentialUpdate>,
 }
 
-impl GrokProvider {
-    pub fn from_stored(
+impl Default for GrokDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrokDriver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            client: GrokClient::new(),
+            refresh_client: GrokRefreshClient::new(),
+            token_counter: Cl100kTokenCounter,
+        }
+    }
+
+    pub fn load_account(
+        self: &Arc<Self>,
+        account: StoredProviderAccount,
+        repository: Arc<dyn AccountRepository>,
+    ) -> Result<Arc<dyn ProviderAccount>, GrokAuthError> {
+        GrokAccount::from_stored(self.clone(), account, repository)
+            .map(|account| Arc::new(account) as Arc<dyn ProviderAccount>)
+    }
+
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(base_url: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            client: GrokClient::with_base_url(base_url),
+            refresh_client: GrokRefreshClient::new(),
+            token_counter: Cl100kTokenCounter,
+        })
+    }
+
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_account(
+        self: &Arc<Self>,
+        access_token: impl Into<String>,
+    ) -> Arc<dyn ProviderAccount> {
+        Arc::new(GrokAccount::for_test(self.clone(), access_token))
+    }
+
+    async fn execute_stream(
+        &self,
+        credentials: &GrokCredentials,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let prepared = prepare_request(request)?;
+        self.client
+            .execute_stream(credentials, prepared.payload, &prepared.metadata)
+            .await
+    }
+
+    fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
+        let prepared = prepare_request(request)?;
+        let input = std::str::from_utf8(&prepared.payload).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                "normalized Grok request was not valid UTF-8",
+            )
+        })?;
+
+        self.token_counter.count(input).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("failed to count Grok request tokens: {error}"),
+            )
+        })
+    }
+}
+
+impl ProviderDriver for GrokDriver {
+    fn name(&self) -> &'static str {
+        "grok"
+    }
+
+    fn native_format(&self) -> WireFormat {
+        WireFormat::OpenAiResponses
+    }
+
+    fn models(&self) -> &[ProviderModel] {
+        grok_models()
+    }
+}
+
+impl GrokAccount {
+    fn from_stored(
+        driver: Arc<GrokDriver>,
         account: StoredProviderAccount,
         repository: Arc<dyn AccountRepository>,
     ) -> Result<Self, GrokAuthError> {
@@ -74,19 +170,14 @@ impl GrokProvider {
             auth_state: account.auth_state,
             pending_update: None,
         };
-        Ok(Self::build(
-            account_id,
-            state,
-            Some(repository),
-            GrokClient::new(),
-        ))
+        Ok(Self::build(driver, account_id, state, Some(repository)))
     }
 
     #[cfg(feature = "test-util")]
-    #[doc(hidden)]
-    pub fn for_test(access_token: impl Into<String>, base_url: impl Into<String>) -> Self {
+    fn for_test(driver: Arc<GrokDriver>, access_token: impl Into<String>) -> Self {
         let account_id = static_account_id("test-grok");
         Self::build(
+            driver,
             account_id,
             GrokState {
                 credentials: GrokCredentials::from_access_token(access_token),
@@ -99,23 +190,20 @@ impl GrokProvider {
                 pending_update: None,
             },
             None,
-            GrokClient::with_base_url(base_url),
         )
     }
 
     fn build(
+        driver: Arc<GrokDriver>,
         account_id: AccountId,
         state: GrokState,
         repository: Option<Arc<dyn AccountRepository>>,
-        client: GrokClient,
     ) -> Self {
         Self {
+            driver,
             account_id,
             repository,
-            state: Arc::new(RwLock::new(state)),
-            client,
-            refresh_client: GrokRefreshClient::new(),
-            token_counter: Cl100kTokenCounter,
+            state: RwLock::new(state),
         }
     }
 
@@ -184,62 +272,11 @@ impl GrokProvider {
 }
 
 #[async_trait]
-impl Provider for GrokProvider {
-    fn name(&self) -> &'static str {
+impl ProviderAccount for GrokAccount {
+    fn provider_name(&self) -> &'static str {
         "grok"
     }
 
-    fn models(&self) -> &[ProviderModel] {
-        grok_models()
-    }
-
-    async fn execute_stream(&self, request: ProxyRequest) -> Result<ProviderStream, ProviderError> {
-        let credentials = self.snapshot();
-        match request.protocol {
-            Protocol::CodexResponses => {
-                let prepared = prepare_codex_request(request)?;
-                self.client
-                    .execute_stream(&credentials, prepared.payload, &prepared.metadata)
-                    .await
-            }
-            Protocol::ClaudeMessages => {
-                let prepared = prepare_claude_request(request)?;
-                let stream = self
-                    .client
-                    .execute_stream(
-                        &credentials,
-                        prepared.upstream.payload,
-                        &prepared.upstream.metadata,
-                    )
-                    .await?;
-                Ok(adapt_grok_stream_to_claude(stream, prepared.response))
-            }
-        }
-    }
-
-    async fn count_tokens(&self, request: ProxyRequest) -> Result<u64, ProviderError> {
-        let prepared = match request.protocol {
-            Protocol::CodexResponses => prepare_codex_request(request)?,
-            Protocol::ClaudeMessages => prepare_claude_request(request)?.upstream,
-        };
-        let input = std::str::from_utf8(&prepared.payload).map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Internal,
-                "normalized Grok request was not valid UTF-8",
-            )
-        })?;
-
-        self.token_counter.count(input).map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Internal,
-                format!("failed to count Grok request tokens: {error}"),
-            )
-        })
-    }
-}
-
-#[async_trait]
-impl ProviderAccount for GrokProvider {
     fn account_id(&self) -> &AccountId {
         &self.account_id
     }
@@ -248,6 +285,17 @@ impl ProviderAccount for GrokProvider {
         runtime_state(&self.state())
     }
 
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let credentials = self.snapshot();
+        self.driver.execute_stream(&credentials, request).await
+    }
+
+    async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
+        self.driver.count_tokens(request)
+    }
     async fn refresh_credentials(
         &self,
         _trigger: RefreshTrigger,
@@ -270,7 +318,12 @@ impl ProviderAccount for GrokProvider {
                 "Grok account requires authorization",
             ));
         }
-        let tokens = match self.refresh_client.refresh(&current.credentials).await {
+        let tokens = match self
+            .driver
+            .refresh_client
+            .refresh(&current.credentials)
+            .await
+        {
             Ok(tokens) => tokens,
             Err(error) if error.kind() == RefreshErrorKind::ReauthRequired => {
                 self.mark_reauth_required(repository).await;

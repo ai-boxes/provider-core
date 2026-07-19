@@ -1,7 +1,8 @@
 use std::{error::Error, sync::Arc};
 
 use provider_core::{AccountRepository, ProxyService};
-use provider_grok::{GrokProvider, grok_models};
+use provider_drivers::grok::GrokDriver;
+use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntime;
 use provider_storage::SqliteAccountRepository;
 use tokio::net::TcpListener;
@@ -13,7 +14,8 @@ use crate::{
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
-    let runtime = ProviderRuntime::new("grok", grok_models().to_vec());
+    let driver = Arc::new(GrokDriver::new());
+    let runtime = ProviderRuntime::new(driver.clone());
     for account in repository.load_enabled_accounts().await? {
         if account.provider.trim() != "grok" {
             return Err(format!(
@@ -23,14 +25,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             .into());
         }
         runtime
-            .register(Arc::new(GrokProvider::from_stored(
-                account,
-                repository.clone(),
-            )?))
+            .register(driver.load_account(account, repository.clone())?)
             .await?;
     }
 
-    let service = ProxyService::new(Arc::new(runtime.clone()));
+    let service = ProxyService::new(Arc::new(runtime.clone()), Arc::new(DefaultProtocolBridge));
     let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
 
     println!("provider-core listening on http://{LISTEN_ADDRESS}");

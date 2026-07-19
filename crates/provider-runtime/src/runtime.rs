@@ -8,8 +8,9 @@ use std::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use provider_core::{
-    AccountId, Provider, ProviderAccount, ProviderError, ProviderErrorKind, ProviderModel,
-    ProviderStream, ProxyRequest, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
+    AccountId, Provider, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
+    ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
+    RefreshTrigger, WireFormat,
 };
 use thiserror::Error;
 use tokio::{
@@ -28,8 +29,7 @@ pub struct ProviderRuntime {
 }
 
 struct RuntimeInner {
-    provider_name: &'static str,
-    models: Vec<ProviderModel>,
+    driver: Arc<dyn ProviderDriver>,
     accounts: RwLock<BTreeMap<AccountId, Arc<AccountEntry>>>,
     refresh_limit: Arc<Semaphore>,
     scheduler_tx: mpsc::UnboundedSender<SchedulerCommand>,
@@ -59,12 +59,11 @@ pub enum ProviderRuntimeError {
 
 impl ProviderRuntime {
     #[must_use]
-    pub fn new(provider_name: &'static str, models: Vec<ProviderModel>) -> Self {
+    pub fn new(driver: Arc<dyn ProviderDriver>) -> Self {
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let inner = Arc::new(RuntimeInner {
-            provider_name,
-            models,
+            driver,
             accounts: RwLock::new(BTreeMap::new()),
             refresh_limit: Arc::new(Semaphore::new(DEFAULT_REFRESH_CONCURRENCY)),
             scheduler_tx,
@@ -83,7 +82,7 @@ impl ProviderRuntime {
         &self,
         account: Arc<dyn ProviderAccount>,
     ) -> Result<(), ProviderRuntimeError> {
-        if account.name() != self.inner.provider_name {
+        if account.provider_name() != self.inner.driver.name() {
             return Err(ProviderRuntimeError::ProviderMismatch);
         }
         let account_id = account.account_id().clone();
@@ -201,14 +200,21 @@ impl Drop for RuntimeInner {
 #[async_trait]
 impl Provider for ProviderRuntime {
     fn name(&self) -> &'static str {
-        self.inner.provider_name
+        self.inner.driver.name()
+    }
+
+    fn native_format(&self) -> WireFormat {
+        self.inner.driver.native_format()
     }
 
     fn models(&self) -> &[ProviderModel] {
-        &self.inner.models
+        self.inner.driver.models()
     }
 
-    async fn execute_stream(&self, request: ProxyRequest) -> Result<ProviderStream, ProviderError> {
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
         let entry = self.selected_account().await?;
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
@@ -227,7 +233,7 @@ impl Provider for ProviderRuntime {
         }
     }
 
-    async fn count_tokens(&self, request: ProxyRequest) -> Result<u64, ProviderError> {
+    async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
         self.selected_account()
             .await?
             .account
@@ -398,9 +404,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use futures_util::stream;
-    use provider_core::{
-        AccountAuthState, AccountRuntimeState, Protocol, RefreshOutcome, RequestMetadata,
-    };
+    use provider_core::{AccountAuthState, AccountRuntimeState, RefreshOutcome, RequestMetadata};
     use tokio::sync::{Barrier, Notify};
 
     use super::*;
@@ -417,19 +421,44 @@ mod tests {
         release_refresh: Notify,
     }
 
-    #[async_trait]
-    impl Provider for UnauthorizedAccount {
+    struct TestDriver;
+
+    impl ProviderDriver for TestDriver {
         fn name(&self) -> &'static str {
             "test"
+        }
+
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
         }
 
         fn models(&self) -> &[ProviderModel] {
             &[]
         }
+    }
+
+    #[async_trait]
+    impl ProviderAccount for UnauthorizedAccount {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn account_id(&self) -> &AccountId {
+            &self.id
+        }
+
+        fn runtime_state(&self) -> AccountRuntimeState {
+            AccountRuntimeState {
+                generation: self.generation.load(Ordering::SeqCst),
+                next_refresh_at: (self.generation.load(Ordering::SeqCst) == 0).then_some(0),
+                auth_state: AccountAuthState::Active,
+                persistence_pending: false,
+            }
+        }
 
         async fn execute_stream(
             &self,
-            _request: ProxyRequest,
+            _request: ProviderRequest,
         ) -> Result<ProviderStream, ProviderError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             if self.generation.load(Ordering::SeqCst) == 0 {
@@ -446,24 +475,8 @@ mod tests {
             Ok(Box::pin(stream::empty()))
         }
 
-        async fn count_tokens(&self, _request: ProxyRequest) -> Result<u64, ProviderError> {
+        async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
             Ok(0)
-        }
-    }
-
-    #[async_trait]
-    impl ProviderAccount for UnauthorizedAccount {
-        fn account_id(&self) -> &AccountId {
-            &self.id
-        }
-
-        fn runtime_state(&self) -> AccountRuntimeState {
-            AccountRuntimeState {
-                generation: self.generation.load(Ordering::SeqCst),
-                next_refresh_at: (self.generation.load(Ordering::SeqCst) == 0).then_some(0),
-                auth_state: AccountAuthState::Active,
-                persistence_pending: false,
-            }
         }
 
         async fn refresh_credentials(
@@ -493,14 +506,14 @@ mod tests {
             refresh_started: Notify::new(),
             release_refresh: Notify::new(),
         });
-        let runtime = ProviderRuntime::new("test", Vec::new());
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
         runtime
             .register(account.clone())
             .await
             .expect("register account");
         account.refresh_started.notified().await;
-        let request = ProxyRequest {
-            protocol: Protocol::CodexResponses,
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
             model: "test-model".to_owned(),
             payload: Default::default(),
             metadata: RequestMetadata::default(),
