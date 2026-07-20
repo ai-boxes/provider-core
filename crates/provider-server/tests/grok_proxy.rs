@@ -8,10 +8,13 @@ use axum::{
     routing::post,
 };
 use futures_util::stream;
+use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::ProxyService;
 use provider_drivers::grok::GrokDriver;
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntime;
+use provider_storage::SqliteAccountRepository;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -62,13 +65,48 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .register(driver.test_account("mock-token"))
         .await
         .expect("register Grok account");
-    let service = ProxyService::new(Arc::new(runtime.clone()), Arc::new(DefaultProtocolBridge));
-    let (server_url, server) = spawn(provider_server::router(service)).await;
+    let repository = Arc::new(
+        SqliteAccountRepository::in_memory()
+            .await
+            .expect("repository"),
+    );
+    let auth = AuthService::new(repository.clone());
+    let grant = auth
+        .setup(
+            "admin".to_owned(),
+            SecretString::from("secret".to_owned()),
+            unix_timestamp(),
+        )
+        .await
+        .expect("initial setup");
+    let api_keys = ApiKeyAuthenticator::load(repository)
+        .await
+        .expect("API key index");
+    let created_key = api_keys
+        .create(
+            &grant.user.id,
+            "test".to_owned(),
+            Some(SecretString::from("test-api-key-123".to_owned())),
+            None,
+            unix_timestamp(),
+        )
+        .await
+        .expect("create API key");
+    let api_key = created_key.key.expose_secret().to_owned();
+    let service = ProxyService::new(
+        Arc::new(runtime.clone()),
+        Arc::new(DefaultProtocolBridge),
+        provider_core::ProviderAccountAccess {
+            owner_user_id: Some(grant.user.id.as_str().to_owned()),
+            visibility: provider_core::ProviderVisibility::Private,
+        },
+    );
+    let (server_url, server) = spawn(provider_server::router(service, api_keys)).await;
     let client = reqwest::Client::new();
 
     let codex = client
         .post(format!("{server_url}/v1/responses"))
-        .bearer_auth("placeholder-key")
+        .bearer_auth(&api_key)
         .header("content-type", "application/json")
         .body(json!({ "model": "grok-4.5", "stream": false, "input": "hello" }).to_string())
         .send()
@@ -81,7 +119,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
 
     let claude = client
         .post(format!("{server_url}/v1/messages"))
-        .header("x-api-key", "placeholder-key")
+        .header("x-api-key", &api_key)
         .header("content-type", "application/json")
         .body(
             json!({
@@ -110,4 +148,12 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     runtime.shutdown();
     server.abort();
     upstream_server.abort();
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
 }

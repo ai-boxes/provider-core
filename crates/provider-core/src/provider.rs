@@ -101,9 +101,9 @@ pub struct ProviderRouteCandidate {
 
 /// In-memory model index used before protocol conversion and provider execution.
 pub trait ProviderRouter: Send + Sync {
-    fn models(&self) -> Vec<ProviderModel>;
+    fn models(&self, user_id: &str) -> Vec<ProviderModel>;
 
-    fn routes(&self, model: &str) -> Vec<ProviderRouteCandidate>;
+    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate>;
 }
 
 /// Shared metadata and native protocol implemented by one upstream driver.

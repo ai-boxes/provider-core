@@ -26,6 +26,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let model_catalog = ModelCatalogService::new(repository.clone());
     for account in repository.load_enabled_accounts().await? {
         let kind = account.provider;
+        let access = account.access();
         let account = runtime.build_account(account)?;
         let models = model_catalog
             .refresh(account.as_ref(), unix_timestamp())
@@ -38,7 +39,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         runtime
-            .activate_account(kind, account, models.models)
+            .activate_account(kind, account, models.models, access)
             .await?;
     }
 

@@ -25,6 +25,7 @@ pub trait AuthRepository: Send + Sync {
     async fn create_initial_user(
         &self,
         user: NewUser,
+        session: NewSession,
     ) -> Result<InitialUserCreateOutcome, AuthRepositoryError>;
 
     async fn load_user_by_username(
@@ -93,7 +94,7 @@ pub trait AuthRepository: Send + Sync {
         key_id: &ApiKeyId,
         enabled: bool,
         updated_at: i64,
-    ) -> Result<bool, AuthRepositoryError>;
+    ) -> Result<Option<StoredApiKey>, AuthRepositoryError>;
 
     async fn delete_api_key(
         &self,

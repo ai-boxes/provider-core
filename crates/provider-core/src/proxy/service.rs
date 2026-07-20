@@ -3,9 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    ProtocolBridge, Provider, ProviderError, ProviderErrorKind, ProviderModel, ProviderRequest,
-    ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream, ProxyRequest,
-    WireFormat,
+    ProtocolBridge, Provider, ProviderAccountAccess, ProviderError, ProviderErrorKind,
+    ProviderModel, ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter,
+    ProviderStream, ProxyRequest, WireFormat,
 };
 
 /// Application service that delegates proxy operations to the active provider.
@@ -17,8 +17,15 @@ pub struct ProxyService {
 
 impl ProxyService {
     #[must_use]
-    pub fn new(provider: Arc<dyn Provider>, protocol: Arc<dyn ProtocolBridge>) -> Self {
-        Self::with_router(Arc::new(SingleProviderRouter::new(provider)), protocol)
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        protocol: Arc<dyn ProtocolBridge>,
+        access: ProviderAccountAccess,
+    ) -> Self {
+        Self::with_router(
+            Arc::new(SingleProviderRouter::new(provider, access)),
+            protocol,
+        )
     }
 
     #[must_use]
@@ -27,15 +34,16 @@ impl ProxyService {
     }
 
     #[must_use]
-    pub fn models(&self) -> Vec<ProviderModel> {
-        self.router.models()
+    pub fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+        self.router.models(user_id)
     }
 
     pub async fn execute_stream(
         &self,
+        user_id: &str,
         request: ProxyRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        let route = self.resolve_route(&request)?;
+        let route = self.resolve_route(user_id, &request)?;
         let mut request = request;
         request.model = route.upstream_model;
         let prepared = self
@@ -46,8 +54,12 @@ impl ProxyService {
         Ok(response.translate_stream(stream))
     }
 
-    pub async fn count_tokens(&self, request: ProxyRequest) -> Result<u64, ProviderError> {
-        let route = self.resolve_route(&request)?;
+    pub async fn count_tokens(
+        &self,
+        user_id: &str,
+        request: ProxyRequest,
+    ) -> Result<u64, ProviderError> {
+        let route = self.resolve_route(user_id, &request)?;
         let mut request = request;
         request.model = route.upstream_model;
         let prepared = self
@@ -59,10 +71,11 @@ impl ProxyService {
 
     fn resolve_route(
         &self,
+        user_id: &str,
         request: &ProxyRequest,
     ) -> Result<ProviderRouteCandidate, ProviderError> {
         self.router
-            .routes(&request.model)
+            .routes(user_id, &request.model)
             .into_iter()
             .find(|candidate| {
                 self.protocol
@@ -80,23 +93,35 @@ impl ProxyService {
 struct SingleProviderRouter {
     provider: Arc<dyn Provider>,
     route: Arc<dyn ProviderRoute>,
+    access: ProviderAccountAccess,
 }
 
 impl SingleProviderRouter {
-    fn new(provider: Arc<dyn Provider>) -> Self {
+    fn new(provider: Arc<dyn Provider>, access: ProviderAccountAccess) -> Self {
         let route: Arc<dyn ProviderRoute> = Arc::new(SingleProviderRoute {
             provider: provider.clone(),
         });
-        Self { provider, route }
+        Self {
+            provider,
+            route,
+            access,
+        }
     }
 }
 
 impl ProviderRouter for SingleProviderRouter {
-    fn models(&self) -> Vec<ProviderModel> {
-        self.provider.models().to_vec()
+    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+        if self.access.allows(user_id) {
+            self.provider.models().to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
-    fn routes(&self, model: &str) -> Vec<ProviderRouteCandidate> {
+    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
+        if !self.access.allows(user_id) {
+            return Vec::new();
+        }
         vec![ProviderRouteCandidate {
             upstream_model: model.to_owned(),
             route: self.route.clone(),

@@ -6,7 +6,7 @@ mod manager;
 mod model_catalog;
 
 pub use manager::{
-    CreatedProviderAccount, OAuthSessionSnapshot, OAuthSessionStatus,
+    CreatedProviderAccount, DirectProviderAccountInput, OAuthSessionSnapshot, OAuthSessionStatus,
     ProviderCredentialReplacement, ProviderManager, ProviderManagerError,
 };
 pub use model_catalog::{

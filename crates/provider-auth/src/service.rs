@@ -5,6 +5,7 @@ use std::{
 
 use secrecy::SecretString;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::{
     ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
@@ -24,7 +25,6 @@ pub struct SessionGrant {
     pub refresh_token: SecretString,
     pub access_expires_at: i64,
     pub refresh_expires_at: i64,
-    pub absolute_expires_at: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,11 +66,29 @@ impl AuthService {
             enabled: true,
             created_at: now,
         };
-        if self.repository.create_initial_user(user).await? != InitialUserCreateOutcome::Created {
+        let tokens = issue_session_tokens(now)?;
+        if self
+            .repository
+            .create_initial_user(
+                user,
+                NewSession {
+                    id: SessionId::random(),
+                    user_id: user_id.clone(),
+                    access_token_hash: tokens.access.digest,
+                    refresh_token_hash: tokens.refresh.digest,
+                    access_expires_at: tokens.access_expires_at,
+                    refresh_expires_at: tokens.refresh_expires_at,
+                    absolute_expires_at: tokens.absolute_expires_at,
+                    created_at: now,
+                },
+            )
+            .await?
+            != InitialUserCreateOutcome::Created
+        {
             return Err(AuthError::AlreadyConfigured);
         }
-        self.create_session(
-            UserSummary {
+        Ok(SessionGrant {
+            user: UserSummary {
                 id: user_id,
                 username,
                 role: UserRole::SuperAdmin,
@@ -78,9 +96,11 @@ impl AuthService {
                 created_at: now,
                 updated_at: now,
             },
-            now,
-        )
-        .await
+            access_token: tokens.access.secret,
+            refresh_token: tokens.refresh.secret,
+            access_expires_at: tokens.access_expires_at,
+            refresh_expires_at: tokens.refresh_expires_at,
+        })
     }
 
     pub async fn login(
@@ -157,7 +177,6 @@ impl AuthService {
             refresh_token: tokens.refresh.secret,
             access_expires_at: tokens.access_expires_at,
             refresh_expires_at: tokens.refresh_expires_at,
-            absolute_expires_at: tokens.absolute_expires_at,
         })
     }
 
@@ -229,7 +248,6 @@ impl AuthService {
             refresh_token: tokens.refresh.secret,
             access_expires_at: tokens.access_expires_at,
             refresh_expires_at: tokens.refresh_expires_at,
-            absolute_expires_at: tokens.absolute_expires_at,
         })
     }
 }
@@ -238,6 +256,7 @@ impl AuthService {
 pub struct ApiKeyAuthenticator {
     repository: Arc<dyn AuthRepository>,
     active: Arc<RwLock<HashMap<[u8; 32], ActiveApiKey>>>,
+    mutation: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -249,12 +268,12 @@ struct ActiveApiKey {
 
 impl ApiKeyAuthenticator {
     pub async fn load(repository: Arc<dyn AuthRepository>) -> Result<Self, AuthError> {
-        let authenticator = Self {
+        let keys = repository.load_active_api_keys().await?;
+        Ok(Self {
             repository,
-            active: Arc::new(RwLock::new(HashMap::new())),
-        };
-        authenticator.reload().await?;
-        Ok(authenticator)
+            active: Arc::new(RwLock::new(active_key_map(keys))),
+            mutation: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn authenticate(&self, key: &str, now: i64) -> Result<AuthenticatedApiKey, AuthError> {
@@ -292,10 +311,21 @@ impl ApiKeyAuthenticator {
             expires_at,
             created_at: now,
         };
+        let _mutation = self.mutation.lock().await;
         if !self.repository.create_api_key(key.clone()).await? {
             return Err(AuthError::Conflict);
         }
-        self.reload().await?;
+        self.active
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                key.key_hash,
+                ActiveApiKey {
+                    id: key.id.clone(),
+                    owner_user_id: key.owner_user_id.clone(),
+                    expires_at: key.expires_at,
+                },
+            );
         Ok(CreatedApiKey {
             summary: ApiKeySummary {
                 id: key.id,
@@ -322,32 +352,78 @@ impl ApiKeyAuthenticator {
         enabled: bool,
         now: i64,
     ) -> Result<(), AuthError> {
-        if !self
+        let _mutation = self.mutation.lock().await;
+        let removed = if enabled {
+            None
+        } else {
+            self.remove_active(owner_user_id, key_id)
+        };
+        let updated = match self
             .repository
             .set_api_key_enabled(owner_user_id, key_id, enabled, now)
-            .await?
+            .await
         {
-            return Err(AuthError::NotFound);
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.restore_active(removed);
+                return Err(AuthError::NotFound);
+            }
+            Err(error) => {
+                self.restore_active(removed);
+                return Err(error.into());
+            }
+        };
+        if enabled {
+            self.active
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    updated.key_hash,
+                    ActiveApiKey {
+                        id: updated.id,
+                        owner_user_id: updated.owner_user_id,
+                        expires_at: updated.expires_at,
+                    },
+                );
         }
-        self.reload().await
+        Ok(())
     }
 
     pub async fn delete(&self, owner_user_id: &UserId, key_id: &ApiKeyId) -> Result<(), AuthError> {
-        if !self
-            .repository
-            .delete_api_key(owner_user_id, key_id)
-            .await?
-        {
-            return Err(AuthError::NotFound);
+        let _mutation = self.mutation.lock().await;
+        let removed = self.remove_active(owner_user_id, key_id);
+        match self.repository.delete_api_key(owner_user_id, key_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.restore_active(removed);
+                Err(AuthError::NotFound)
+            }
+            Err(error) => {
+                self.restore_active(removed);
+                Err(error.into())
+            }
         }
-        self.reload().await
     }
 
-    async fn reload(&self) -> Result<(), AuthError> {
-        let keys = self.repository.load_active_api_keys().await?;
+    fn remove_active(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+    ) -> Option<([u8; 32], ActiveApiKey)> {
         let mut active = self.active.write().unwrap_or_else(PoisonError::into_inner);
-        *active = active_key_map(keys);
-        Ok(())
+        let digest = active.iter().find_map(|(digest, key)| {
+            (key.id == *key_id && key.owner_user_id == *owner_user_id).then_some(*digest)
+        })?;
+        active.remove_entry(&digest)
+    }
+
+    fn restore_active(&self, removed: Option<([u8; 32], ActiveApiKey)>) {
+        if let Some((digest, key)) = removed {
+            self.active
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(digest, key);
+        }
     }
 }
 

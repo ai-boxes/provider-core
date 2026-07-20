@@ -158,6 +158,40 @@ impl FromStr for AccountAuthState {
 #[error("unsupported account auth state")]
 pub struct AccountAuthStateError;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderVisibility {
+    #[default]
+    Private,
+    Shared,
+}
+
+impl ProviderVisibility {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+impl FromStr for ProviderVisibility {
+    type Err = ProviderVisibilityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "private" => Ok(Self::Private),
+            "shared" => Ok(Self::Shared),
+            _ => Err(ProviderVisibilityError),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("unsupported provider visibility")]
+pub struct ProviderVisibilityError;
+
 #[derive(Clone, Debug)]
 pub struct StoredCredential {
     pub kind: CredentialKind,
@@ -172,6 +206,8 @@ pub struct StoredCredential {
 #[derive(Clone, Debug)]
 pub struct StoredProviderAccount {
     pub id: AccountId,
+    pub owner_user_id: Option<String>,
+    pub visibility: ProviderVisibility,
     pub provider: ProviderKind,
     pub label: String,
     pub config_json: String,
@@ -181,6 +217,31 @@ pub struct StoredProviderAccount {
     pub created_at: i64,
     pub updated_at: i64,
     pub credential: StoredCredential,
+}
+
+impl StoredProviderAccount {
+    #[must_use]
+    pub fn access(&self) -> ProviderAccountAccess {
+        ProviderAccountAccess {
+            owner_user_id: self.owner_user_id.clone(),
+            visibility: self.visibility,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAccountAccess {
+    pub owner_user_id: Option<String>,
+    pub visibility: ProviderVisibility,
+}
+
+impl ProviderAccountAccess {
+    #[must_use]
+    pub fn allows(&self, user_id: &str) -> bool {
+        self.owner_user_id.as_deref().is_some_and(|owner_user_id| {
+            owner_user_id == user_id || self.visibility == ProviderVisibility::Shared
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +266,8 @@ pub struct NewProviderAccount {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderAccountSummary {
     pub id: AccountId,
+    pub owner_user_id: Option<String>,
+    pub visibility: ProviderVisibility,
     pub provider: ProviderKind,
     pub label: String,
     pub config_json: String,
@@ -220,6 +283,7 @@ pub struct ProviderAccountSummary {
 pub struct ProviderAccountUpdate {
     pub label: String,
     pub config_json: String,
+    pub visibility: ProviderVisibility,
     pub updated_at: i64,
 }
 
@@ -379,6 +443,7 @@ pub trait AccountRepository: Send + Sync {
 pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
     async fn list_provider_accounts(
         &self,
+        actor_user_id: &str,
     ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
 
     async fn load_provider_account(
@@ -389,6 +454,8 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
     async fn create_provider_account(
         &self,
         account: NewProviderAccount,
+        owner_user_id: &str,
+        visibility: ProviderVisibility,
     ) -> Result<ProviderAccountCreateOutcome, AccountRepositoryError>;
 
     async fn update_provider_account(

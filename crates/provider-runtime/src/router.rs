@@ -9,8 +9,9 @@ use std::{
 
 use async_trait::async_trait;
 use provider_core::{
-    AccountId, ProviderAccount, ProviderError, ProviderModel, ProviderRequest, ProviderRoute,
-    ProviderRouteCandidate, ProviderRouter, ProviderStream, StoredProviderModel, WireFormat,
+    AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
+    ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
+    ProviderVisibility, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -29,6 +30,7 @@ struct RouterInner {
 
 struct RoutedAccount {
     account: Arc<dyn ProviderAccount>,
+    access: ProviderAccountAccess,
     models: Vec<StoredProviderModel>,
     route: Arc<RuntimeAccountRoute>,
 }
@@ -67,6 +69,7 @@ impl ProviderModelRouter {
         runtime: ProviderRuntime,
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
+        access: ProviderAccountAccess,
     ) -> Result<(), ProviderModelRouterError> {
         if account.provider_name() != runtime.provider_name() {
             return Err(ProviderModelRouterError::ProviderMismatch);
@@ -80,6 +83,7 @@ impl ProviderModelRouter {
             account_id,
             RoutedAccount {
                 account,
+                access,
                 models,
                 route,
             },
@@ -89,6 +93,41 @@ impl ProviderModelRouter {
 
     pub fn remove_account(&self, account_id: &AccountId) -> bool {
         self.accounts().remove(account_id).is_some()
+    }
+
+    pub fn update_account_access(
+        &self,
+        account_id: &AccountId,
+        access: ProviderAccountAccess,
+    ) -> bool {
+        let mut accounts = self.accounts();
+        let Some(account) = accounts.get_mut(account_id) else {
+            return false;
+        };
+        account.access = access;
+        true
+    }
+
+    pub fn update_account_models(
+        &self,
+        account_id: &AccountId,
+        models: Vec<StoredProviderModel>,
+    ) -> bool {
+        let mut accounts = self.accounts();
+        let Some(account) = accounts.get_mut(account_id) else {
+            return false;
+        };
+        account.models = models;
+        true
+    }
+
+    pub fn claim_unowned_account_access(&self, owner_user_id: &str) {
+        for account in self.accounts().values_mut() {
+            if account.access.owner_user_id.is_none() {
+                account.access.owner_user_id = Some(owner_user_id.to_owned());
+                account.access.visibility = ProviderVisibility::Private;
+            }
+        }
     }
 
     fn accounts(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<AccountId, RoutedAccount>> {
@@ -109,10 +148,12 @@ impl ProviderModelRouter {
 }
 
 impl ProviderRouter for ProviderModelRouter {
-    fn models(&self) -> Vec<ProviderModel> {
+    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
         let mut models = BTreeMap::new();
         for account in self.account_snapshot().values() {
-            if !account.account.runtime_state().available_for_requests() {
+            if !account.access.allows(user_id)
+                || !account.account.runtime_state().available_for_requests()
+            {
                 continue;
             }
             for model in account
@@ -136,10 +177,12 @@ impl ProviderRouter for ProviderModelRouter {
         models.into_values().collect()
     }
 
-    fn routes(&self, model: &str) -> Vec<ProviderRouteCandidate> {
+    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
         let mut routes = Vec::new();
         for account in self.account_snapshot().values() {
-            if !account.account.runtime_state().available_for_requests() {
+            if !account.access.allows(user_id)
+                || !account.account.runtime_state().available_for_requests()
+            {
                 continue;
             }
             for provider_model in account.models.iter().filter(|provider_model| {
@@ -201,8 +244,8 @@ fn random_index(state: &RandomState, counter: &AtomicU64, length: usize) -> usiz
 mod tests {
     use futures_util::{StreamExt, stream};
     use provider_core::{
-        AccountAuthState, AccountRuntimeState, RefreshError, RefreshOutcome, RefreshTrigger,
-        RequestMetadata,
+        AccountAuthState, AccountRuntimeState, ProviderVisibility, RefreshError, RefreshOutcome,
+        RefreshTrigger, RequestMetadata,
     };
 
     use super::*;
@@ -297,6 +340,7 @@ mod tests {
                     stored_model(&first.id, "upstream-a", "shared"),
                     non_routable_model(&first.id, "grok-imagine-image"),
                 ],
+                access("owner-a", ProviderVisibility::Private),
             )
             .expect("first routes");
         router
@@ -304,15 +348,16 @@ mod tests {
                 runtime.clone(),
                 second.clone(),
                 vec![stored_model(&second.id, "upstream-b", "shared")],
+                access("owner-b", ProviderVisibility::Shared),
             )
             .expect("second routes");
 
-        let models = router.models();
+        let models = router.models("owner-a");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "shared");
-        assert!(router.routes("grok-imagine-image").is_empty());
+        assert!(router.routes("owner-a", "grok-imagine-image").is_empty());
 
-        let routes = router.routes("shared");
+        let routes = router.routes("owner-a", "shared");
         assert_eq!(routes.len(), 2);
         let mut outputs = Vec::new();
         for route in routes {
@@ -342,7 +387,40 @@ mod tests {
             outputs,
             vec!["account-a:upstream-a", "account-b:upstream-b"]
         );
+        assert_eq!(router.routes("owner-b", "shared").len(), 1);
+        assert_eq!(router.routes("other-user", "shared").len(), 1);
+
+        assert!(
+            router
+                .update_account_access(&second.id, access("owner-b", ProviderVisibility::Private),)
+        );
+        assert!(router.routes("other-user", "shared").is_empty());
+        assert_eq!(router.routes("owner-b", "shared").len(), 1);
+
+        assert!(router.update_account_access(
+            &first.id,
+            ProviderAccountAccess {
+                owner_user_id: None,
+                visibility: ProviderVisibility::Private,
+            },
+        ));
+        assert!(router.routes("owner-a", "shared").is_empty());
+        router.claim_unowned_account_access("owner-a");
+        assert_eq!(router.routes("owner-a", "shared").len(), 1);
+        assert!(router.update_account_models(
+            &first.id,
+            vec![stored_model(&first.id, "upstream-a", "updated")],
+        ));
+        assert!(router.routes("owner-a", "shared").is_empty());
+        assert_eq!(router.routes("owner-a", "updated").len(), 1);
         runtime.shutdown();
+    }
+
+    fn access(owner_user_id: &str, visibility: ProviderVisibility) -> ProviderAccountAccess {
+        ProviderAccountAccess {
+            owner_user_id: Some(owner_user_id.to_owned()),
+            visibility,
+        }
     }
 
     fn stored_model(

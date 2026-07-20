@@ -10,8 +10,8 @@ use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
     CredentialUpdate, CredentialWriteOutcome, DiscoveredProviderModel, NewProviderAccount,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
-    ProviderManagementRepository, ProviderModelOverride, StoredCredential, StoredProviderAccount,
-    StoredProviderModel,
+    ProviderManagementRepository, ProviderModelOverride, ProviderVisibility, StoredCredential,
+    StoredProviderAccount, StoredProviderModel,
 };
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{
@@ -79,6 +79,8 @@ impl AccountRepository for SqliteAccountRepository {
             r#"
             SELECT
                 a.id,
+                a.owner_user_id,
+                a.visibility,
                 a.provider,
                 a.label,
                 a.config_json,
@@ -215,11 +217,14 @@ impl AccountRepository for SqliteAccountRepository {
 impl ProviderManagementRepository for SqliteAccountRepository {
     async fn list_provider_accounts(
         &self,
+        actor_user_id: &str,
     ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT
                 a.id,
+                a.owner_user_id,
+                a.visibility,
                 a.provider,
                 a.label,
                 a.config_json,
@@ -231,9 +236,12 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 c.credential_kind
             FROM provider_accounts AS a
             INNER JOIN provider_credentials AS c ON c.account_id = a.id
+            WHERE a.owner_user_id IS NOT NULL
+              AND (a.owner_user_id = ? OR a.visibility = 'shared')
             ORDER BY a.created_at, a.id
             "#,
         )
+        .bind(actor_user_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| repository_error("failed to list provider accounts", error))?;
@@ -249,6 +257,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             r#"
             SELECT
                 a.id,
+                a.owner_user_id,
+                a.visibility,
                 a.provider,
                 a.label,
                 a.config_json,
@@ -280,6 +290,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
     async fn create_provider_account(
         &self,
         account: NewProviderAccount,
+        owner_user_id: &str,
+        visibility: ProviderVisibility,
     ) -> Result<ProviderAccountCreateOutcome, AccountRepositoryError> {
         let format_version = i64::from(account.credential.format_version);
         let mut transaction = self
@@ -290,12 +302,14 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let inserted = sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, provider, label, config_json, enabled, auth_state)
-            VALUES (?, ?, ?, ?, ?, 'active')
+                (id, owner_user_id, visibility, provider, label, config_json, enabled, auth_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
             ON CONFLICT(id) DO NOTHING
             "#,
         )
         .bind(account.id.as_str())
+        .bind(owner_user_id)
+        .bind(visibility.as_str())
         .bind(account.provider.as_str())
         .bind(account.label)
         .bind(account.config_json)
@@ -344,12 +358,13 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             UPDATE provider_accounts
-            SET label = ?, config_json = ?, updated_at = ?
+            SET label = ?, config_json = ?, visibility = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(update.label)
         .bind(update.config_json)
+        .bind(update.visibility.as_str())
         .bind(update.updated_at)
         .bind(account_id.as_str())
         .execute(&self.pool)
@@ -541,7 +556,13 @@ impl AuthRepository for SqliteAccountRepository {
     async fn create_initial_user(
         &self,
         user: NewUser,
+        session: NewSession,
     ) -> Result<InitialUserCreateOutcome, AuthRepositoryError> {
+        if session.user_id != user.id {
+            return Err(AuthRepositoryError::new(
+                "initial session must belong to the initial user",
+            ));
+        }
         let mut transaction = self.pool.begin().await.map_err(|error| {
             auth_repository_error("failed to start initial user transaction", error)
         })?;
@@ -601,6 +622,27 @@ impl AuthRepository for SqliteAccountRepository {
         .map_err(|error| {
             auth_repository_error("failed to assign existing providers to initial user", error)
         })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_sessions
+                (id, user_id, access_token_hash, refresh_token_hash, access_expires_at,
+                 refresh_expires_at, absolute_expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(session.id.as_str())
+        .bind(session.user_id.as_str())
+        .bind(session.access_token_hash.as_slice())
+        .bind(session.refresh_token_hash.as_slice())
+        .bind(session.access_expires_at)
+        .bind(session.refresh_expires_at)
+        .bind(session.absolute_expires_at)
+        .bind(session.created_at)
+        .bind(session.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to create initial session", error))?;
 
         transaction
             .commit()
@@ -856,22 +898,24 @@ impl AuthRepository for SqliteAccountRepository {
         key_id: &ApiKeyId,
         enabled: bool,
         updated_at: i64,
-    ) -> Result<bool, AuthRepositoryError> {
-        let result = sqlx::query(
+    ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
+        let row = sqlx::query(
             r#"
             UPDATE api_keys
             SET enabled = ?, updated_at = ?
             WHERE id = ? AND owner_user_id = ?
+            RETURNING id, owner_user_id, label, key_hash, enabled, expires_at,
+                      last_used_at, created_at, updated_at
             "#,
         )
         .bind(database_bool(enabled))
         .bind(updated_at)
         .bind(key_id.as_str())
         .bind(owner_user_id.as_str())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|error| auth_repository_error("failed to update API key status", error))?;
-        Ok(result.rows_affected() > 0)
+        row.map(stored_api_key).transpose()
     }
 
     async fn delete_api_key(
@@ -987,6 +1031,8 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
 
     Ok(StoredProviderAccount {
         id,
+        owner_user_id: row_value(&row, "owner_user_id")?,
+        visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
         config_json: row_value(&row, "config_json")?,
@@ -1027,6 +1073,8 @@ fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepo
 
     Ok(ProviderAccountSummary {
         id,
+        owner_user_id: row_value(&row, "owner_user_id")?,
+        visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
         config_json: row_value(&row, "config_json")?,
@@ -1055,6 +1103,12 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
         last_seen_at: row_value(&row, "last_seen_at")?,
         created_at: row_value(&row, "created_at")?,
         updated_at: row_value(&row, "updated_at")?,
+    })
+}
+
+fn provider_visibility(row: &SqliteRow) -> Result<ProviderVisibility, AccountRepositoryError> {
+    ProviderVisibility::from_str(&row_value::<String>(row, "visibility")?).map_err(|error| {
+        AccountRepositoryError::new(format!("invalid provider visibility: {error}"))
     })
 }
 
@@ -1350,6 +1404,21 @@ mod tests {
         let repository = SqliteAccountRepository::in_memory()
             .await
             .expect("in-memory repository");
+        let owner_user_id = UserId::new("model-owner").expect("user ID");
+        repository
+            .create_initial_user(
+                NewUser {
+                    id: owner_user_id.clone(),
+                    username: "model-owner".to_owned(),
+                    password_hash: "password-hash".to_owned(),
+                    role: UserRole::SuperAdmin,
+                    enabled: true,
+                    created_at: 1,
+                },
+                test_session("model-owner-session", owner_user_id, 20, 21),
+            )
+            .await
+            .expect("create model owner");
         let account_id = AccountId::new("grok-models").expect("account ID");
         let account = NewProviderAccount {
             id: account_id.clone(),
@@ -1369,14 +1438,18 @@ mod tests {
         };
         assert_eq!(
             repository
-                .create_provider_account(account.clone())
+                .create_provider_account(
+                    account.clone(),
+                    "model-owner",
+                    ProviderVisibility::Private,
+                )
                 .await
                 .expect("create account"),
             ProviderAccountCreateOutcome::Created
         );
         assert_eq!(
             repository
-                .create_provider_account(account)
+                .create_provider_account(account, "model-owner", ProviderVisibility::Private)
                 .await
                 .expect("duplicate account"),
             ProviderAccountCreateOutcome::Conflict
@@ -1486,18 +1559,25 @@ mod tests {
         };
         assert_eq!(
             repository
-                .create_initial_user(initial_user.clone())
+                .create_initial_user(
+                    initial_user.clone(),
+                    test_session("initial-session", initial_user.id.clone(), 10, 11),
+                )
                 .await
                 .expect("create initial user"),
             InitialUserCreateOutcome::Created
         );
+        let second_user = NewUser {
+            id: UserId::new("user-second").expect("user ID"),
+            username: "second".to_owned(),
+            ..initial_user
+        };
         assert_eq!(
             repository
-                .create_initial_user(NewUser {
-                    id: UserId::new("user-second").expect("user ID"),
-                    username: "second".to_owned(),
-                    ..initial_user
-                })
+                .create_initial_user(
+                    second_user.clone(),
+                    test_session("second-session", second_user.id, 12, 13),
+                )
                 .await
                 .expect("reject second initial user"),
             InitialUserCreateOutcome::AlreadyConfigured
@@ -1526,6 +1606,13 @@ mod tests {
                 .expect("load user")
                 .is_none()
         );
+        assert!(
+            repository
+                .load_session_by_access_hash(&[10; 32])
+                .await
+                .expect("load initial session")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1536,14 +1623,17 @@ mod tests {
         let user_id = UserId::new("user-session").expect("user ID");
         assert_eq!(
             repository
-                .create_initial_user(NewUser {
-                    id: user_id.clone(),
-                    username: "admin".to_owned(),
-                    password_hash: "password-hash".to_owned(),
-                    role: UserRole::SuperAdmin,
-                    enabled: true,
-                    created_at: 100,
-                })
+                .create_initial_user(
+                    NewUser {
+                        id: user_id.clone(),
+                        username: "admin".to_owned(),
+                        password_hash: "password-hash".to_owned(),
+                        role: UserRole::SuperAdmin,
+                        enabled: true,
+                        created_at: 100,
+                    },
+                    test_session("initial-session", user_id.clone(), 10, 11),
+                )
                 .await
                 .expect("create initial user"),
             InitialUserCreateOutcome::Created
@@ -1585,5 +1675,18 @@ mod tests {
         assert_eq!(session.access_token_hash, [3; 32]);
         assert_eq!(session.refresh_expires_at, 350);
         assert_eq!(session.absolute_expires_at, 400);
+    }
+
+    fn test_session(id: &str, user_id: UserId, access_hash: u8, refresh_hash: u8) -> NewSession {
+        NewSession {
+            id: SessionId::new(id).expect("session ID"),
+            user_id,
+            access_token_hash: [access_hash; 32],
+            refresh_token_hash: [refresh_hash; 32],
+            access_expires_at: 200,
+            refresh_expires_at: 300,
+            absolute_expires_at: 400,
+            created_at: 100,
+        }
     }
 }

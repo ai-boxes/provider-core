@@ -5,8 +5,9 @@ use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{
-    AccountId, AccountRepository, NewProviderAccount, ProviderAccount, ProviderAccountUpdate,
-    ProviderDriver, ProviderKind, StoredProviderAccount, StoredProviderModel,
+    AccountId, AccountRepository, NewProviderAccount, ProviderAccount, ProviderAccountAccess,
+    ProviderAccountUpdate, ProviderDriver, ProviderKind, StoredProviderAccount,
+    StoredProviderModel,
 };
 
 #[derive(Clone, Debug)]
@@ -134,7 +135,18 @@ pub trait ProviderControl: Send + Sync {
         kind: ProviderKind,
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
+        access: ProviderAccountAccess,
     ) -> Result<(), ProviderControlError>;
+
+    fn update_account_access(&self, account_id: &AccountId, access: ProviderAccountAccess) -> bool;
+
+    fn update_account_models(
+        &self,
+        account_id: &AccountId,
+        models: Vec<StoredProviderModel>,
+    ) -> bool;
+
+    fn claim_unowned_account_access(&self, owner_user_id: &str);
 
     async fn remove_account(&self, account_id: &AccountId) -> bool;
 }

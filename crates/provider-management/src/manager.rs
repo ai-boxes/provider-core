@@ -8,7 +8,7 @@ use provider_core::{
     AccountId, AccountProvisioningInput, CredentialKind, CredentialUpdate, CredentialWriteOutcome,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderControl,
     ProviderControlError, ProviderKind, ProviderManagementRepository, ProviderModelOverride,
-    ProviderOAuthChallenge, StoredProviderAccount, StoredProviderModel,
+    ProviderOAuthChallenge, ProviderVisibility, StoredProviderAccount, StoredProviderModel,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -20,6 +20,14 @@ use crate::{ModelCatalogError, ModelCatalogService, ModelCatalogSnapshot};
 pub struct CreatedProviderAccount {
     pub account: ProviderAccountSummary,
     pub models: ModelCatalogSnapshot,
+}
+
+pub struct DirectProviderAccountInput {
+    pub kind: ProviderKind,
+    pub label: String,
+    pub config_json: String,
+    pub api_key: Option<SecretString>,
+    pub visibility: ProviderVisibility,
 }
 
 pub struct ProviderCredentialReplacement {
@@ -42,6 +50,8 @@ pub enum OAuthSessionStatus {
 #[derive(Clone, Debug)]
 pub struct OAuthSessionSnapshot {
     pub id: String,
+    pub owner_user_id: String,
+    pub visibility: ProviderVisibility,
     pub provider: ProviderKind,
     pub account_id: AccountId,
     pub label: String,
@@ -79,21 +89,21 @@ impl ProviderManager {
 
     pub async fn create_direct_account(
         &self,
-        kind: ProviderKind,
-        label: String,
-        config_json: String,
-        api_key: Option<SecretString>,
+        owner_user_id: &str,
+        input: DirectProviderAccountInput,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
         self.create_account(
-            kind,
+            owner_user_id,
+            input.kind,
             AccountProvisioningInput::Direct {
                 id,
-                label,
-                config_json,
-                api_key,
+                label: input.label,
+                config_json: input.config_json,
+                api_key: input.api_key,
             },
+            input.visibility,
             now,
         )
         .await
@@ -101,18 +111,22 @@ impl ProviderManager {
 
     pub async fn import_grok_account(
         &self,
+        owner_user_id: &str,
         label: String,
         credential_json: SecretString,
+        visibility: ProviderVisibility,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
         self.create_account(
+            owner_user_id,
             ProviderKind::Grok,
             AccountProvisioningInput::CredentialJson {
                 id,
                 label,
                 credential_json,
             },
+            visibility,
             now,
         )
         .await
@@ -120,8 +134,10 @@ impl ProviderManager {
 
     pub async fn start_oauth_session(
         &self,
+        owner_user_id: &str,
         kind: ProviderKind,
         label: String,
+        visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
         let label = label.trim().to_owned();
         if label.is_empty() {
@@ -136,8 +152,11 @@ impl ProviderManager {
             .map_err(ProviderManagerError::OAuthStart)?;
         let session_id = Uuid::new_v4().to_string();
         let account_id = generated_account_id();
+        let owner_user_id = owner_user_id.to_owned();
         let snapshot = OAuthSessionSnapshot {
             id: session_id.clone(),
+            owner_user_id: owner_user_id.clone(),
+            visibility,
             provider: kind,
             account_id: account_id.clone(),
             label: label.clone(),
@@ -159,12 +178,14 @@ impl ProviderManager {
             let result = match started.pending.complete().await {
                 Ok(credential_json) => manager
                     .create_account(
+                        &owner_user_id,
                         kind,
                         AccountProvisioningInput::CredentialJson {
                             id: account_id,
                             label,
                             credential_json,
                         },
+                        visibility,
                         unix_timestamp(),
                     )
                     .await
@@ -184,15 +205,27 @@ impl ProviderManager {
         Ok(snapshot)
     }
 
-    pub fn oauth_session(&self, session_id: &str) -> Option<OAuthSessionSnapshot> {
+    pub fn oauth_session(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+    ) -> Option<OAuthSessionSnapshot> {
         self.oauth_sessions()
             .get(session_id)
+            .filter(|entry| entry.snapshot.owner_user_id == actor_user_id)
             .map(|entry| entry.snapshot.clone())
     }
 
-    pub fn cancel_oauth_session(&self, session_id: &str) -> Option<OAuthSessionSnapshot> {
+    pub fn cancel_oauth_session(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+    ) -> Option<OAuthSessionSnapshot> {
         let mut sessions = self.oauth_sessions();
         let entry = sessions.get_mut(session_id)?;
+        if entry.snapshot.owner_user_id != actor_user_id {
+            return None;
+        }
         if entry.snapshot.status == OAuthSessionStatus::Pending {
             if let Some(abort) = entry.abort.take() {
                 abort.abort();
@@ -203,27 +236,42 @@ impl ProviderManager {
         Some(entry.snapshot.clone())
     }
 
-    pub async fn list_accounts(&self) -> Result<Vec<ProviderAccountSummary>, ProviderManagerError> {
-        Ok(self.repository.list_provider_accounts().await?)
+    pub async fn list_accounts(
+        &self,
+        actor_user_id: &str,
+    ) -> Result<Vec<ProviderAccountSummary>, ProviderManagerError> {
+        Ok(self
+            .repository
+            .list_provider_accounts(actor_user_id)
+            .await?)
+    }
+
+    pub fn claim_unowned_account_access(&self, owner_user_id: &str) {
+        self.control.claim_unowned_account_access(owner_user_id);
     }
 
     pub async fn get_account(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
-        Ok(account_summary(&self.load_account(account_id).await?))
+        Ok(account_summary(
+            &self.load_visible_account(actor_user_id, account_id).await?,
+        ))
     }
 
     pub async fn create_account(
         &self,
+        owner_user_id: &str,
         kind: ProviderKind,
         input: AccountProvisioningInput,
+        visibility: ProviderVisibility,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let account = self.control.prepare_account(kind, input)?;
         match self
             .repository
-            .create_provider_account(account.clone())
+            .create_provider_account(account.clone(), owner_user_id, visibility)
             .await?
         {
             ProviderAccountCreateOutcome::Created => {}
@@ -235,7 +283,12 @@ impl ProviderManager {
         let runtime_account = self.control.build_account(stored.clone())?;
         let models = self.models.refresh(runtime_account.as_ref(), now).await?;
         self.control
-            .activate_account(stored.provider, runtime_account, models.models.clone())
+            .activate_account(
+                stored.provider,
+                runtime_account,
+                models.models.clone(),
+                stored.access(),
+            )
             .await?;
         Ok(CreatedProviderAccount {
             account: account_summary(&stored),
@@ -245,13 +298,16 @@ impl ProviderManager {
 
     pub async fn update_account(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
         update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
-        let current = self.load_account(account_id).await?;
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
         let update = self
             .control
             .prepare_account_update(current.provider, update)?;
+        let rebuild_required = current.config_json != update.config_json;
+        let access_changed = current.visibility != update.visibility;
         if !self
             .repository
             .update_provider_account(account_id, update)
@@ -260,16 +316,23 @@ impl ProviderManager {
             return Err(ProviderManagerError::NotFound);
         }
         let stored = self.load_account(account_id).await?;
-        self.reconcile(stored.clone()).await?;
+        if access_changed {
+            self.control
+                .update_account_access(account_id, stored.access());
+        }
+        if rebuild_required {
+            self.reconcile(stored.clone()).await?;
+        }
         Ok(account_summary(&stored))
     }
 
     pub async fn update_credential(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
         replacement: ProviderCredentialReplacement,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
-        let current = self.load_account(account_id).await?;
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
         let outcome = self
             .repository
             .compare_and_swap_credential(
@@ -295,10 +358,12 @@ impl ProviderManager {
 
     pub async fn set_account_enabled(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
         enabled: bool,
         updated_at: i64,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
         if !self
             .repository
             .set_provider_account_enabled(account_id, enabled, updated_at)
@@ -311,7 +376,12 @@ impl ProviderManager {
         Ok(account_summary(&stored))
     }
 
-    pub async fn delete_account(&self, account_id: &AccountId) -> Result<(), ProviderManagerError> {
+    pub async fn delete_account(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+    ) -> Result<(), ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
         if !self.repository.delete_provider_account(account_id).await? {
             return Err(ProviderManagerError::NotFound);
         }
@@ -321,22 +391,33 @@ impl ProviderManager {
 
     pub async fn list_models(
         &self,
-        account_id: Option<&AccountId>,
+        actor_user_id: &str,
+        account_id: &AccountId,
     ) -> Result<Vec<StoredProviderModel>, ProviderManagerError> {
-        Ok(self.repository.list_provider_models(account_id).await?)
+        self.load_visible_account(actor_user_id, account_id).await?;
+        Ok(self
+            .repository
+            .list_provider_models(Some(account_id))
+            .await?)
     }
 
     pub async fn refresh_models(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
         now: i64,
     ) -> Result<ModelCatalogSnapshot, ProviderManagerError> {
-        let stored = self.load_account(account_id).await?;
+        let stored = self.load_owned_account(actor_user_id, account_id).await?;
         let account = self.control.build_account(stored.clone())?;
         let models = self.models.refresh(account.as_ref(), now).await?;
         if stored.enabled {
             self.control
-                .activate_account(stored.provider, account, models.models.clone())
+                .activate_account(
+                    stored.provider,
+                    account,
+                    models.models.clone(),
+                    stored.access(),
+                )
                 .await?;
         }
         Ok(models)
@@ -344,10 +425,12 @@ impl ProviderManager {
 
     pub async fn update_model(
         &self,
+        actor_user_id: &str,
         account_id: &AccountId,
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<Vec<StoredProviderModel>, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
         if !self
             .repository
             .update_provider_model(account_id, upstream_model, update)
@@ -361,10 +444,8 @@ impl ProviderManager {
             .list_provider_models(Some(account_id))
             .await?;
         if stored.enabled {
-            let account = self.control.build_account(stored.clone())?;
             self.control
-                .activate_account(stored.provider, account, models.clone())
-                .await?;
+                .update_account_models(account_id, models.clone());
         }
         Ok(models)
     }
@@ -379,6 +460,36 @@ impl ProviderManager {
             .ok_or(ProviderManagerError::NotFound)
     }
 
+    async fn load_visible_account(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+    ) -> Result<StoredProviderAccount, ProviderManagerError> {
+        let account = self.load_account(account_id).await?;
+        match account.owner_user_id.as_deref() {
+            Some(owner_user_id) if owner_user_id == actor_user_id => Ok(account),
+            Some(_) if account.visibility == ProviderVisibility::Shared => Ok(account),
+            Some(_) => Err(ProviderManagerError::NotFound),
+            None => Err(ProviderManagerError::MissingOwner),
+        }
+    }
+
+    async fn load_owned_account(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+    ) -> Result<StoredProviderAccount, ProviderManagerError> {
+        let account = self.load_account(account_id).await?;
+        match account.owner_user_id.as_deref() {
+            Some(owner_user_id) if owner_user_id == actor_user_id => Ok(account),
+            Some(_) if account.visibility == ProviderVisibility::Shared => {
+                Err(ProviderManagerError::Forbidden)
+            }
+            Some(_) => Err(ProviderManagerError::NotFound),
+            None => Err(ProviderManagerError::MissingOwner),
+        }
+    }
+
     async fn reconcile(&self, stored: StoredProviderAccount) -> Result<(), ProviderManagerError> {
         if !stored.enabled {
             self.control.remove_account(&stored.id).await;
@@ -390,7 +501,7 @@ impl ProviderManager {
             .await?;
         let account = self.control.build_account(stored.clone())?;
         self.control
-            .activate_account(stored.provider, account, models)
+            .activate_account(stored.provider, account, models, stored.access())
             .await?;
         Ok(())
     }
@@ -441,6 +552,8 @@ fn unix_timestamp() -> i64 {
 fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
     ProviderAccountSummary {
         id: account.id.clone(),
+        owner_user_id: account.owner_user_id.clone(),
+        visibility: account.visibility,
         provider: account.provider,
         label: account.label.clone(),
         config_json: account.config_json.clone(),
@@ -459,6 +572,10 @@ pub enum ProviderManagerError {
     InvalidInput(&'static str),
     #[error("provider account was not found")]
     NotFound,
+    #[error("provider account cannot be managed by this user")]
+    Forbidden,
+    #[error("provider account is missing an owner")]
+    MissingOwner,
     #[error("provider account already exists or changed concurrently")]
     Conflict,
     #[error(transparent)]

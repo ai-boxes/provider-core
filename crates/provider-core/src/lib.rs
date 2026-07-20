@@ -14,9 +14,10 @@ pub use account::{
     AccountAuthState, AccountAuthStateError, AccountId, AccountIdError, AccountRepository,
     AccountRepositoryError, AccountRuntimeState, CredentialKind, CredentialKindError,
     CredentialUpdate, CredentialWriteOutcome, NewCredential, NewProviderAccount, ProviderAccount,
-    ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
-    ProviderKindError, ProviderManagementRepository, RefreshError, RefreshErrorKind,
-    RefreshOutcome, RefreshTrigger, StoredCredential, StoredProviderAccount,
+    ProviderAccountAccess, ProviderAccountCreateOutcome, ProviderAccountSummary,
+    ProviderAccountUpdate, ProviderKind, ProviderKindError, ProviderManagementRepository,
+    ProviderVisibility, ProviderVisibilityError, RefreshError, RefreshErrorKind, RefreshOutcome,
+    RefreshTrigger, StoredCredential, StoredProviderAccount,
 };
 pub use management::{
     AccountProvisioningInput, ManagedProviderDriver, PendingProviderOAuth,

@@ -2,17 +2,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    extract::{Extension, Request, State, rejection::JsonRejection},
+    extract::{Extension, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use provider_auth::{
-    ApiKeyAuthenticator, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
+    ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
     CreatedApiKey, CredentialError, SessionGrant, UserSummary,
 };
+use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,12 +22,21 @@ use serde_json::{Value, json};
 pub(crate) struct AuthHttpState {
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
+    manager: ProviderManager,
 }
 
 impl AuthHttpState {
     #[must_use]
-    pub(crate) fn new(auth: AuthService, api_keys: ApiKeyAuthenticator) -> Self {
-        Self { auth, api_keys }
+    pub(crate) fn new(
+        auth: AuthService,
+        api_keys: ApiKeyAuthenticator,
+        manager: ProviderManager,
+    ) -> Self {
+        Self {
+            auth,
+            api_keys,
+            manager,
+        }
     }
 
     #[must_use]
@@ -41,6 +51,8 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/keys", get(list_keys).post(create_key))
+        .route("/api/v1/keys/{key_id}/enabled", put(set_key_enabled))
+        .route("/api/v1/keys/{key_id}", delete(delete_key))
         .route_layer(middleware::from_fn_with_state(
             state.auth_service(),
             require_access,
@@ -77,6 +89,9 @@ async fn setup(
             unix_timestamp(),
         )
         .await?;
+    state
+        .manager
+        .claim_unowned_account_access(grant.user.id.as_str());
     Ok((StatusCode::CREATED, data(session_grant_json(&grant))))
 }
 
@@ -176,6 +191,37 @@ async fn create_key(
     Ok((StatusCode::CREATED, data(created_api_key_json(&key))))
 }
 
+async fn set_key_enabled(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(key_id): Path<String>,
+    request: Result<Json<SetEnabledRequest>, JsonRejection>,
+) -> Result<StatusCode, AuthApiError> {
+    let request = json_request(request)?;
+    state
+        .api_keys
+        .set_enabled(
+            &session.user.id,
+            &parse_api_key_id(&key_id)?,
+            request.enabled,
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_key(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(key_id): Path<String>,
+) -> Result<StatusCode, AuthApiError> {
+    state
+        .api_keys
+        .delete(&session.user.id, &parse_api_key_id(&key_id)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn require_access(
     State(auth): State<AuthService>,
     headers: HeaderMap,
@@ -206,6 +252,11 @@ struct CreateApiKeyRequest {
     expires_at: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct SetEnabledRequest {
+    enabled: bool,
+}
+
 fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, AuthApiError> {
     request
         .map(|Json(request)| request)
@@ -226,14 +277,17 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthApiError> {
     Ok(token)
 }
 
+fn parse_api_key_id(value: &str) -> Result<ApiKeyId, AuthApiError> {
+    ApiKeyId::new(value).map_err(|_| AuthApiError::invalid_request("invalid API key ID"))
+}
+
 fn session_grant_json(grant: &SessionGrant) -> Value {
     json!({
         "user": user_json(&grant.user),
         "access_token": grant.access_token.expose_secret(),
         "refresh_token": grant.refresh_token.expose_secret(),
         "access_expires_at": grant.access_expires_at,
-        "refresh_expires_at": grant.refresh_expires_at,
-        "absolute_expires_at": grant.absolute_expires_at
+        "refresh_expires_at": grant.refresh_expires_at
     })
 }
 
@@ -368,6 +422,8 @@ impl IntoResponse for AuthApiError {
 mod tests {
     use std::sync::Arc;
 
+    use provider_management::ProviderManager;
+    use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
     use tokio::net::TcpListener;
 
@@ -381,15 +437,21 @@ mod tests {
                 .expect("repository"),
         );
         let auth = AuthService::new(repository.clone());
-        let api_keys = ApiKeyAuthenticator::load(repository)
+        let api_keys = ApiKeyAuthenticator::load(repository.clone())
             .await
             .expect("API key index");
+        let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+        let manager = ProviderManager::new(repository, runtime.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind auth server");
         let address = listener.local_addr().expect("auth address");
         let server = tokio::spawn(
-            axum::serve(listener, router(AuthHttpState::new(auth, api_keys))).into_future(),
+            axum::serve(
+                listener,
+                router(AuthHttpState::new(auth, api_keys, manager)),
+            )
+            .into_future(),
         );
         let client = reqwest::Client::new();
         let base_url = format!("http://{address}");
@@ -440,7 +502,12 @@ mod tests {
         )
         .await;
         assert_eq!(created_key.status(), StatusCode::CREATED);
-        assert_eq!(response_json(created_key).await["data"]["key"], custom_key);
+        let created_key = response_json(created_key).await;
+        assert_eq!(created_key["data"]["key"], custom_key);
+        let key_id = created_key["data"]["id"]
+            .as_str()
+            .expect("API key ID")
+            .to_owned();
 
         let listed_keys = client
             .get(format!("{base_url}/api/v1/keys"))
@@ -455,6 +522,77 @@ mod tests {
                 .await
                 .expect("API key list body")
                 .contains(custom_key)
+        );
+
+        let created_member = post_json(
+            &client,
+            format!("{base_url}/api/v1/users"),
+            json!({ "username": "member", "password": "secret2" }),
+            Some(&access_token),
+        )
+        .await;
+        assert_eq!(created_member.status(), StatusCode::CREATED);
+        let member_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "member", "password": "secret2" }),
+            None,
+        )
+        .await;
+        assert_eq!(member_login.status(), StatusCode::OK);
+        let member_access = response_secret(&response_json(member_login).await, "access_token");
+
+        let foreign_disable = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
+            .bearer_auth(&member_access)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":false}"#)
+            .send()
+            .await
+            .expect("foreign API key disable");
+        assert_eq!(foreign_disable.status(), StatusCode::NOT_FOUND);
+
+        let disabled = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":false}"#)
+            .send()
+            .await
+            .expect("disable API key");
+        assert_eq!(disabled.status(), StatusCode::NO_CONTENT);
+
+        let disabled_keys = client
+            .get(format!("{base_url}/api/v1/keys"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list disabled API key");
+        assert_eq!(
+            response_json(disabled_keys).await["data"][0]["enabled"],
+            false
+        );
+
+        let deleted = client
+            .delete(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("delete API key");
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let remaining_keys = client
+            .get(format!("{base_url}/api/v1/keys"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list remaining API keys");
+        assert_eq!(
+            response_json(remaining_keys).await["data"]
+                .as_array()
+                .expect("remaining API keys")
+                .len(),
+            0
         );
 
         let refreshed = post_json(
@@ -497,6 +635,7 @@ mod tests {
         assert_eq!(logged_out_me.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
+        runtime.shutdown();
     }
 
     async fn post_json(

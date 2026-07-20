@@ -2,11 +2,11 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_auth::{ApiKeyAuthenticator, AuthService, AuthenticatedApiKey};
 use provider_core::{
     ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService, WireFormat,
 };
@@ -16,16 +16,17 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 struct AppState {
     service: ProxyService,
+    api_keys: ApiKeyAuthenticator,
 }
 
-pub fn router(service: ProxyService) -> Router {
+pub fn router(service: ProxyService, api_keys: ApiKeyAuthenticator) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
-        .with_state(AppState { service })
+        .with_state(AppState { service, api_keys })
 }
 
 pub fn router_with_management(
@@ -34,9 +35,10 @@ pub fn router_with_management(
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
 ) -> Router {
-    let auth_state = crate::auth_http::AuthHttpState::new(auth.clone(), api_keys);
+    let auth_state =
+        crate::auth_http::AuthHttpState::new(auth.clone(), api_keys.clone(), manager.clone());
     let management = crate::auth_http::protect(crate::management_http::router(manager), auth);
-    router(service)
+    router(service, api_keys)
         .merge(crate::auth_http::router(auth_state))
         .merge(management)
 }
@@ -45,29 +47,57 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn models(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
+async fn models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
+    Ok(Json(json!({
         "object": "list",
-        "data": state.service.models()
-    }))
+        "data": state.service.models(key.owner_user_id.as_str())
+    })))
 }
 
-async fn responses(State(state): State<AppState>, body: Bytes) -> Result<Response, HttpError> {
-    proxy_stream(&state.service, WireFormat::OpenAiResponses, body).await
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, HttpError> {
+    let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
+    proxy_stream(
+        &state.service,
+        key.owner_user_id.as_str(),
+        WireFormat::OpenAiResponses,
+        body,
+    )
+    .await
 }
 
-async fn messages(State(state): State<AppState>, body: Bytes) -> Result<Response, HttpError> {
-    proxy_stream(&state.service, WireFormat::ClaudeMessages, body).await
+async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, HttpError> {
+    let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
+    proxy_stream(
+        &state.service,
+        key.owner_user_id.as_str(),
+        WireFormat::ClaudeMessages,
+        body,
+    )
+    .await
 }
 
 async fn count_tokens(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, HttpError> {
+    let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
     let request = proxy_request(WireFormat::ClaudeMessages, body)?;
     let count = state
         .service
-        .count_tokens(request)
+        .count_tokens(key.owner_user_id.as_str(), request)
         .await
         .map_err(|error| HttpError::from_provider(WireFormat::ClaudeMessages, error))?;
 
@@ -76,12 +106,13 @@ async fn count_tokens(
 
 async fn proxy_stream(
     service: &ProxyService,
+    user_id: &str,
     protocol: WireFormat,
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let request = proxy_request(protocol, body)?;
     let stream = service
-        .execute_stream(request)
+        .execute_stream(user_id, request)
         .await
         .map_err(|error| HttpError::from_provider(protocol, error))?;
 
@@ -106,12 +137,68 @@ fn proxy_request(protocol: WireFormat, body: Bytes) -> Result<ProxyRequest, Http
         .map_err(|error| HttpError::from_proxy_request(protocol, error))
 }
 
+fn authenticate_api_key(
+    authenticator: &ApiKeyAuthenticator,
+    headers: &HeaderMap,
+    protocol: WireFormat,
+) -> Result<AuthenticatedApiKey, HttpError> {
+    let key = downstream_api_key(headers).ok_or_else(|| HttpError::authentication(protocol))?;
+    authenticator
+        .authenticate(key, unix_timestamp())
+        .map_err(|_| HttpError::authentication(protocol))
+}
+
+fn downstream_api_key(headers: &HeaderMap) -> Option<&str> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_value);
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    match (bearer, x_api_key) {
+        (Some(bearer), Some(x_api_key)) if bearer != x_api_key => None,
+        (Some(bearer), _) => Some(bearer),
+        (None, Some(x_api_key)) => Some(x_api_key),
+        (None, None) => None,
+    }
+}
+
+fn bearer_value(value: &str) -> Option<&str> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && parts.next().is_none() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
 struct HttpError {
     status: StatusCode,
     body: Value,
 }
 
 impl HttpError {
+    fn authentication(protocol: WireFormat) -> Self {
+        Self::new(
+            protocol,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid API key",
+        )
+    }
+
     fn invalid_request(protocol: WireFormat, message: &'static str) -> Self {
         Self::new(
             protocol,
@@ -175,8 +262,11 @@ mod tests {
 
     use async_trait::async_trait;
     use futures_util::stream;
+    use provider_auth::AuthService;
     use provider_core::{Provider, ProviderModel, ProviderRequest, ProviderStream};
     use provider_protocol::DefaultProtocolBridge;
+    use provider_storage::SqliteAccountRepository;
+    use secrecy::{ExposeSecret, SecretString};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -220,18 +310,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exposes_phase_one_http_contract() {
+    async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
+        let repository = Arc::new(
+            SqliteAccountRepository::in_memory()
+                .await
+                .expect("repository"),
+        );
+        let auth = AuthService::new(repository.clone());
+        let grant = auth
+            .setup(
+                "admin".to_owned(),
+                SecretString::from("secret".to_owned()),
+                unix_timestamp(),
+            )
+            .await
+            .expect("initial setup");
+        let api_keys = ApiKeyAuthenticator::load(repository)
+            .await
+            .expect("API key index");
+        let created_key = api_keys
+            .create(
+                &grant.user.id,
+                "test".to_owned(),
+                Some(SecretString::from("test-api-key-123".to_owned())),
+                None,
+                unix_timestamp(),
+            )
+            .await
+            .expect("create API key");
+        let api_key = created_key.key.expose_secret().to_owned();
         let service = ProxyService::new(
             Arc::new(TestProvider {
                 models: vec![ProviderModel::new("grok-4.5", "xai")],
             }),
             Arc::new(DefaultProtocolBridge),
+            provider_core::ProviderAccountAccess {
+                owner_user_id: Some(grant.user.id.as_str().to_owned()),
+                visibility: provider_core::ProviderVisibility::Private,
+            },
         );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
         let address = listener.local_addr().expect("test server address");
-        let server = tokio::spawn(axum::serve(listener, router(service)).into_future());
+        let server =
+            tokio::spawn(axum::serve(listener, router(service, api_keys.clone())).into_future());
         let client = reqwest::Client::new();
         let base_url = format!("http://{address}");
 
@@ -242,9 +365,17 @@ mod tests {
             .expect("health response");
         assert_eq!(health.status(), StatusCode::OK);
 
+        let missing_key = client
+            .get(format!("{base_url}/v1/models"))
+            .send()
+            .await
+            .expect("missing API key response");
+        assert_eq!(missing_key.status(), StatusCode::UNAUTHORIZED);
+
         let models = response_json(
             client
                 .get(format!("{base_url}/v1/models"))
+                .bearer_auth(&api_key)
                 .send()
                 .await
                 .expect("models response"),
@@ -253,14 +384,16 @@ mod tests {
         assert_eq!(models["data"][0]["id"], "grok-4.5");
 
         for path in ["/v1/responses", "/v1/messages"] {
-            let response = client
+            let mut request = client
                 .post(format!("{base_url}{path}"))
-                .bearer_auth("placeholder-key")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(json!({ "model": "grok-4.5", "input": "hello", "messages": [] }).to_string())
-                .send()
-                .await
-                .expect("stream response");
+                .body(json!({ "model": "grok-4.5", "input": "hello", "messages": [] }).to_string());
+            request = if path == "/v1/messages" {
+                request.header("x-api-key", &api_key)
+            } else {
+                request.bearer_auth(&api_key)
+            };
+            let response = request.send().await.expect("stream response");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 response
@@ -274,6 +407,7 @@ mod tests {
         let count = response_json(
             client
                 .post(format!("{base_url}/v1/messages/count_tokens"))
+                .header("x-api-key", &api_key)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(json!({ "model": "grok-4.5", "messages": [] }).to_string())
                 .send()
@@ -282,6 +416,23 @@ mod tests {
         )
         .await;
         assert_eq!(count["input_tokens"], 42);
+
+        api_keys
+            .set_enabled(
+                &grant.user.id,
+                &created_key.summary.id,
+                false,
+                unix_timestamp(),
+            )
+            .await
+            .expect("disable API key");
+        let disabled_key = client
+            .get(format!("{base_url}/v1/models"))
+            .bearer_auth(&api_key)
+            .send()
+            .await
+            .expect("disabled API key response");
+        assert_eq!(disabled_key.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
     }

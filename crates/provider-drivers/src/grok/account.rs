@@ -101,6 +101,22 @@ impl GrokDriver {
     #[cfg(feature = "test-util")]
     #[doc(hidden)]
     #[must_use]
+    pub fn for_test_with_oauth(
+        base_url: impl Into<String>,
+        discovery_url: impl Into<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            client: GrokClient::with_base_url(base_url),
+            refresh_client: GrokRefreshClient::new(),
+            model_client: GrokModelClient::for_test(),
+            oauth_client: GrokOAuthClient::for_test(discovery_url),
+            token_counter: Cl100kTokenCounter,
+        })
+    }
+
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    #[must_use]
     pub fn test_account(
         self: &Arc<Self>,
         access_token: impl Into<String>,

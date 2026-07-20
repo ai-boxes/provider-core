@@ -6,9 +6,9 @@ use std::{
 use async_trait::async_trait;
 use provider_core::{
     AccountId, AccountProvisioningInput, AccountRepository, ManagedProviderDriver,
-    NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderControl,
-    ProviderControlError, ProviderKind, ProviderModel, ProviderRouteCandidate, ProviderRouter,
-    StartedProviderOAuth, StoredProviderAccount, StoredProviderModel,
+    NewProviderAccount, ProviderAccount, ProviderAccountAccess, ProviderAccountUpdate,
+    ProviderControl, ProviderControlError, ProviderKind, ProviderModel, ProviderRouteCandidate,
+    ProviderRouter, StartedProviderOAuth, StoredProviderAccount, StoredProviderModel,
 };
 use thiserror::Error;
 
@@ -175,6 +175,7 @@ impl ProviderControl for ProviderRuntimeCatalog {
         kind: ProviderKind,
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
+        access: ProviderAccountAccess,
     ) -> Result<(), ProviderControlError> {
         let driver = self
             .inner
@@ -202,9 +203,27 @@ impl ProviderControl for ProviderRuntimeCatalog {
             .map_err(|error| ProviderControlError::new(error.to_string()))?;
         self.inner
             .router
-            .replace_account_models(runtime, account, models)
+            .replace_account_models(runtime, account, models, access)
             .map_err(|error| ProviderControlError::new(error.to_string()))?;
         Ok(())
+    }
+
+    fn update_account_access(&self, account_id: &AccountId, access: ProviderAccountAccess) -> bool {
+        self.inner.router.update_account_access(account_id, access)
+    }
+
+    fn update_account_models(
+        &self,
+        account_id: &AccountId,
+        models: Vec<StoredProviderModel>,
+    ) -> bool {
+        self.inner.router.update_account_models(account_id, models)
+    }
+
+    fn claim_unowned_account_access(&self, owner_user_id: &str) {
+        self.inner
+            .router
+            .claim_unowned_account_access(owner_user_id);
     }
 
     async fn remove_account(&self, account_id: &AccountId) -> bool {
@@ -213,11 +232,11 @@ impl ProviderControl for ProviderRuntimeCatalog {
 }
 
 impl ProviderRouter for ProviderRuntimeCatalog {
-    fn models(&self) -> Vec<ProviderModel> {
-        self.inner.router.models()
+    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+        self.inner.router.models(user_id)
     }
 
-    fn routes(&self, model: &str) -> Vec<ProviderRouteCandidate> {
-        self.inner.router.routes(model)
+    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
+        self.inner.router.routes(user_id, model)
     }
 }
