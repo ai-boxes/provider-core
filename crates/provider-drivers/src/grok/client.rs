@@ -1,14 +1,18 @@
+use std::sync::Arc;
+
 use futures_util::TryStreamExt;
 use provider_core::{ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata};
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
 
-use super::credentials::GrokCredentials;
+use super::{
+    credentials::GrokCredentials,
+    identity::{
+        CLIENT_IDENTIFIER, CLIENT_MODE, CLIENT_VERSION, DEFAULT_PROXY_BASE_URL, TOKEN_AUTH_HEADER,
+        TOKEN_AUTH_VALUE, user_agent,
+    },
+};
 
-const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
-const CLIENT_VERSION: &str = "0.2.93";
-const TOKEN_AUTH_HEADER: &str = "X-XAI-Token-Auth";
-const TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 const CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
 const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 
@@ -17,6 +21,7 @@ const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 pub struct GrokClient {
     http: reqwest::Client,
     base_url: String,
+    agent_id: Arc<str>,
 }
 
 impl Default for GrokClient {
@@ -28,38 +33,49 @@ impl Default for GrokClient {
 impl GrokClient {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_BASE_URL)
+        Self::with_base_url(DEFAULT_PROXY_BASE_URL)
     }
 
     pub async fn execute_stream(
         &self,
         credentials: &GrokCredentials,
         payload: bytes::Bytes,
+        model: &str,
         metadata: &RequestMetadata,
     ) -> Result<ProviderStream, ProviderError> {
-        let mut request = self
+        let user_id = credentials.upstream_user_id().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                "Grok credential is missing upstream user ID",
+            )
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let generated_session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = metadata
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&generated_session_id);
+        let request = self
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(credentials.access_token().expose_secret())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::CONNECTION, "Keep-Alive")
             .header(TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE)
             .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
-            .header(
-                reqwest::header::USER_AGENT,
-                format!("xai-grok-workspace/{CLIENT_VERSION}"),
-            )
+            .header("x-authenticateresponse", "authenticate-response")
+            .header("x-grok-client-mode", CLIENT_MODE)
+            .header("x-grok-client-identifier", CLIENT_IDENTIFIER)
+            .header("x-grok-user-id", user_id)
+            .header(CONVERSATION_ID_HEADER, session_id)
+            .header("x-grok-req-id", request_id)
+            .header("x-grok-model-override", model)
+            .header("x-grok-session-id", session_id)
+            .header("x-grok-agent-id", self.agent_id.as_ref())
+            .header(reqwest::header::USER_AGENT, user_agent())
             .body(payload);
-
-        if let Some(session_id) = metadata
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())
-        {
-            request = request.header(CONVERSATION_ID_HEADER, session_id);
-        }
 
         let response = request.send().await.map_err(|error| {
             ProviderError::new(
@@ -87,6 +103,7 @@ impl GrokClient {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            agent_id: Arc::from(uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -127,6 +144,15 @@ mod tests {
         client_version: String,
         user_agent: String,
         conversation_id: String,
+        authenticate_response: String,
+        client_mode: String,
+        client_identifier: String,
+        user_id: String,
+        request_id: String,
+        model_override: String,
+        session_id: String,
+        agent_id: String,
+        connection: String,
         body: Bytes,
     }
 
@@ -144,6 +170,15 @@ mod tests {
             client_version: header(&headers, CLIENT_VERSION_HEADER),
             user_agent: header(&headers, reqwest::header::USER_AGENT.as_str()),
             conversation_id: header(&headers, CONVERSATION_ID_HEADER),
+            authenticate_response: header(&headers, "x-authenticateresponse"),
+            client_mode: header(&headers, "x-grok-client-mode"),
+            client_identifier: header(&headers, "x-grok-client-identifier"),
+            user_id: header(&headers, "x-grok-user-id"),
+            request_id: header(&headers, "x-grok-req-id"),
+            model_override: header(&headers, "x-grok-model-override"),
+            session_id: header(&headers, "x-grok-session-id"),
+            agent_id: header(&headers, "x-grok-agent-id"),
+            connection: header(&headers, reqwest::header::CONNECTION.as_str()),
             body,
         });
 
@@ -198,7 +233,7 @@ mod tests {
         metadata.session_id = Some("session-1".to_owned());
 
         let chunks = client
-            .execute_stream(&credentials, payload.clone(), &metadata)
+            .execute_stream(&credentials, payload.clone(), "grok-4.5", &metadata)
             .await
             .expect("stream response")
             .collect::<Vec<_>>()
@@ -217,11 +252,17 @@ mod tests {
         assert_eq!(captured.authorization, "Bearer upstream-token");
         assert_eq!(captured.token_auth, TOKEN_AUTH_VALUE);
         assert_eq!(captured.client_version, CLIENT_VERSION);
-        assert_eq!(
-            captured.user_agent,
-            format!("xai-grok-workspace/{CLIENT_VERSION}")
-        );
+        assert_eq!(captured.user_agent, user_agent());
         assert_eq!(captured.conversation_id, "session-1");
+        assert_eq!(captured.authenticate_response, "authenticate-response");
+        assert_eq!(captured.client_mode, CLIENT_MODE);
+        assert_eq!(captured.client_identifier, CLIENT_IDENTIFIER);
+        assert_eq!(captured.user_id, "test-user");
+        assert!(!captured.request_id.is_empty());
+        assert_eq!(captured.model_override, "grok-4.5");
+        assert_eq!(captured.session_id, "session-1");
+        assert!(!captured.agent_id.is_empty());
+        assert!(captured.connection.is_empty());
         assert_eq!(captured.body, payload);
         assert_eq!(chunks.len(), 2);
     }
@@ -237,6 +278,7 @@ mod tests {
             .execute_stream(
                 &credentials,
                 Bytes::from_static(b"{}"),
+                "grok-4.5",
                 &RequestMetadata::default(),
             )
             .await

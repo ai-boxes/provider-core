@@ -10,9 +10,10 @@ use provider_core::{
     AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
     CredentialKind, CredentialUpdate, CredentialWriteOutcome, ManagedProviderDriver, NewCredential,
     NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
-    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
-    ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
-    StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
+    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaSnapshot, ProviderQuotaSource,
+    ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
+    RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
 };
 
 use super::{
@@ -20,6 +21,7 @@ use super::{
     credentials::{GrokAuthError, GrokCredentials},
     models::{GrokModelClient, grok_models},
     oauth::GrokOAuthClient,
+    quota::GrokQuotaClient,
     refresh::{GrokRefreshClient, validate_token_endpoint},
     request::prepare_request,
 };
@@ -35,6 +37,7 @@ pub struct GrokDriver {
     refresh_client: GrokRefreshClient,
     model_client: GrokModelClient,
     oauth_client: GrokOAuthClient,
+    quota_client: GrokQuotaClient,
     token_counter: Cl100kTokenCounter,
 }
 
@@ -72,6 +75,7 @@ impl GrokDriver {
             refresh_client: GrokRefreshClient::new(),
             model_client: GrokModelClient::new(),
             oauth_client: GrokOAuthClient::new(),
+            quota_client: GrokQuotaClient::new(),
             token_counter: Cl100kTokenCounter,
         }
     }
@@ -89,11 +93,13 @@ impl GrokDriver {
     #[doc(hidden)]
     #[must_use]
     pub fn for_test(base_url: impl Into<String>) -> Arc<Self> {
+        let base_url = base_url.into();
         Arc::new(Self {
-            client: GrokClient::with_base_url(base_url),
+            client: GrokClient::with_base_url(base_url.clone()),
             refresh_client: GrokRefreshClient::new(),
             model_client: GrokModelClient::for_test(),
-            oauth_client: GrokOAuthClient::for_test("http://127.0.0.1/unused"),
+            oauth_client: GrokOAuthClient::for_test("http://127.0.0.1/unused", base_url.clone()),
+            quota_client: GrokQuotaClient::with_base_url(base_url),
             token_counter: Cl100kTokenCounter,
         })
     }
@@ -105,11 +111,13 @@ impl GrokDriver {
         base_url: impl Into<String>,
         discovery_url: impl Into<String>,
     ) -> Arc<Self> {
+        let base_url = base_url.into();
         Arc::new(Self {
-            client: GrokClient::with_base_url(base_url),
+            client: GrokClient::with_base_url(base_url.clone()),
             refresh_client: GrokRefreshClient::new(),
             model_client: GrokModelClient::for_test(),
-            oauth_client: GrokOAuthClient::for_test(discovery_url),
+            oauth_client: GrokOAuthClient::for_test(discovery_url, base_url.clone()),
+            quota_client: GrokQuotaClient::with_base_url(base_url),
             token_counter: Cl100kTokenCounter,
         })
     }
@@ -131,7 +139,12 @@ impl GrokDriver {
     ) -> Result<ProviderStream, ProviderError> {
         let prepared = prepare_request(request)?;
         self.client
-            .execute_stream(credentials, prepared.payload, &prepared.metadata)
+            .execute_stream(
+                credentials,
+                prepared.payload,
+                &prepared.model,
+                &prepared.metadata,
+            )
             .await
     }
 
@@ -171,6 +184,10 @@ impl ProviderDriver for GrokDriver {
 impl ManagedProviderDriver for GrokDriver {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Grok
+    }
+
+    fn supports_quota(&self) -> bool {
+        true
     }
 
     fn prepare_account(
@@ -376,6 +393,85 @@ impl GrokAccount {
         }
     }
 
+    async fn credentials_with_upstream_user_id(
+        &self,
+    ) -> Result<GrokCredentials, ProviderQuotaError> {
+        let current = self.state().clone();
+        if current.credentials.upstream_user_id().is_some() {
+            return Ok(current.credentials);
+        }
+        let user_id = self
+            .driver
+            .quota_client
+            .fetch_user_id(&current.credentials)
+            .await?;
+        let credentials = current
+            .credentials
+            .with_upstream_user_id(&user_id)
+            .map_err(|_| {
+                ProviderQuotaError::new(
+                    ProviderQuotaErrorKind::Internal,
+                    "failed to update Grok upstream user ID",
+                )
+            })?;
+        let credential_json = credentials.to_json().map_err(|_| {
+            ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Internal,
+                "failed to serialize Grok credential",
+            )
+        })?;
+
+        {
+            let mut state = self.state_mut();
+            if state.revision == current.revision && state.pending_update.is_some() {
+                state.credentials = credentials.clone();
+                if let Some(pending) = state.pending_update.as_mut() {
+                    pending.credential_json = credential_json;
+                }
+                return Ok(credentials);
+            }
+        }
+
+        let Some(repository) = self.repository.as_ref() else {
+            return Ok(credentials);
+        };
+        let last_refreshed_at = current.credentials.last_refreshed_at().map_err(|_| {
+            ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Internal,
+                "Grok credential has an invalid refresh timestamp",
+            )
+        })?;
+        let update = CredentialUpdate {
+            expected_revision: current.revision,
+            kind: CredentialKind::Oauth,
+            format_version: current.format_version,
+            credential_json,
+            expires_at: current.expires_at,
+            last_refreshed_at,
+            updated_at: unix_timestamp(),
+        };
+        match repository
+            .compare_and_swap_credential(&self.account_id, update)
+            .await
+        {
+            Ok(CredentialWriteOutcome::Updated { revision }) => {
+                let mut state = self.state_mut();
+                if state.revision == current.revision {
+                    state.credentials = credentials.clone();
+                    state.revision = revision;
+                }
+            }
+            Ok(CredentialWriteOutcome::Conflict) => {}
+            Err(_) => {
+                eprintln!(
+                    "failed to persist Grok upstream user ID for account {}",
+                    self.account_id
+                );
+            }
+        }
+        Ok(credentials)
+    }
+
     async fn mark_reauth_required(&self, repository: &Arc<dyn AccountRepository>) {
         let now = unix_timestamp();
         let _ = repository
@@ -406,11 +502,18 @@ impl ProviderAccount for GrokAccount {
         runtime_state(&self.state())
     }
 
+    fn credential_revision(&self) -> u64 {
+        self.state().revision
+    }
+
     async fn execute_stream(
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        let credentials = self.snapshot();
+        let credentials = self
+            .credentials_with_upstream_user_id()
+            .await
+            .map_err(quota_provider_error)?;
         self.driver.execute_stream(&credentials, request).await
     }
 
@@ -427,6 +530,10 @@ impl ProviderAccount for GrokAccount {
 
     fn fallback_models(&self) -> &[ProviderModel] {
         self.driver.models()
+    }
+
+    fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+        Some(self)
     }
 
     async fn refresh_credentials(
@@ -529,6 +636,39 @@ impl ProviderAccount for GrokAccount {
             }
         }
     }
+}
+
+#[async_trait]
+impl ProviderQuotaSource for GrokAccount {
+    async fn fetch_quota(&self) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
+        let credentials = self.credentials_with_upstream_user_id().await?;
+        let user_id = credentials.upstream_user_id().ok_or_else(|| {
+            ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Internal,
+                "Grok credential is missing upstream user ID",
+            )
+        })?;
+        self.driver
+            .quota_client
+            .fetch_quota(self.account_id.as_str(), &credentials, user_id)
+            .await
+    }
+}
+
+fn quota_provider_error(error: ProviderQuotaError) -> ProviderError {
+    let kind = match error.kind() {
+        ProviderQuotaErrorKind::Authentication => ProviderErrorKind::Authentication,
+        ProviderQuotaErrorKind::Unsupported
+        | ProviderQuotaErrorKind::RateLimited
+        | ProviderQuotaErrorKind::Upstream
+        | ProviderQuotaErrorKind::InvalidResponse => ProviderErrorKind::Upstream,
+        ProviderQuotaErrorKind::Internal => ProviderErrorKind::Internal,
+    };
+    let mut provider_error = ProviderError::new(kind, error.message());
+    if let Some(status) = error.upstream_status() {
+        provider_error = provider_error.with_upstream_status(status);
+    }
+    provider_error
 }
 
 fn runtime_state(state: &GrokState) -> AccountRuntimeState {

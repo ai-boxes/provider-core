@@ -46,6 +46,11 @@ pub(crate) fn router(manager: ProviderManager) -> Router {
             "/api/v1/providers/{account_id}/models/refresh",
             post(refresh_models),
         )
+        .route("/api/v1/providers/{account_id}/quota", get(get_quota))
+        .route(
+            "/api/v1/providers/{account_id}/quota/refresh",
+            post(refresh_quota),
+        )
         .route("/api/v1/oauth/sessions", post(start_oauth_session))
         .route(
             "/api/v1/oauth/sessions/{session_id}",
@@ -62,8 +67,19 @@ async fn list_accounts(
         .manager
         .list_accounts(session.user.id.as_str())
         .await?;
+    let now = unix_timestamp();
     Ok(data(Value::Array(
-        accounts.iter().map(account_json).collect(),
+        accounts
+            .iter()
+            .map(|account| {
+                account_with_quota_json(
+                    account,
+                    state
+                        .manager
+                        .cached_quota(session.user.id.as_str(), account, now),
+                )
+            })
+            .collect(),
     )))
 }
 
@@ -246,6 +262,38 @@ async fn refresh_models(
     Ok(data(model_snapshot_json(&snapshot)))
 }
 
+async fn get_quota(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(account_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let quota = state
+        .manager
+        .quota(
+            session.user.id.as_str(),
+            &parse_account_id(&account_id)?,
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(data(quota_json(&quota)?))
+}
+
+async fn refresh_quota(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(account_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let quota = state
+        .manager
+        .refresh_quota(
+            session.user.id.as_str(),
+            &parse_account_id(&account_id)?,
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(data(quota_json(&quota)?))
+}
+
 async fn update_model(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -385,6 +433,24 @@ fn account_json(account: &ProviderAccountSummary) -> Value {
         "created_at": account.created_at,
         "updated_at": account.updated_at
     })
+}
+
+fn account_with_quota_json(
+    account: &ProviderAccountSummary,
+    quota: provider_core::ProviderQuotaView,
+) -> Value {
+    let mut value = account_json(account);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "quota".to_owned(),
+            serde_json::to_value(quota).unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiError> {
+    serde_json::to_value(quota).map_err(|_| ApiError::internal())
 }
 
 fn model_snapshot_json(snapshot: &ModelCatalogSnapshot) -> Value {
@@ -538,7 +604,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use axum::{
         Router,
@@ -546,10 +615,13 @@ mod tests {
         http::{HeaderMap, StatusCode, header},
         routing::{get, post},
     };
-    use provider_auth::{ApiKeyAuthenticator, AuthService};
-    use provider_core::ProxyService;
+    use provider_auth::{ApiKeyAuthenticator, AuthService, UserSummary};
+    use provider_core::{
+        AccountId, CredentialKind, ProviderManagementRepository, ProviderQuotaErrorKind,
+        ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
+    };
     use provider_drivers::{grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver};
-    use provider_management::ProviderManager;
+    use provider_management::{ProviderCredentialReplacement, ProviderManager};
     use provider_protocol::DefaultProtocolBridge;
     use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
@@ -560,6 +632,137 @@ mod tests {
     use crate::router_with_management;
 
     use super::unix_timestamp;
+
+    #[derive(Clone, Default)]
+    struct QuotaUpstreamState {
+        billing_calls: Arc<AtomicUsize>,
+        user_calls: Arc<AtomicUsize>,
+        fail_billing: Arc<AtomicBool>,
+    }
+
+    async fn quota_models() -> &'static str {
+        r#"{"data":[{"id":"grok-4.5","owned_by":"xai"}]}"#
+    }
+
+    async fn quota_user(State(state): State<QuotaUpstreamState>) -> &'static str {
+        state.user_calls.fetch_add(1, Ordering::SeqCst);
+        r#"{"userId":"upstream-user"}"#
+    }
+
+    async fn quota_billing(State(state): State<QuotaUpstreamState>) -> (StatusCode, &'static str) {
+        state.billing_calls.fetch_add(1, Ordering::SeqCst);
+        if state.fail_billing.load(Ordering::SeqCst) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#);
+        }
+        (
+            StatusCode::OK,
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-16T02:27:51+00:00","end":"2026-07-23T02:27:51+00:00"},"creditUsagePercent":75.0,"onDemandCap":{"val":5000},"onDemandUsed":{"val":1250},"productUsage":[{"product":"GrokBuild","usagePercent":70.0}],"prepaidBalance":{"val":3000}}}"#,
+        )
+    }
+
+    struct QuotaTestContext {
+        upstream_state: QuotaUpstreamState,
+        upstream_server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        base_url: String,
+        repository: Arc<SqliteAccountRepository>,
+        runtime: Arc<ProviderRuntimeCatalog>,
+        manager: ProviderManager,
+        auth: AuthService,
+        owner: UserSummary,
+        member: UserSummary,
+        member_access_token: SecretString,
+        account_id: AccountId,
+        now: i64,
+    }
+
+    async fn quota_test_context() -> QuotaTestContext {
+        let upstream_state = QuotaUpstreamState::default();
+        let upstream = Router::new()
+            .route("/v1/models", get(quota_models))
+            .route("/v1/user", get(quota_user))
+            .route("/v1/billing", get(quota_billing))
+            .with_state(upstream_state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind quota upstream");
+        let address = listener.local_addr().expect("quota upstream address");
+        let upstream_server = tokio::spawn(axum::serve(listener, upstream).into_future());
+        let base_url = format!("http://{address}/v1");
+        let repository = Arc::new(
+            SqliteAccountRepository::in_memory()
+                .await
+                .expect("repository"),
+        );
+        let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+        runtime
+            .register_driver(GrokDriver::for_test(base_url.clone()))
+            .expect("register Grok driver");
+        let auth = AuthService::new(repository.clone());
+        let now = unix_timestamp();
+        let owner_grant = auth
+            .setup(
+                "quota-owner".to_owned(),
+                SecretString::from("secret1".to_owned()),
+                now,
+            )
+            .await
+            .expect("owner setup");
+        let member = auth
+            .create_user(
+                &owner_grant.user,
+                "quota-member".to_owned(),
+                SecretString::from("secret2".to_owned()),
+                now,
+            )
+            .await
+            .expect("create member");
+        let member_grant = auth
+            .login(
+                "quota-member".to_owned(),
+                SecretString::from("secret2".to_owned()),
+                now,
+            )
+            .await
+            .expect("member login");
+        let manager = ProviderManager::new(repository.clone(), runtime.clone());
+        let credential_json = SecretString::from(
+            serde_json::json!({
+                "type": "xai",
+                "auth_kind": "oauth",
+                "access_token": "quota-token",
+                "refresh_token": "quota-refresh",
+                "token_endpoint": "https://auth.x.ai/oauth/token",
+                "base_url": base_url.clone(),
+                "disabled": false
+            })
+            .to_string(),
+        );
+        let created = manager
+            .import_grok_account(
+                owner_grant.user.id.as_str(),
+                "shared Grok".to_owned(),
+                credential_json,
+                provider_core::ProviderVisibility::Shared,
+                now,
+            )
+            .await
+            .expect("create Grok account");
+
+        QuotaTestContext {
+            upstream_state,
+            upstream_server,
+            base_url,
+            repository,
+            runtime,
+            manager,
+            auth,
+            owner: owner_grant.user,
+            member,
+            member_access_token: member_grant.access_token,
+            account_id: created.account.id,
+            now,
+        }
+    }
 
     #[tokio::test]
     async fn enforces_provider_ownership_without_returning_credentials() {
@@ -903,5 +1106,237 @@ mod tests {
             authorization.lock().expect("authorization lock").as_slice(),
             ["Bearer do-not-return", "", ""]
         );
+    }
+
+    #[tokio::test]
+    async fn quota_http_filters_shared_billing_and_forces_refresh() {
+        let context = quota_test_context().await;
+        let upstream_state = context.upstream_state.clone();
+        let repository = context.repository.clone();
+        let runtime = context.runtime.clone();
+        let manager = context.manager.clone();
+        let auth = context.auth.clone();
+        let owner = context.owner.clone();
+        let member = context.member.clone();
+        let member_access_token = context.member_access_token.clone();
+        let account_id = context.account_id.clone();
+        let now = context.now;
+
+        let first = manager
+            .quota(member.id.as_str(), &account_id, now)
+            .await
+            .expect("member quota");
+        assert_eq!(first.support, ProviderQuotaSupport::Supported);
+        assert_eq!(first.freshness, Some(ProviderQuotaFreshness::Fresh));
+        assert_eq!(
+            first
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.groups.len()),
+            Some(1)
+        );
+        assert_eq!(
+            first
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.groups.first())
+                .map(|group| group.key.as_str()),
+            Some("grok")
+        );
+        let owner_summary = manager
+            .get_account(owner.id.as_str(), &account_id)
+            .await
+            .expect("owner account");
+        let owner_quota = manager.cached_quota(owner.id.as_str(), &owner_summary, now);
+        assert_eq!(
+            owner_quota
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.groups.len()),
+            Some(2)
+        );
+        assert_eq!(upstream_state.user_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
+
+        let api_keys = ApiKeyAuthenticator::load(repository.clone())
+            .await
+            .expect("API key index");
+        let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+        let management_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind quota management server");
+        let management_address = management_listener
+            .local_addr()
+            .expect("quota management address");
+        let management_server = tokio::spawn(
+            axum::serve(
+                management_listener,
+                router_with_management(service, manager.clone(), auth, api_keys),
+            )
+            .into_future(),
+        );
+        let client = reqwest::Client::new();
+        let access_token = member_access_token.expose_secret();
+        let endpoint = format!("http://{management_address}/api/v1/providers");
+        let list_response = client
+            .get(&endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .expect("quota provider list");
+        let list_response: Value = serde_json::from_slice(
+            &list_response
+                .bytes()
+                .await
+                .expect("quota provider list body"),
+        )
+        .expect("quota provider list JSON");
+        assert_eq!(list_response["data"][0]["quota"]["freshness"], "fresh");
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
+        let quota_response = client
+            .get(format!("{endpoint}/{account_id}/quota"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .expect("quota endpoint");
+        let quota_response: Value =
+            serde_json::from_slice(&quota_response.bytes().await.expect("quota endpoint body"))
+                .expect("quota endpoint JSON");
+        assert_eq!(quota_response["data"]["support"], "supported");
+        assert_eq!(quota_response["data"]["freshness"], "fresh");
+        assert_eq!(
+            quota_response["data"]["snapshot"]["groups"][0]["metrics"][0]["breakdown"][0]["key"],
+            "grok_build"
+        );
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
+        let refresh_response = client
+            .post(format!("{endpoint}/{account_id}/quota/refresh"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .expect("refresh quota endpoint");
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 2);
+        management_server.abort();
+        context.upstream_server.abort();
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn quota_cache_handles_singleflight_backoff_and_credential_replacement() {
+        let context = quota_test_context().await;
+        let upstream_state = context.upstream_state.clone();
+        let repository = context.repository.clone();
+        let runtime = context.runtime.clone();
+        let manager = context.manager.clone();
+        let base_url = context.base_url.clone();
+        let owner = context.owner.clone();
+        let member = context.member.clone();
+        let account_id = context.account_id.clone();
+        let now = context.now;
+
+        manager
+            .quota(member.id.as_str(), &account_id, now)
+            .await
+            .expect("initial quota");
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
+
+        let (first_refresh, second_refresh) = tokio::join!(
+            manager.refresh_quota(member.id.as_str(), &account_id, now + 31),
+            manager.refresh_quota(member.id.as_str(), &account_id, now + 31),
+        );
+        first_refresh.expect("first forced member refresh");
+        second_refresh.expect("second forced member refresh");
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 2);
+
+        manager
+            .set_account_enabled(owner.id.as_str(), &account_id, false, now + 32)
+            .await
+            .expect("disable account");
+        let disabled = manager
+            .quota(member.id.as_str(), &account_id, now + 62)
+            .await
+            .expect("disabled quota");
+        assert_eq!(disabled.freshness, Some(ProviderQuotaFreshness::Fresh));
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 3);
+        assert!(
+            !manager
+                .get_account(owner.id.as_str(), &account_id)
+                .await
+                .expect("disabled account")
+                .enabled
+        );
+
+        upstream_state.fail_billing.store(true, Ordering::SeqCst);
+        let stale = manager
+            .quota(member.id.as_str(), &account_id, now + 93)
+            .await
+            .expect("stale quota");
+        assert_eq!(stale.freshness, Some(ProviderQuotaFreshness::Stale));
+        assert_eq!(stale.last_error, Some(ProviderQuotaErrorKind::Upstream));
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 4);
+        let backed_off = manager
+            .refresh_quota(member.id.as_str(), &account_id, now + 94)
+            .await
+            .expect("quota failure backoff");
+        assert_eq!(backed_off.freshness, Some(ProviderQuotaFreshness::Stale));
+        assert_eq!(
+            backed_off.last_error,
+            Some(ProviderQuotaErrorKind::Upstream)
+        );
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 4);
+
+        let stored = repository
+            .load_provider_account(&account_id)
+            .await
+            .expect("load account")
+            .expect("stored account");
+        assert!(
+            stored
+                .credential
+                .credential_json
+                .expose_secret()
+                .contains("upstream_user_id")
+        );
+        manager
+            .update_credential(
+                owner.id.as_str(),
+                &account_id,
+                ProviderCredentialReplacement {
+                    kind: CredentialKind::Oauth,
+                    format_version: stored.credential.format_version,
+                    credential_json: SecretString::from(
+                        serde_json::json!({
+                            "type": "xai",
+                            "auth_kind": "oauth",
+                            "access_token": "replacement-token",
+                            "refresh_token": "replacement-refresh",
+                            "upstream_user_id": "replacement-user",
+                            "token_endpoint": "https://auth.x.ai/oauth/token",
+                            "base_url": base_url,
+                            "disabled": false
+                        })
+                        .to_string(),
+                    ),
+                    expires_at: None,
+                    last_refreshed_at: None,
+                    updated_at: now + 94,
+                },
+            )
+            .await
+            .expect("replace credential");
+        let listed = manager
+            .list_accounts(member.id.as_str())
+            .await
+            .expect("member account list");
+        let summary = listed
+            .iter()
+            .find(|account| account.id == account_id)
+            .expect("shared account summary");
+        let cached = manager.cached_quota(member.id.as_str(), summary, now + 94);
+        assert_eq!(cached.support, ProviderQuotaSupport::Supported);
+        assert!(cached.snapshot.is_none());
+        context.upstream_server.abort();
+        runtime.shutdown();
     }
 }

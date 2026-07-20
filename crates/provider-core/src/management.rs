@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::{
     AccountId, AccountRepository, NewProviderAccount, ProviderAccount, ProviderAccountAccess,
-    ProviderAccountUpdate, ProviderDriver, ProviderKind, StoredProviderAccount,
-    StoredProviderModel,
+    ProviderAccountUpdate, ProviderDriver, ProviderKind, ProviderQuotaControl,
+    StoredProviderAccount, StoredProviderModel,
 };
 
 #[derive(Clone, Debug)]
@@ -68,6 +68,10 @@ impl ProviderConfigurationError {
 pub trait ManagedProviderDriver: ProviderDriver {
     fn kind(&self) -> ProviderKind;
 
+    fn supports_quota(&self) -> bool {
+        false
+    }
+
     fn prepare_account(
         &self,
         input: AccountProvisioningInput,
@@ -107,7 +111,7 @@ impl ProviderControlError {
 }
 
 #[async_trait]
-pub trait ProviderControl: Send + Sync {
+pub trait ProviderControl: ProviderQuotaControl + Send + Sync {
     fn prepare_account(
         &self,
         kind: ProviderKind,

@@ -7,10 +7,13 @@ use async_trait::async_trait;
 use provider_core::{
     AccountId, AccountProvisioningInput, AccountRepository, ManagedProviderDriver,
     NewProviderAccount, ProviderAccount, ProviderAccountAccess, ProviderAccountUpdate,
-    ProviderControl, ProviderControlError, ProviderKind, ProviderModel, ProviderRouteCandidate,
-    ProviderRouter, StartedProviderOAuth, StoredProviderAccount, StoredProviderModel,
+    ProviderControl, ProviderControlError, ProviderKind, ProviderModel, ProviderQuotaControl,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderRouteCandidate,
+    ProviderRouter, RefreshError, RefreshErrorKind, RefreshTrigger, StartedProviderOAuth,
+    StoredProviderAccount, StoredProviderModel,
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use crate::{ProviderModelRouter, ProviderRuntime};
 
@@ -24,6 +27,7 @@ struct CatalogInner {
     drivers: RwLock<BTreeMap<ProviderKind, Arc<dyn ManagedProviderDriver>>>,
     runtimes: RwLock<BTreeMap<ProviderKind, ProviderRuntime>>,
     router: ProviderModelRouter,
+    detached_refresh_limit: Arc<Semaphore>,
 }
 
 #[derive(Debug, Error)]
@@ -43,6 +47,7 @@ impl ProviderRuntimeCatalog {
                 drivers: RwLock::new(BTreeMap::new()),
                 runtimes: RwLock::new(BTreeMap::new()),
                 router: ProviderModelRouter::new(),
+                detached_refresh_limit: Arc::new(Semaphore::new(4)),
             }),
         }
     }
@@ -94,6 +99,51 @@ impl ProviderRuntimeCatalog {
         {
             runtime.shutdown();
         }
+    }
+}
+
+#[async_trait]
+impl ProviderQuotaControl for ProviderRuntimeCatalog {
+    fn supports_quota(&self, provider: ProviderKind) -> bool {
+        self.inner
+            .drivers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&provider)
+            .is_some_and(|driver| driver.supports_quota())
+    }
+
+    async fn fetch_account_quota(
+        &self,
+        account: StoredProviderAccount,
+    ) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+        if account.enabled {
+            let runtime = self
+                .inner
+                .runtimes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&account.provider)
+                .cloned()
+                .ok_or_else(|| {
+                    ProviderQuotaError::new(
+                        ProviderQuotaErrorKind::Internal,
+                        "provider runtime is not registered",
+                    )
+                })?;
+            return runtime.fetch_quota_for(&account.id).await;
+        }
+
+        let detached = self.build_account(account).map_err(|error| {
+            ProviderQuotaError::new(ProviderQuotaErrorKind::Internal, error.to_string())
+        })?;
+        if !detached.runtime_state().available_for_requests() {
+            return Err(ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Authentication,
+                "provider account is not available",
+            ));
+        }
+        fetch_detached_quota(detached, &self.inner.detached_refresh_limit).await
     }
 }
 
@@ -239,4 +289,55 @@ impl ProviderRouter for ProviderRuntimeCatalog {
     fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
         self.inner.router.routes(user_id, model)
     }
+}
+
+async fn fetch_detached_quota(
+    account: Arc<dyn ProviderAccount>,
+    refresh_limit: &Arc<Semaphore>,
+) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+    let generation = account.runtime_state().generation;
+    let first = fetch_quota_source(account.as_ref()).await;
+    let snapshot = match first {
+        Err(error) if error.upstream_status() == Some(401) => {
+            let _permit = refresh_limit.acquire().await.map_err(|_| {
+                ProviderQuotaError::new(
+                    ProviderQuotaErrorKind::Internal,
+                    "provider refresh runtime stopped",
+                )
+            })?;
+            if account.runtime_state().generation == generation {
+                account
+                    .refresh_credentials(RefreshTrigger::Unauthorized)
+                    .await
+                    .map_err(refresh_quota_error)?;
+            }
+            fetch_quota_source(account.as_ref()).await?
+        }
+        result => result?,
+    };
+    Ok(ProviderQuotaFetch {
+        snapshot,
+        credential_revision: account.credential_revision(),
+    })
+}
+
+async fn fetch_quota_source(
+    account: &dyn ProviderAccount,
+) -> Result<provider_core::ProviderQuotaSnapshot, ProviderQuotaError> {
+    let source = account.quota_source().ok_or_else(|| {
+        ProviderQuotaError::new(
+            ProviderQuotaErrorKind::Unsupported,
+            "provider account does not support quota queries",
+        )
+    })?;
+    source.fetch_quota().await
+}
+
+fn refresh_quota_error(error: RefreshError) -> ProviderQuotaError {
+    let kind = match error.kind() {
+        RefreshErrorKind::ReauthRequired => ProviderQuotaErrorKind::Authentication,
+        RefreshErrorKind::Transient => ProviderQuotaErrorKind::Upstream,
+        RefreshErrorKind::Internal => ProviderQuotaErrorKind::Internal,
+    };
+    ProviderQuotaError::new(kind, error.message())
 }

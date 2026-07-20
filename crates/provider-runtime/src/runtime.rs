@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use provider_core::{
     AccountId, Provider, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
-    ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
-    RefreshTrigger, WireFormat,
+    ProviderModel, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderRequest,
+    ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger, WireFormat,
 };
 use thiserror::Error;
 use tokio::{
@@ -170,6 +170,14 @@ impl ProviderRuntime {
             .await
     }
 
+    pub async fn fetch_quota_for(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+        let entry = self.quota_account(account_id).await?;
+        self.fetch_quota_entry(entry).await
+    }
+
     async fn selected_account(&self) -> Result<Arc<AccountEntry>, ProviderError> {
         let accounts = self.inner.accounts.read().await;
         let available: Vec<_> = accounts
@@ -211,6 +219,25 @@ impl ProviderRuntime {
         Ok(entry)
     }
 
+    async fn quota_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Arc<AccountEntry>, ProviderQuotaError> {
+        let entry = self.account_entry(account_id).await.ok_or_else(|| {
+            ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Internal,
+                "provider account is not registered",
+            )
+        })?;
+        if !entry.account.runtime_state().available_for_requests() {
+            return Err(ProviderQuotaError::new(
+                ProviderQuotaErrorKind::Authentication,
+                "provider account is not available",
+            ));
+        }
+        Ok(entry)
+    }
+
     async fn execute_entry(
         &self,
         entry: Arc<AccountEntry>,
@@ -231,6 +258,30 @@ impl ProviderRuntime {
             }
             result => result,
         }
+    }
+
+    async fn fetch_quota_entry(
+        &self,
+        entry: Arc<AccountEntry>,
+    ) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+        let generation = entry.account.runtime_state().generation;
+        let first = fetch_account_quota(entry.account.as_ref()).await;
+        let snapshot = match first {
+            Err(error) if error.upstream_status() == Some(401) => {
+                let account_id = entry.account.account_id().clone();
+                let refresh = self
+                    .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
+                    .await;
+                self.report_refresh_result(account_id, &refresh);
+                refresh.map_err(refresh_quota_error)?;
+                fetch_account_quota(entry.account.as_ref()).await?
+            }
+            result => result?,
+        };
+        Ok(ProviderQuotaFetch {
+            snapshot,
+            credential_revision: entry.account.credential_revision(),
+        })
     }
 
     async fn refresh_entry(
@@ -320,6 +371,27 @@ fn refresh_provider_error(error: RefreshError) -> ProviderError {
         RefreshErrorKind::Internal => ProviderErrorKind::Internal,
     };
     ProviderError::new(kind, error.message())
+}
+
+fn refresh_quota_error(error: RefreshError) -> ProviderQuotaError {
+    let kind = match error.kind() {
+        RefreshErrorKind::ReauthRequired => ProviderQuotaErrorKind::Authentication,
+        RefreshErrorKind::Transient => ProviderQuotaErrorKind::Upstream,
+        RefreshErrorKind::Internal => ProviderQuotaErrorKind::Internal,
+    };
+    ProviderQuotaError::new(kind, error.message())
+}
+
+async fn fetch_account_quota(
+    account: &dyn ProviderAccount,
+) -> Result<provider_core::ProviderQuotaSnapshot, ProviderQuotaError> {
+    let source = account.quota_source().ok_or_else(|| {
+        ProviderQuotaError::new(
+            ProviderQuotaErrorKind::Unsupported,
+            "provider account does not support quota queries",
+        )
+    })?;
+    source.fetch_quota().await
 }
 
 async fn run_scheduler(
@@ -475,7 +547,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use futures_util::stream;
-    use provider_core::{AccountAuthState, AccountRuntimeState, RefreshOutcome, RequestMetadata};
+    use provider_core::{
+        AccountAuthState, AccountRuntimeState, ProviderQuotaSnapshot, ProviderQuotaSource,
+        RefreshOutcome, RequestMetadata,
+    };
     use tokio::sync::{Barrier, Notify};
 
     use super::*;
@@ -485,6 +560,7 @@ mod tests {
         generation: AtomicU64,
         refresh_calls: AtomicU64,
         execute_calls: AtomicU64,
+        quota_calls: AtomicU64,
         unauthorized_calls: AtomicU64,
         initial_requests: Barrier,
         unauthorized_ready: Notify,
@@ -527,6 +603,14 @@ mod tests {
             }
         }
 
+        fn credential_revision(&self) -> u64 {
+            self.generation.load(Ordering::SeqCst)
+        }
+
+        fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+            Some(self)
+        }
+
         async fn execute_stream(
             &self,
             _request: ProviderRequest,
@@ -564,6 +648,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ProviderQuotaSource for UnauthorizedAccount {
+        async fn fetch_quota(&self) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
+            self.quota_calls.fetch_add(1, Ordering::SeqCst);
+            if self.generation.load(Ordering::SeqCst) == 0 {
+                return Err(ProviderQuotaError::new(
+                    ProviderQuotaErrorKind::Authentication,
+                    "quota returned unauthorized",
+                )
+                .with_upstream_status(401));
+            }
+            Ok(ProviderQuotaSnapshot {
+                account_id: self.id.to_string(),
+                provider: provider_core::ProviderKind::Grok,
+                fetched_at: 1,
+                groups: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn background_and_unauthorized_requests_share_one_refresh() {
         let account = Arc::new(UnauthorizedAccount {
@@ -571,6 +676,7 @@ mod tests {
             generation: AtomicU64::new(0),
             refresh_calls: AtomicU64::new(0),
             execute_calls: AtomicU64::new(0),
+            quota_calls: AtomicU64::new(0),
             unauthorized_calls: AtomicU64::new(0),
             initial_requests: Barrier::new(2),
             unauthorized_ready: Notify::new(),
@@ -607,5 +713,37 @@ mod tests {
         assert_eq!(account.refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(account.generation.load(Ordering::SeqCst), 1);
         assert_eq!(account.execute_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn quota_unauthorized_uses_account_refresh_gate_and_retries_once() {
+        let account = Arc::new(UnauthorizedAccount {
+            id: AccountId::new("quota-account").expect("valid account ID"),
+            generation: AtomicU64::new(0),
+            refresh_calls: AtomicU64::new(0),
+            execute_calls: AtomicU64::new(0),
+            quota_calls: AtomicU64::new(0),
+            unauthorized_calls: AtomicU64::new(0),
+            initial_requests: Barrier::new(2),
+            unauthorized_ready: Notify::new(),
+            refresh_started: Notify::new(),
+            release_refresh: Notify::new(),
+        });
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        runtime
+            .register(account.clone())
+            .await
+            .expect("register account");
+        let request_runtime = runtime.clone();
+        let account_id = account.id.clone();
+        let quota = tokio::spawn(async move { request_runtime.fetch_quota_for(&account_id).await });
+        account.refresh_started.notified().await;
+        account.release_refresh.notify_one();
+        let fetched = quota.await.expect("quota task").expect("quota result");
+        runtime.shutdown();
+
+        assert_eq!(fetched.credential_revision, 1);
+        assert_eq!(account.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(account.quota_calls.load(Ordering::SeqCst), 2);
     }
 }

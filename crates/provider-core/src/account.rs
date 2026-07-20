@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel, ProviderRequest,
-    ProviderStream,
+    DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel, ProviderQuotaSource,
+    ProviderRequest, ProviderStream,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -272,6 +272,7 @@ pub struct ProviderAccountSummary {
     pub label: String,
     pub config_json: String,
     pub credential_kind: CredentialKind,
+    pub credential_revision: u64,
     pub enabled: bool,
     pub auth_state: AccountAuthState,
     pub safe_error_code: Option<String>,
@@ -378,6 +379,12 @@ pub trait ProviderAccount: Send + Sync {
     fn account_id(&self) -> &AccountId;
 
     fn runtime_state(&self) -> AccountRuntimeState;
+
+    fn credential_revision(&self) -> u64;
+
+    fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+        None
+    }
 
     async fn execute_stream(
         &self,

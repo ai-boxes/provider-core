@@ -16,6 +16,7 @@ pub struct GrokCredentials {
     document: Map<String, Value>,
     access_token: SecretString,
     refresh_token: Option<SecretString>,
+    upstream_user_id: Option<String>,
     token_endpoint: Option<String>,
     base_url: Option<String>,
 }
@@ -38,6 +39,24 @@ impl GrokCredentials {
     #[must_use]
     pub(crate) fn refresh_token(&self) -> Option<&SecretString> {
         self.refresh_token.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn upstream_user_id(&self) -> Option<&str> {
+        self.upstream_user_id.as_deref()
+    }
+
+    pub(crate) fn with_upstream_user_id(&self, user_id: &str) -> Result<Self, GrokAuthError> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Err(GrokAuthError::MissingUpstreamUserId);
+        }
+        let mut document = self.document.clone();
+        document.insert(
+            "upstream_user_id".to_owned(),
+            Value::String(user_id.to_owned()),
+        );
+        Self::from_document(document)
     }
 
     #[must_use]
@@ -113,6 +132,10 @@ impl GrokCredentials {
         document.insert("type".to_owned(), Value::String("xai".to_owned()));
         document.insert("auth_kind".to_owned(), Value::String("oauth".to_owned()));
         document.insert("access_token".to_owned(), Value::String(access_token));
+        document.insert(
+            "upstream_user_id".to_owned(),
+            Value::String("test-user".to_owned()),
+        );
         document.insert("disabled".to_owned(), Value::Bool(false));
         match Self::from_document(document) {
             Ok(credentials) => credentials,
@@ -148,6 +171,11 @@ impl GrokCredentials {
         let access_token =
             required_secret(&document, "access_token").ok_or(GrokAuthError::MissingAccessToken)?;
         let refresh_token = optional_secret(&document, "refresh_token");
+        let upstream_user_id = string_field(&document, "upstream_user_id")
+            .or_else(|| string_field(&document, "user_id"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let token_endpoint = string_field(&document, "token_endpoint")
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -161,6 +189,7 @@ impl GrokCredentials {
             document,
             access_token,
             refresh_token,
+            upstream_user_id,
             token_endpoint,
             base_url,
         })
@@ -176,6 +205,7 @@ impl fmt::Debug for GrokCredentials {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("upstream_user_id", &self.upstream_user_id)
             .field("token_endpoint", &self.token_endpoint)
             .field("base_url", &self.base_url)
             .finish_non_exhaustive()
@@ -235,6 +265,8 @@ pub enum GrokAuthError {
     Disabled,
     #[error("Grok auth JSON is missing access_token")]
     MissingAccessToken,
+    #[error("Grok auth JSON is missing upstream user ID")]
+    MissingUpstreamUserId,
     #[error("stored provider account is not a Grok account")]
     InvalidStoredProvider,
     #[error("unsupported Grok credential format version {0}")]

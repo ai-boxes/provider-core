@@ -8,6 +8,7 @@ pub mod model;
 pub mod protocol;
 pub mod provider;
 pub mod proxy;
+pub mod quota;
 pub mod token_count;
 
 pub use account::{
@@ -33,4 +34,10 @@ pub use provider::{
     ProviderRouteCandidate, ProviderRouter, ProviderStream,
 };
 pub use proxy::{ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
+pub use quota::{
+    ProviderQuotaControl, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
+    ProviderQuotaFreshness, ProviderQuotaSnapshot, ProviderQuotaSource, ProviderQuotaSupport,
+    ProviderQuotaView, QuotaAmount, QuotaBreakdown, QuotaGroup, QuotaGroupAudience,
+    QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod, QuotaPeriodKind, QuotaUnit,
+};
 pub use token_count::{TokenCountError, TokenCounter};

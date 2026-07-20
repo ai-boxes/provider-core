@@ -20,6 +20,7 @@ thiserror.workspace = true
 tiktoken-rs.workspace = true
 time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

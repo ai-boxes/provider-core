@@ -14,6 +14,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
 #[derive(Debug)]
 pub(crate) struct PreparedGrokRequest {
     pub(crate) payload: Bytes,
+    pub(crate) model: String,
     pub(crate) metadata: RequestMetadata,
 }
 
@@ -27,7 +28,7 @@ pub(crate) fn prepare_request(
         ));
     }
 
-    let model = request.model.trim();
+    let model = request.model.trim().to_owned();
     if model.is_empty() {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
@@ -48,7 +49,7 @@ pub(crate) fn prepare_request(
         )
     })?;
 
-    body.insert("model".to_owned(), Value::String(model.to_owned()));
+    body.insert("model".to_owned(), Value::String(model.clone()));
     body.insert("stream".to_owned(), Value::Bool(true));
     for field in UNSUPPORTED_FIELDS {
         body.remove(*field);
@@ -77,7 +78,11 @@ pub(crate) fn prepare_request(
         )
     })?;
 
-    Ok(PreparedGrokRequest { payload, metadata })
+    Ok(PreparedGrokRequest {
+        payload,
+        model,
+        metadata,
+    })
 }
 
 fn normalized_string(value: Option<&str>) -> Option<String> {

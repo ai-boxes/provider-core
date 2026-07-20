@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex as StdMutex, PoisonError, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,14 +8,20 @@ use provider_core::{
     AccountId, AccountProvisioningInput, CredentialKind, CredentialUpdate, CredentialWriteOutcome,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderControl,
     ProviderControlError, ProviderKind, ProviderManagementRepository, ProviderModelOverride,
-    ProviderOAuthChallenge, ProviderVisibility, StoredProviderAccount, StoredProviderModel,
+    ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport,
+    ProviderQuotaView, ProviderVisibility, QuotaGroupAudience, StoredProviderAccount,
+    StoredProviderModel,
 };
 use secrecy::SecretString;
 use thiserror::Error;
-use tokio::task::AbortHandle;
+use tokio::{sync::Mutex as AsyncMutex, task::AbortHandle};
 use uuid::Uuid;
 
 use crate::{ModelCatalogError, ModelCatalogService, ModelCatalogSnapshot};
+
+const QUOTA_FRESH_SECONDS: i64 = 30;
+const QUOTA_RETRY_SECONDS: i64 = 30;
+const QUOTA_STALE_SECONDS: i64 = 15 * 60;
 
 pub struct CreatedProviderAccount {
     pub account: ProviderAccountSummary,
@@ -66,11 +72,33 @@ struct OAuthSessionEntry {
 }
 
 #[derive(Clone)]
+struct QuotaCacheEntry {
+    credential_revision: u64,
+    snapshot: Option<provider_core::ProviderQuotaSnapshot>,
+    last_error: Option<ProviderQuotaErrorKind>,
+    last_attempt_at: i64,
+    attempt: u64,
+}
+
+#[derive(Default)]
+struct QuotaState {
+    entries: StdMutex<BTreeMap<AccountId, QuotaCacheEntry>>,
+    gates: StdMutex<BTreeMap<AccountId, Weak<AsyncMutex<()>>>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QuotaFetchMode {
+    Automatic,
+    Force,
+}
+
+#[derive(Clone)]
 pub struct ProviderManager {
     repository: Arc<dyn ProviderManagementRepository>,
     control: Arc<dyn ProviderControl>,
     models: ModelCatalogService,
-    oauth_sessions: Arc<Mutex<BTreeMap<String, OAuthSessionEntry>>>,
+    oauth_sessions: Arc<StdMutex<BTreeMap<String, OAuthSessionEntry>>>,
+    quota: Arc<QuotaState>,
 }
 
 impl ProviderManager {
@@ -83,7 +111,8 @@ impl ProviderManager {
             models: ModelCatalogService::new(repository.clone()),
             repository,
             control,
-            oauth_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            oauth_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
+            quota: Arc::new(QuotaState::default()),
         }
     }
 
@@ -260,6 +289,42 @@ impl ProviderManager {
         ))
     }
 
+    #[must_use]
+    pub fn cached_quota(
+        &self,
+        actor_user_id: &str,
+        account: &ProviderAccountSummary,
+        now: i64,
+    ) -> ProviderQuotaView {
+        if !self.control.supports_quota(account.provider) {
+            return ProviderQuotaView::unsupported();
+        }
+        self.cached_quota_entry(&account.id, account.credential_revision)
+            .map_or_else(ProviderQuotaView::supported_without_snapshot, |entry| {
+                quota_cache_view(&entry, account.owner_user_id.as_deref(), actor_user_id, now)
+            })
+    }
+
+    pub async fn quota(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        now: i64,
+    ) -> Result<ProviderQuotaView, ProviderManagerError> {
+        self.fetch_quota_view(actor_user_id, account_id, now, QuotaFetchMode::Automatic)
+            .await
+    }
+
+    pub async fn refresh_quota(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        now: i64,
+    ) -> Result<ProviderQuotaView, ProviderManagerError> {
+        self.fetch_quota_view(actor_user_id, account_id, now, QuotaFetchMode::Force)
+            .await
+    }
+
     pub async fn create_account(
         &self,
         owner_user_id: &str,
@@ -302,6 +367,9 @@ impl ProviderManager {
         account_id: &AccountId,
         update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         let current = self.load_owned_account(actor_user_id, account_id).await?;
         let update = self
             .control
@@ -332,6 +400,9 @@ impl ProviderManager {
         account_id: &AccountId,
         replacement: ProviderCredentialReplacement,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         let current = self.load_owned_account(actor_user_id, account_id).await?;
         let outcome = self
             .repository
@@ -352,6 +423,7 @@ impl ProviderManager {
             return Err(ProviderManagerError::Conflict);
         }
         let stored = self.load_account(account_id).await?;
+        self.invalidate_quota(account_id);
         self.reconcile(stored.clone()).await?;
         Ok(account_summary(&stored))
     }
@@ -363,6 +435,9 @@ impl ProviderManager {
         enabled: bool,
         updated_at: i64,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         self.load_owned_account(actor_user_id, account_id).await?;
         if !self
             .repository
@@ -382,10 +457,15 @@ impl ProviderManager {
         account_id: &AccountId,
     ) -> Result<(), ProviderManagerError> {
         self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
+        self.load_owned_account(actor_user_id, account_id).await?;
         if !self.repository.delete_provider_account(account_id).await? {
             return Err(ProviderManagerError::NotFound);
         }
+        self.invalidate_quota(account_id);
         self.control.remove_account(account_id).await;
+        self.remove_account_gate(account_id);
         Ok(())
     }
 
@@ -448,6 +528,158 @@ impl ProviderManager {
                 .update_account_models(account_id, models.clone());
         }
         Ok(models)
+    }
+
+    async fn fetch_quota_view(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        now: i64,
+        mode: QuotaFetchMode,
+    ) -> Result<ProviderQuotaView, ProviderManagerError> {
+        let visible = self.load_visible_account(actor_user_id, account_id).await?;
+        if !self.control.supports_quota(visible.provider) {
+            return Ok(ProviderQuotaView::unsupported());
+        }
+        let initial_credential_revision = visible.credential.revision;
+        let initial_attempt = self
+            .cached_quota_entry(account_id, initial_credential_revision)
+            .map_or(0, |entry| entry.attempt);
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
+        let account = self.load_visible_account(actor_user_id, account_id).await?;
+        let owner_user_id = account.owner_user_id.as_deref();
+        let cached = self.cached_quota_entry(account_id, account.credential.revision);
+
+        if let Some(entry) = cached.as_ref() {
+            if mode == QuotaFetchMode::Force
+                && (account.credential.revision != initial_credential_revision
+                    || entry.attempt > initial_attempt)
+            {
+                return Ok(quota_cache_view(entry, owner_user_id, actor_user_id, now));
+            }
+            if entry.last_error.is_some()
+                && elapsed_seconds(now, entry.last_attempt_at) < QUOTA_RETRY_SECONDS
+            {
+                return Ok(quota_cache_view(entry, owner_user_id, actor_user_id, now));
+            }
+            if mode == QuotaFetchMode::Automatic
+                && entry.last_error.is_none()
+                && entry.snapshot.as_ref().is_some_and(|snapshot| {
+                    elapsed_seconds(now, snapshot.fetched_at) < QUOTA_FRESH_SECONDS
+                })
+            {
+                return Ok(quota_cache_view(entry, owner_user_id, actor_user_id, now));
+            }
+        }
+
+        let next_attempt = cached
+            .as_ref()
+            .map_or(1, |entry| entry.attempt.saturating_add(1));
+        let result = self.control.fetch_account_quota(account.clone()).await;
+        match result {
+            Ok(mut fetched) => {
+                let latest = self.load_visible_account(actor_user_id, account_id).await?;
+                if latest.credential.revision != fetched.credential_revision {
+                    return Ok(ProviderQuotaView::failed(ProviderQuotaErrorKind::Internal));
+                }
+                fetched.snapshot.fetched_at = now;
+                let entry = QuotaCacheEntry {
+                    credential_revision: fetched.credential_revision,
+                    snapshot: Some(fetched.snapshot),
+                    last_error: None,
+                    last_attempt_at: now,
+                    attempt: next_attempt,
+                };
+                self.quota
+                    .entries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(account_id.clone(), entry.clone());
+                Ok(quota_cache_view(
+                    &entry,
+                    latest.owner_user_id.as_deref(),
+                    actor_user_id,
+                    now,
+                ))
+            }
+            Err(error) if error.kind() == ProviderQuotaErrorKind::Unsupported => {
+                Ok(ProviderQuotaView::unsupported())
+            }
+            Err(error) => {
+                let latest = self.load_visible_account(actor_user_id, account_id).await?;
+                let snapshot = cached
+                    .filter(|entry| entry.credential_revision == latest.credential.revision)
+                    .and_then(|entry| entry.snapshot);
+                let entry = QuotaCacheEntry {
+                    credential_revision: latest.credential.revision,
+                    snapshot,
+                    last_error: Some(error.kind()),
+                    last_attempt_at: now,
+                    attempt: next_attempt,
+                };
+                self.quota
+                    .entries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(account_id.clone(), entry.clone());
+                Ok(quota_cache_view(
+                    &entry,
+                    latest.owner_user_id.as_deref(),
+                    actor_user_id,
+                    now,
+                ))
+            }
+        }
+    }
+
+    fn cached_quota_entry(
+        &self,
+        account_id: &AccountId,
+        credential_revision: u64,
+    ) -> Option<QuotaCacheEntry> {
+        let mut entries = self
+            .quota
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.get(account_id)?;
+        if entry.credential_revision != credential_revision {
+            entries.remove(account_id);
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    fn account_gate(&self, account_id: &AccountId) -> Arc<AsyncMutex<()>> {
+        let mut gates = self
+            .quota
+            .gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(account_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        gates.insert(account_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    fn invalidate_quota(&self, account_id: &AccountId) {
+        self.quota
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(account_id);
+    }
+
+    fn remove_account_gate(&self, account_id: &AccountId) {
+        self.quota
+            .gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(account_id);
     }
 
     async fn load_account(
@@ -549,6 +781,44 @@ fn unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+fn elapsed_seconds(now: i64, then: i64) -> i64 {
+    now.saturating_sub(then).max(0)
+}
+
+fn quota_cache_view(
+    entry: &QuotaCacheEntry,
+    owner_user_id: Option<&str>,
+    actor_user_id: &str,
+    now: i64,
+) -> ProviderQuotaView {
+    let snapshot = entry.snapshot.as_ref().and_then(|snapshot| {
+        (elapsed_seconds(now, snapshot.fetched_at) <= QUOTA_STALE_SECONDS).then(|| {
+            let mut snapshot = snapshot.clone();
+            if owner_user_id != Some(actor_user_id) {
+                snapshot
+                    .groups
+                    .retain(|group| group.audience == QuotaGroupAudience::Shared);
+            }
+            snapshot
+        })
+    });
+    let freshness = snapshot.as_ref().map(|snapshot| {
+        if entry.last_error.is_none()
+            && elapsed_seconds(now, snapshot.fetched_at) < QUOTA_FRESH_SECONDS
+        {
+            ProviderQuotaFreshness::Fresh
+        } else {
+            ProviderQuotaFreshness::Stale
+        }
+    });
+    ProviderQuotaView {
+        support: ProviderQuotaSupport::Supported,
+        freshness,
+        snapshot,
+        last_error: entry.last_error,
+    }
+}
+
 fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
     ProviderAccountSummary {
         id: account.id.clone(),
@@ -558,6 +828,7 @@ fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
         label: account.label.clone(),
         config_json: account.config_json.clone(),
         credential_kind: account.credential.kind,
+        credential_revision: account.credential.revision,
         enabled: account.enabled,
         auth_state: account.auth_state,
         safe_error_code: account.safe_error_code.clone(),

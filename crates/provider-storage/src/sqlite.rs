@@ -233,6 +233,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.safe_error_code,
                 a.created_at,
                 a.updated_at,
+                c.revision,
                 c.credential_kind
             FROM provider_accounts AS a
             INNER JOIN provider_credentials AS c ON c.account_id = a.id
@@ -1079,6 +1080,9 @@ fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepo
         label: row_value(&row, "label")?,
         config_json: row_value(&row, "config_json")?,
         credential_kind,
+        credential_revision: row_value::<i64>(&row, "revision")?
+            .try_into()
+            .map_err(|_| AccountRepositoryError::new("invalid provider credential revision"))?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
         safe_error_code: row_value(&row, "safe_error_code")?,

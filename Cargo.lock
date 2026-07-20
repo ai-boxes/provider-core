@@ -1291,6 +1291,7 @@ dependencies = [
  "tiktoken-rs",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

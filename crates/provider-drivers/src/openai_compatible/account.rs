@@ -28,6 +28,7 @@ pub struct OpenAiCompatibleDriver {
 struct OpenAiCompatibleAccount {
     driver: Arc<OpenAiCompatibleDriver>,
     account_id: AccountId,
+    credential_revision: u64,
     config: CompatibleConfig,
     credentials: CompatibleCredentials,
     auth_state: AccountAuthState,
@@ -126,6 +127,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
         Ok(Arc::new(OpenAiCompatibleAccount {
             driver: self,
             account_id: account.id,
+            credential_revision: account.credential.revision,
             config,
             credentials,
             auth_state: account.auth_state,
@@ -160,6 +162,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
             auth_state: self.auth_state,
             persistence_pending: false,
         }
+    }
+
+    fn credential_revision(&self) -> u64 {
+        self.credential_revision
     }
 
     async fn execute_stream(

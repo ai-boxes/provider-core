@@ -8,6 +8,7 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::quota::GrokQuotaClient;
 use super::refresh::validate_oauth_endpoint;
 
 const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
@@ -22,6 +23,7 @@ const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 pub(crate) struct GrokOAuthClient {
     http: reqwest::Client,
     discovery_url: String,
+    quota_client: GrokQuotaClient,
     allow_insecure_endpoint: bool,
 }
 
@@ -33,6 +35,7 @@ impl GrokOAuthClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             discovery_url: DISCOVERY_URL.to_owned(),
+            quota_client: GrokQuotaClient::new(),
             allow_insecure_endpoint: false,
         }
     }
@@ -119,6 +122,7 @@ impl GrokOAuthClient {
             pending: Box::new(GrokPendingOAuth {
                 http: self.http.clone(),
                 token_endpoint: discovery.token_endpoint,
+                quota_client: self.quota_client.clone(),
                 device_code,
                 interval_seconds,
                 expires_at,
@@ -142,10 +146,14 @@ impl GrokOAuthClient {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn for_test(discovery_url: impl Into<String>) -> Self {
+    pub(crate) fn for_test(
+        discovery_url: impl Into<String>,
+        proxy_base_url: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             discovery_url: discovery_url.into(),
+            quota_client: GrokQuotaClient::with_base_url(proxy_base_url),
             allow_insecure_endpoint: true,
         }
     }
@@ -154,6 +162,7 @@ impl GrokOAuthClient {
 struct GrokPendingOAuth {
     http: reqwest::Client,
     token_endpoint: String,
+    quota_client: GrokQuotaClient,
     device_code: String,
     interval_seconds: u64,
     expires_at: i64,
@@ -231,6 +240,11 @@ impl PendingProviderOAuth for GrokPendingOAuth {
 
             let access_token = required(token.access_token, "access_token")?;
             let refresh_token = required(token.refresh_token, "refresh_token")?;
+            let upstream_user_id = self
+                .quota_client
+                .fetch_user_id_with_access_token(&access_token)
+                .await
+                .ok();
             let refreshed_at = unix_timestamp();
             let expires_in = u64::try_from(token.expires_in)
                 .ok()
@@ -250,6 +264,7 @@ impl PendingProviderOAuth for GrokPendingOAuth {
                 "auth_kind": "oauth",
                 "access_token": access_token,
                 "refresh_token": refresh_token,
+                "upstream_user_id": upstream_user_id,
                 "id_token": token.id_token.filter(|value| !value.trim().is_empty()),
                 "token_type": token.token_type.filter(|value| !value.trim().is_empty()),
                 "expires_in": expires_in,
@@ -390,10 +405,14 @@ mod tests {
                 post(|| async {
                     r#"{"access_token":"access-secret","refresh_token":"refresh-secret","id_token":"id-secret","token_type":"Bearer","expires_in":3600}"#
                 }),
+            )
+            .route(
+                "/user",
+                get(|| async { r#"{"userId":"oauth-user"}"# }),
             );
         let server = tokio::spawn(axum::serve(listener, app).into_future());
 
-        let started = GrokOAuthClient::for_test(format!("{base_url}/discovery"))
+        let started = GrokOAuthClient::for_test(format!("{base_url}/discovery"), base_url.clone())
             .start()
             .await
             .expect("start OAuth");
@@ -408,6 +427,7 @@ mod tests {
         assert_eq!(document["auth_kind"], "oauth");
         assert_eq!(document["access_token"], "access-secret");
         assert_eq!(document["refresh_token"], "refresh-secret");
+        assert_eq!(document["upstream_user_id"], "oauth-user");
         assert_eq!(document["base_url"], DEFAULT_API_BASE_URL);
         assert_eq!(document["token_endpoint"], format!("{base_url}/token"));
     }
