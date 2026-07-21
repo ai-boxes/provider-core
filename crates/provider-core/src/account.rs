@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel, ProviderQuotaSource,
-    ProviderRequest, ProviderStream,
+    DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel,
+    ProviderQuotaObservation, ProviderQuotaSource, ProviderRequest, ProviderStream,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -50,6 +50,7 @@ pub struct AccountIdError;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Grok,
+    Codex,
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     AnthropicCompatible,
@@ -60,6 +61,7 @@ impl ProviderKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Grok => "grok",
+            Self::Codex => "codex",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicCompatible => "anthropic_compatible",
         }
@@ -78,6 +80,7 @@ impl FromStr for ProviderKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim() {
             "grok" => Ok(Self::Grok),
+            "codex" => Ok(Self::Codex),
             "openai_compatible" => Ok(Self::OpenAiCompatible),
             "anthropic_compatible" => Ok(Self::AnthropicCompatible),
             _ => Err(ProviderKindError),
@@ -383,6 +386,10 @@ pub trait ProviderAccount: Send + Sync {
     fn credential_revision(&self) -> u64;
 
     fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+        None
+    }
+
+    fn quota_observation(&self) -> Option<ProviderQuotaObservation> {
         None
     }
 

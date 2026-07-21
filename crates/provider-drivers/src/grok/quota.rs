@@ -12,10 +12,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{
     credentials::GrokCredentials,
-    identity::{
-        CLIENT_MODE, CLIENT_VERSION, DEFAULT_PROXY_BASE_URL, TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE,
-        user_agent,
-    },
+    identity::{DEFAULT_PROXY_BASE_URL, session_headers},
 };
 
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
@@ -45,18 +42,15 @@ impl GrokQuotaClient {
         &self,
         access_token: &str,
     ) -> Result<String, ProviderQuotaError> {
-        let response = self
-            .http
-            .get(format!("{}/user", self.base_url))
-            .bearer_auth(access_token)
-            .header(TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE)
-            .header("x-grok-client-version", CLIENT_VERSION)
-            .header("x-grok-client-mode", CLIENT_MODE)
-            .header(reqwest::header::USER_AGENT, user_agent())
-            .timeout(USER_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| upstream_error("Grok user request failed"))?;
+        let response = session_headers(
+            self.http
+                .get(format!("{}/user", self.base_url))
+                .bearer_auth(access_token),
+        )
+        .timeout(USER_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| upstream_error("Grok user request failed"))?;
         let response: UserResponse = response_json(response, "Grok user").await?;
         let user_id = response.user_id.trim();
         if user_id.is_empty() {
@@ -74,19 +68,16 @@ impl GrokQuotaClient {
         credentials: &GrokCredentials,
         user_id: &str,
     ) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
-        let response = self
-            .http
-            .get(format!("{}/billing?format=credits", self.base_url))
-            .bearer_auth(credentials.access_token().expose_secret())
-            .header(TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE)
-            .header("x-userid", user_id)
-            .header("x-grok-client-version", CLIENT_VERSION)
-            .header("x-grok-client-mode", CLIENT_MODE)
-            .header(reqwest::header::USER_AGENT, user_agent())
-            .timeout(BILLING_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| upstream_error("Grok billing request failed"))?;
+        let response = session_headers(
+            self.http
+                .get(format!("{}/billing?format=credits", self.base_url))
+                .bearer_auth(credentials.access_token().expose_secret()),
+        )
+        .header("x-userid", user_id)
+        .timeout(BILLING_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| upstream_error("Grok billing request failed"))?;
         let response: BillingResponse = response_json(response, "Grok billing").await?;
         normalize_billing(account_id, response)
     }
@@ -175,6 +166,7 @@ fn normalize_billing(
             key: "grok".to_owned(),
             scope: QuotaGroupScope::Aggregate,
             audience: QuotaGroupAudience::Shared,
+            attributes: Default::default(),
             metrics: vec![QuotaMetric {
                 key: "included_usage".to_owned(),
                 kind: QuotaMetricKind::Usage,
@@ -224,6 +216,7 @@ fn normalize_billing(
             key: "billing".to_owned(),
             scope: QuotaGroupScope::Billing,
             audience: QuotaGroupAudience::OwnerOnly,
+            attributes: Default::default(),
             metrics: billing_metrics,
         });
     }
@@ -239,6 +232,7 @@ fn normalize_billing(
         account_id: account_id.to_owned(),
         provider: ProviderKind::Grok,
         fetched_at: unix_timestamp(),
+        last_observed_at: None,
         groups,
         warnings,
     })
@@ -262,6 +256,7 @@ fn normalize_period(period: &UsagePeriod, warnings: &mut Vec<String>) -> QuotaPe
             "invalid_current_period_end",
             warnings,
         ),
+        duration_seconds: None,
     }
 }
 
@@ -466,7 +461,7 @@ mod tests {
             user_headers
                 .get("x-grok-client-version")
                 .and_then(|value| value.to_str().ok()),
-            Some(CLIENT_VERSION)
+            Some("0.2.105")
         );
         assert!(user_headers.get("x-userid").is_none());
 
@@ -485,9 +480,9 @@ mod tests {
         );
         assert_eq!(
             billing_headers
-                .get(TOKEN_AUTH_HEADER)
+                .get("x-xai-token-auth")
                 .and_then(|value| value.to_str().ok()),
-            Some(TOKEN_AUTH_VALUE)
+            Some("xai-grok-cli")
         );
         assert!(billing_headers.get(reqwest::header::CONTENT_TYPE).is_none());
     }

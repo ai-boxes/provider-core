@@ -8,9 +8,9 @@ use provider_core::{
     AccountId, AccountProvisioningInput, CredentialKind, CredentialUpdate, CredentialWriteOutcome,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderControl,
     ProviderControlError, ProviderKind, ProviderManagementRepository, ProviderModelOverride,
-    ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport,
-    ProviderQuotaView, ProviderVisibility, QuotaGroupAudience, StoredProviderAccount,
-    StoredProviderModel,
+    ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness,
+    ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView, ProviderVisibility,
+    QuotaGroupAudience, StoredProviderAccount, StoredProviderModel, merge_quota_groups,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -75,6 +75,8 @@ struct OAuthSessionEntry {
 struct QuotaCacheEntry {
     credential_revision: u64,
     snapshot: Option<provider_core::ProviderQuotaSnapshot>,
+    last_full_fetch_at: Option<i64>,
+    last_observation_generation: u64,
     last_error: Option<ProviderQuotaErrorKind>,
     last_attempt_at: i64,
     attempt: u64,
@@ -138,9 +140,10 @@ impl ProviderManager {
         .await
     }
 
-    pub async fn import_grok_account(
+    pub async fn create_credential_account(
         &self,
         owner_user_id: &str,
+        kind: ProviderKind,
         label: String,
         credential_json: SecretString,
         visibility: ProviderVisibility,
@@ -149,7 +152,7 @@ impl ProviderManager {
         let id = generated_account_id();
         self.create_account(
             owner_user_id,
-            ProviderKind::Grok,
+            kind,
             AccountProvisioningInput::CredentialJson {
                 id,
                 label,
@@ -289,8 +292,7 @@ impl ProviderManager {
         ))
     }
 
-    #[must_use]
-    pub fn cached_quota(
+    pub async fn cached_quota(
         &self,
         actor_user_id: &str,
         account: &ProviderAccountSummary,
@@ -299,10 +301,15 @@ impl ProviderManager {
         if !self.control.supports_quota(account.provider) {
             return ProviderQuotaView::unsupported();
         }
-        self.cached_quota_entry(&account.id, account.credential_revision)
-            .map_or_else(ProviderQuotaView::supported_without_snapshot, |entry| {
-                quota_cache_view(&entry, account.owner_user_id.as_deref(), actor_user_id, now)
-            })
+        let observation = self.control.quota_observation(&account.id).await;
+        self.cached_quota_entry_with_observation(
+            &account.id,
+            account.credential_revision,
+            observation,
+        )
+        .map_or_else(ProviderQuotaView::supported_without_snapshot, |entry| {
+            quota_cache_view(&entry, account.owner_user_id.as_deref(), actor_user_id, now)
+        })
     }
 
     pub async fn quota(
@@ -542,14 +549,35 @@ impl ProviderManager {
             return Ok(ProviderQuotaView::unsupported());
         }
         let initial_credential_revision = visible.credential.revision;
-        let initial_attempt = self
-            .cached_quota_entry(account_id, initial_credential_revision)
-            .map_or(0, |entry| entry.attempt);
+        let initial_observation = self.control.quota_observation(account_id).await;
+        let initial_entry = self.cached_quota_entry_with_observation(
+            account_id,
+            initial_credential_revision,
+            initial_observation,
+        );
+        let initial_attempt = initial_entry.as_ref().map_or(0, |entry| entry.attempt);
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
         let account = self.load_visible_account(actor_user_id, account_id).await?;
         let owner_user_id = account.owner_user_id.as_deref();
-        let cached = self.cached_quota_entry(account_id, account.credential.revision);
+        let observation = self.control.quota_observation(account_id).await;
+        let observation_generation_at_start = observation
+            .as_ref()
+            .filter(|observation| observation.credential_revision == account.credential.revision)
+            .map_or(0, |observation| observation.generation);
+        let cached = self.cached_quota_entry_with_observation(
+            account_id,
+            account.credential.revision,
+            observation,
+        );
+        let observation_generation_at_start =
+            cached
+                .as_ref()
+                .map_or(observation_generation_at_start, |entry| {
+                    entry
+                        .last_observation_generation
+                        .max(observation_generation_at_start)
+                });
 
         if let Some(entry) = cached.as_ref() {
             if mode == QuotaFetchMode::Force
@@ -565,8 +593,8 @@ impl ProviderManager {
             }
             if mode == QuotaFetchMode::Automatic
                 && entry.last_error.is_none()
-                && entry.snapshot.as_ref().is_some_and(|snapshot| {
-                    elapsed_seconds(now, snapshot.fetched_at) < QUOTA_FRESH_SECONDS
+                && entry.last_full_fetch_at.is_some_and(|fetched_at| {
+                    elapsed_seconds(now, fetched_at) < QUOTA_FRESH_SECONDS
                 })
             {
                 return Ok(quota_cache_view(entry, owner_user_id, actor_user_id, now));
@@ -584,9 +612,19 @@ impl ProviderManager {
                     return Ok(ProviderQuotaView::failed(ProviderQuotaErrorKind::Internal));
                 }
                 fetched.snapshot.fetched_at = now;
+                fetched.snapshot.last_observed_at = None;
+                let latest_observation = self.control.quota_observation(account_id).await;
+                let last_observation_generation = merge_new_observation(
+                    &mut fetched.snapshot,
+                    fetched.credential_revision,
+                    observation_generation_at_start,
+                    latest_observation,
+                );
                 let entry = QuotaCacheEntry {
                     credential_revision: fetched.credential_revision,
                     snapshot: Some(fetched.snapshot),
+                    last_full_fetch_at: Some(now),
+                    last_observation_generation,
                     last_error: None,
                     last_attempt_at: now,
                     attempt: next_attempt,
@@ -608,12 +646,15 @@ impl ProviderManager {
             }
             Err(error) => {
                 let latest = self.load_visible_account(actor_user_id, account_id).await?;
-                let snapshot = cached
-                    .filter(|entry| entry.credential_revision == latest.credential.revision)
-                    .and_then(|entry| entry.snapshot);
+                let cached =
+                    cached.filter(|entry| entry.credential_revision == latest.credential.revision);
                 let entry = QuotaCacheEntry {
                     credential_revision: latest.credential.revision,
-                    snapshot,
+                    snapshot: cached.as_ref().and_then(|entry| entry.snapshot.clone()),
+                    last_full_fetch_at: cached.as_ref().and_then(|entry| entry.last_full_fetch_at),
+                    last_observation_generation: cached
+                        .as_ref()
+                        .map_or(0, |entry| entry.last_observation_generation),
                     last_error: Some(error.kind()),
                     last_attempt_at: now,
                     attempt: next_attempt,
@@ -633,21 +674,26 @@ impl ProviderManager {
         }
     }
 
-    fn cached_quota_entry(
+    fn cached_quota_entry_with_observation(
         &self,
         account_id: &AccountId,
         credential_revision: u64,
+        observation: Option<ProviderQuotaObservation>,
     ) -> Option<QuotaCacheEntry> {
         let mut entries = self
             .quota
             .entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entry = entries.get(account_id)?;
-        if entry.credential_revision != credential_revision {
+        if entries
+            .get(account_id)
+            .is_some_and(|entry| entry.credential_revision != credential_revision)
+        {
             entries.remove(account_id);
             return None;
         }
+        let entry = entries.get_mut(account_id)?;
+        apply_observation(entry, observation);
         Some(entry.clone())
     }
 
@@ -785,6 +831,38 @@ fn elapsed_seconds(now: i64, then: i64) -> i64 {
     now.saturating_sub(then).max(0)
 }
 
+fn apply_observation(entry: &mut QuotaCacheEntry, observation: Option<ProviderQuotaObservation>) {
+    let Some(observation) = observation.filter(|observation| {
+        observation.credential_revision == entry.credential_revision
+            && observation.generation > entry.last_observation_generation
+    }) else {
+        return;
+    };
+    entry.last_observation_generation = observation.generation;
+    if let Some(snapshot) = entry.snapshot.as_mut() {
+        merge_quota_groups(&mut snapshot.groups, observation.groups);
+        snapshot.last_observed_at = Some(observation.observed_at);
+    }
+}
+
+fn merge_new_observation(
+    snapshot: &mut provider_core::ProviderQuotaSnapshot,
+    credential_revision: u64,
+    baseline_generation: u64,
+    observation: Option<ProviderQuotaObservation>,
+) -> u64 {
+    let Some(observation) = observation.filter(|observation| {
+        observation.credential_revision == credential_revision
+            && observation.generation > baseline_generation
+    }) else {
+        return baseline_generation;
+    };
+    let generation = observation.generation;
+    merge_quota_groups(&mut snapshot.groups, observation.groups);
+    snapshot.last_observed_at = Some(observation.observed_at);
+    generation
+}
+
 fn quota_cache_view(
     entry: &QuotaCacheEntry,
     owner_user_id: Option<&str>,
@@ -792,19 +870,24 @@ fn quota_cache_view(
     now: i64,
 ) -> ProviderQuotaView {
     let snapshot = entry.snapshot.as_ref().and_then(|snapshot| {
-        (elapsed_seconds(now, snapshot.fetched_at) <= QUOTA_STALE_SECONDS).then(|| {
-            let mut snapshot = snapshot.clone();
-            if owner_user_id != Some(actor_user_id) {
+        entry
+            .last_full_fetch_at
+            .filter(|fetched_at| elapsed_seconds(now, *fetched_at) <= QUOTA_STALE_SECONDS)
+            .map(|_| {
+                let mut snapshot = snapshot.clone();
+                if owner_user_id != Some(actor_user_id) {
+                    snapshot
+                        .groups
+                        .retain(|group| group.audience == QuotaGroupAudience::Shared);
+                }
                 snapshot
-                    .groups
-                    .retain(|group| group.audience == QuotaGroupAudience::Shared);
-            }
-            snapshot
-        })
+            })
     });
-    let freshness = snapshot.as_ref().map(|snapshot| {
+    let freshness = snapshot.as_ref().map(|_| {
         if entry.last_error.is_none()
-            && elapsed_seconds(now, snapshot.fetched_at) < QUOTA_FRESH_SECONDS
+            && entry
+                .last_full_fetch_at
+                .is_some_and(|fetched_at| elapsed_seconds(now, fetched_at) < QUOTA_FRESH_SECONDS)
         {
             ProviderQuotaFreshness::Fresh
         } else {
@@ -857,4 +940,159 @@ pub enum ProviderManagerError {
     OAuthStart(ProviderControlError),
     #[error(transparent)]
     ModelCatalog(#[from] ModelCatalogError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use provider_core::{
+        ProviderQuotaSnapshot, QuotaAmount, QuotaGroup, QuotaGroupScope, QuotaMetric,
+        QuotaMetricKind, QuotaUnit,
+    };
+
+    #[test]
+    fn observation_updates_snapshot_without_changing_full_fetch_state() {
+        let mut entry = cache_entry(7, 100, 1, 10);
+        entry.last_error = Some(ProviderQuotaErrorKind::Upstream);
+        entry.last_attempt_at = 120;
+        entry.attempt = 3;
+
+        apply_observation(&mut entry, Some(observation(7, 2, 1_000, 20)));
+
+        assert_eq!(entry.last_full_fetch_at, Some(100));
+        assert_eq!(entry.last_error, Some(ProviderQuotaErrorKind::Upstream));
+        assert_eq!(entry.last_attempt_at, 120);
+        assert_eq!(entry.attempt, 3);
+        assert_eq!(entry.last_observation_generation, 2);
+        assert_eq!(metric_used(&entry), Some(&QuotaAmount::Integer(20)));
+        assert_eq!(
+            entry
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.last_observed_at),
+            Some(1_000)
+        );
+
+        let recent = quota_cache_view(&entry, Some("owner"), "owner", 130);
+        assert_eq!(recent.freshness, Some(ProviderQuotaFreshness::Stale));
+        assert_eq!(recent.last_error, Some(ProviderQuotaErrorKind::Upstream));
+        let expired = quota_cache_view(&entry, Some("owner"), "owner", 1_001);
+        assert!(expired.snapshot.is_none());
+        assert_eq!(expired.freshness, None);
+    }
+
+    #[test]
+    fn observation_rejects_old_generation_and_credential_revision() {
+        let mut entry = cache_entry(7, 100, 4, 10);
+
+        apply_observation(&mut entry, Some(observation(8, 5, 200, 20)));
+        apply_observation(&mut entry, Some(observation(7, 4, 200, 30)));
+
+        assert_eq!(entry.last_observation_generation, 4);
+        assert_eq!(metric_used(&entry), Some(&QuotaAmount::Integer(10)));
+        assert_eq!(
+            entry
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.last_observed_at),
+            None
+        );
+    }
+
+    #[test]
+    fn full_fetch_merges_only_observations_newer_than_its_baseline() {
+        let mut fetched = snapshot(100, 10);
+        let generation =
+            merge_new_observation(&mut fetched, 7, 3, Some(observation(7, 4, 200, 20)));
+
+        assert_eq!(generation, 4);
+        assert_eq!(
+            fetched.groups[0].metrics[0].used,
+            Some(QuotaAmount::Integer(20))
+        );
+        assert_eq!(fetched.last_observed_at, Some(200));
+
+        let mut fetched = snapshot(100, 10);
+        let generation =
+            merge_new_observation(&mut fetched, 7, 4, Some(observation(7, 4, 200, 20)));
+        assert_eq!(generation, 4);
+        assert_eq!(
+            fetched.groups[0].metrics[0].used,
+            Some(QuotaAmount::Integer(10))
+        );
+        assert_eq!(fetched.last_observed_at, None);
+    }
+
+    fn cache_entry(
+        credential_revision: u64,
+        fetched_at: i64,
+        observation_generation: u64,
+        used: i64,
+    ) -> QuotaCacheEntry {
+        QuotaCacheEntry {
+            credential_revision,
+            snapshot: Some(snapshot(fetched_at, used)),
+            last_full_fetch_at: Some(fetched_at),
+            last_observation_generation: observation_generation,
+            last_error: None,
+            last_attempt_at: fetched_at,
+            attempt: 1,
+        }
+    }
+
+    fn snapshot(fetched_at: i64, used: i64) -> ProviderQuotaSnapshot {
+        ProviderQuotaSnapshot {
+            account_id: "account".to_owned(),
+            provider: ProviderKind::Codex,
+            fetched_at,
+            last_observed_at: None,
+            groups: vec![quota_group(used)],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn observation(
+        credential_revision: u64,
+        generation: u64,
+        observed_at: i64,
+        used: i64,
+    ) -> ProviderQuotaObservation {
+        ProviderQuotaObservation {
+            credential_revision,
+            generation,
+            observed_at,
+            groups: vec![quota_group(used)],
+        }
+    }
+
+    fn quota_group(used: i64) -> QuotaGroup {
+        QuotaGroup {
+            key: "codex".to_owned(),
+            scope: QuotaGroupScope::Aggregate,
+            audience: QuotaGroupAudience::Shared,
+            attributes: BTreeMap::new(),
+            metrics: vec![QuotaMetric {
+                key: "primary".to_owned(),
+                kind: QuotaMetricKind::Usage,
+                unit: QuotaUnit::Percent,
+                used: Some(QuotaAmount::Integer(used)),
+                remaining: None,
+                limit: None,
+                period: None,
+                breakdown: Vec::new(),
+            }],
+        }
+    }
+
+    fn metric_used(entry: &QuotaCacheEntry) -> Option<&QuotaAmount> {
+        entry
+            .snapshot
+            .as_ref()?
+            .groups
+            .first()?
+            .metrics
+            .first()?
+            .used
+            .as_ref()
+    }
 }

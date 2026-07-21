@@ -8,7 +8,8 @@ use axum::{
 };
 use provider_auth::{ApiKeyAuthenticator, AuthService, AuthenticatedApiKey};
 use provider_core::{
-    ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService, WireFormat,
+    ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService,
+    RequestMetadata, WireFormat,
 };
 use provider_management::ProviderManager;
 use serde_json::{Value, json};
@@ -68,6 +69,7 @@ async fn responses(
         &state.service,
         key.owner_user_id.as_str(),
         WireFormat::OpenAiResponses,
+        &headers,
         body,
     )
     .await
@@ -83,6 +85,7 @@ async fn messages(
         &state.service,
         key.owner_user_id.as_str(),
         WireFormat::ClaudeMessages,
+        &headers,
         body,
     )
     .await
@@ -94,7 +97,7 @@ async fn count_tokens(
     body: Bytes,
 ) -> Result<Json<Value>, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
-    let request = proxy_request(WireFormat::ClaudeMessages, body)?;
+    let request = proxy_request(WireFormat::ClaudeMessages, &headers, body)?;
     let count = state
         .service
         .count_tokens(key.owner_user_id.as_str(), request)
@@ -108,9 +111,10 @@ async fn proxy_stream(
     service: &ProxyService,
     user_id: &str,
     protocol: WireFormat,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
-    let request = proxy_request(protocol, body)?;
+    let request = proxy_request(protocol, headers, body)?;
     let stream = service
         .execute_stream(user_id, request)
         .await
@@ -124,7 +128,11 @@ async fn proxy_stream(
         .map_err(|_| HttpError::internal(protocol))
 }
 
-fn proxy_request(protocol: WireFormat, body: Bytes) -> Result<ProxyRequest, HttpError> {
+fn proxy_request(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<ProxyRequest, HttpError> {
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
     let model = payload
@@ -133,8 +141,48 @@ fn proxy_request(protocol: WireFormat, body: Bytes) -> Result<ProxyRequest, Http
         .and_then(Value::as_str)
         .ok_or_else(|| HttpError::invalid_request(protocol, "model must be a non-empty string"))?;
 
-    ProxyRequest::new(protocol, model, body)
-        .map_err(|error| HttpError::from_proxy_request(protocol, error))
+    let request = ProxyRequest::new(protocol, model, body)
+        .map_err(|error| HttpError::from_proxy_request(protocol, error))?;
+    Ok(request.with_metadata(request_metadata(headers, protocol)?))
+}
+
+fn request_metadata(
+    headers: &HeaderMap,
+    protocol: WireFormat,
+) -> Result<RequestMetadata, HttpError> {
+    let mut metadata = RequestMetadata::default();
+    metadata.session_id = metadata_header(headers, "session-id", protocol)?;
+    metadata.thread_id = metadata_header(headers, "thread-id", protocol)?;
+    metadata.client_request_id = metadata_header(headers, "x-client-request-id", protocol)?;
+    Ok(metadata)
+}
+
+fn metadata_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    protocol: WireFormat,
+) -> Result<Option<String>, HttpError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| HttpError::invalid_request(protocol, "request metadata header is invalid"))?
+        .trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+    {
+        return Err(HttpError::invalid_request(
+            protocol,
+            "request metadata header is invalid",
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn authenticate_api_key(
@@ -230,6 +278,7 @@ impl HttpError {
         let (status, error_type) = match error.kind() {
             ProviderErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             ProviderErrorKind::Authentication => (StatusCode::UNAUTHORIZED, "authentication_error"),
+            ProviderErrorKind::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             ProviderErrorKind::Upstream => (StatusCode::BAD_GATEWAY, "api_error"),
             ProviderErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         };
@@ -258,12 +307,14 @@ impl IntoResponse for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use futures_util::stream;
     use provider_auth::AuthService;
-    use provider_core::{Provider, ProviderModel, ProviderRequest, ProviderStream};
+    use provider_core::{
+        Provider, ProviderModel, ProviderRequest, ProviderStream, RequestMetadata,
+    };
     use provider_protocol::DefaultProtocolBridge;
     use provider_storage::SqliteAccountRepository;
     use secrecy::{ExposeSecret, SecretString};
@@ -278,6 +329,7 @@ mod tests {
 
     struct TestProvider {
         models: Vec<ProviderModel>,
+        metadata: Arc<Mutex<Vec<RequestMetadata>>>,
     }
 
     #[async_trait]
@@ -296,8 +348,12 @@ mod tests {
 
         async fn execute_stream(
             &self,
-            _request: ProviderRequest,
+            request: ProviderRequest,
         ) -> Result<ProviderStream, ProviderError> {
+            self.metadata
+                .lock()
+                .expect("metadata capture lock")
+                .push(request.metadata);
             let event = Bytes::from_static(
                 b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
             );
@@ -339,9 +395,11 @@ mod tests {
             .await
             .expect("create API key");
         let api_key = created_key.key.expose_secret().to_owned();
+        let captured_metadata = Arc::new(Mutex::new(Vec::new()));
         let service = ProxyService::new(
             Arc::new(TestProvider {
                 models: vec![ProviderModel::new("grok-4.5", "xai")],
+                metadata: captured_metadata.clone(),
             }),
             Arc::new(DefaultProtocolBridge),
             provider_core::ProviderAccountAccess {
@@ -391,7 +449,11 @@ mod tests {
             request = if path == "/v1/messages" {
                 request.header("x-api-key", &api_key)
             } else {
-                request.bearer_auth(&api_key)
+                request
+                    .bearer_auth(&api_key)
+                    .header("session-id", "session-1")
+                    .header("thread-id", "thread:1")
+                    .header("x-client-request-id", "request_1")
             };
             let response = request.send().await.expect("stream response");
             assert_eq!(response.status(), StatusCode::OK);
@@ -403,6 +465,35 @@ mod tests {
                 Some("text/event-stream")
             );
         }
+        let mut expected_metadata = RequestMetadata::default();
+        expected_metadata.session_id = Some("session-1".to_owned());
+        expected_metadata.thread_id = Some("thread:1".to_owned());
+        expected_metadata.client_request_id = Some("request_1".to_owned());
+        assert_eq!(
+            captured_metadata
+                .lock()
+                .expect("metadata capture lock")
+                .as_slice(),
+            [expected_metadata, RequestMetadata::default()]
+        );
+
+        let invalid_metadata = client
+            .post(format!("{base_url}/v1/responses"))
+            .bearer_auth(&api_key)
+            .header("session-id", "invalid value")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({ "model": "grok-4.5", "input": "hello" }).to_string())
+            .send()
+            .await
+            .expect("invalid metadata response");
+        assert_eq!(invalid_metadata.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            captured_metadata
+                .lock()
+                .expect("metadata capture lock")
+                .len(),
+            2
+        );
 
         let count = response_json(
             client
@@ -418,10 +509,11 @@ mod tests {
         assert_eq!(count["input_tokens"], 42);
 
         api_keys
-            .set_enabled(
+            .update(
                 &grant.user.id,
                 &created_key.summary.id,
-                false,
+                Some(false),
+                None,
                 unix_timestamp(),
             )
             .await

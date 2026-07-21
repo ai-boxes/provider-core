@@ -11,7 +11,7 @@ use provider_core::{
     CredentialKind, CredentialUpdate, CredentialWriteOutcome, ManagedProviderDriver, NewCredential,
     NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
     ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel,
-    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaSnapshot, ProviderQuotaSource,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaSource,
     ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
     RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
 };
@@ -265,13 +265,17 @@ impl ManagedProviderDriver for GrokDriver {
                 "Grok account label must not be empty",
             ));
         }
-        if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&update.config_json)
-            .is_err()
-        {
+        let config =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&update.config_json)
+                .map_err(|_| {
+                    ProviderConfigurationError::new("Grok configuration must be a JSON object")
+                })?;
+        if !config.is_empty() {
             return Err(ProviderConfigurationError::new(
-                "Grok configuration must be a JSON object",
+                "Grok upstream URL is managed by the driver",
             ));
         }
+        update.config_json = "{}".to_owned();
         Ok(update)
     }
 
@@ -395,10 +399,10 @@ impl GrokAccount {
 
     async fn credentials_with_upstream_user_id(
         &self,
-    ) -> Result<GrokCredentials, ProviderQuotaError> {
+    ) -> Result<(GrokCredentials, u64), ProviderQuotaError> {
         let current = self.state().clone();
         if current.credentials.upstream_user_id().is_some() {
-            return Ok(current.credentials);
+            return Ok((current.credentials, current.revision));
         }
         let user_id = self
             .driver
@@ -428,12 +432,12 @@ impl GrokAccount {
                 if let Some(pending) = state.pending_update.as_mut() {
                     pending.credential_json = credential_json;
                 }
-                return Ok(credentials);
+                return Ok((credentials, state.revision));
             }
         }
 
         let Some(repository) = self.repository.as_ref() else {
-            return Ok(credentials);
+            return Ok((credentials, current.revision));
         };
         let last_refreshed_at = current.credentials.last_refreshed_at().map_err(|_| {
             ProviderQuotaError::new(
@@ -450,7 +454,7 @@ impl GrokAccount {
             last_refreshed_at,
             updated_at: unix_timestamp(),
         };
-        match repository
+        let credential_revision = match repository
             .compare_and_swap_credential(&self.account_id, update)
             .await
         {
@@ -460,16 +464,18 @@ impl GrokAccount {
                     state.credentials = credentials.clone();
                     state.revision = revision;
                 }
+                revision
             }
-            Ok(CredentialWriteOutcome::Conflict) => {}
+            Ok(CredentialWriteOutcome::Conflict) => current.revision,
             Err(_) => {
                 eprintln!(
                     "failed to persist Grok upstream user ID for account {}",
                     self.account_id
                 );
+                current.revision
             }
-        }
-        Ok(credentials)
+        };
+        Ok((credentials, credential_revision))
     }
 
     async fn mark_reauth_required(&self, repository: &Arc<dyn AccountRepository>) {
@@ -510,7 +516,7 @@ impl ProviderAccount for GrokAccount {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        let credentials = self
+        let (credentials, _) = self
             .credentials_with_upstream_user_id()
             .await
             .map_err(quota_provider_error)?;
@@ -640,26 +646,31 @@ impl ProviderAccount for GrokAccount {
 
 #[async_trait]
 impl ProviderQuotaSource for GrokAccount {
-    async fn fetch_quota(&self) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
-        let credentials = self.credentials_with_upstream_user_id().await?;
+    async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+        let (credentials, revision) = self.credentials_with_upstream_user_id().await?;
         let user_id = credentials.upstream_user_id().ok_or_else(|| {
             ProviderQuotaError::new(
                 ProviderQuotaErrorKind::Internal,
                 "Grok credential is missing upstream user ID",
             )
         })?;
-        self.driver
+        let snapshot = self
+            .driver
             .quota_client
             .fetch_quota(self.account_id.as_str(), &credentials, user_id)
-            .await
+            .await?;
+        Ok(ProviderQuotaFetch {
+            snapshot,
+            credential_revision: revision,
+        })
     }
 }
 
 fn quota_provider_error(error: ProviderQuotaError) -> ProviderError {
     let kind = match error.kind() {
         ProviderQuotaErrorKind::Authentication => ProviderErrorKind::Authentication,
+        ProviderQuotaErrorKind::RateLimited => ProviderErrorKind::RateLimited,
         ProviderQuotaErrorKind::Unsupported
-        | ProviderQuotaErrorKind::RateLimited
         | ProviderQuotaErrorKind::Upstream
         | ProviderQuotaErrorKind::InvalidResponse => ProviderErrorKind::Upstream,
         ProviderQuotaErrorKind::Internal => ProviderErrorKind::Internal,

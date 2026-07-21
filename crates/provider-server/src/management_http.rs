@@ -68,19 +68,15 @@ async fn list_accounts(
         .list_accounts(session.user.id.as_str())
         .await?;
     let now = unix_timestamp();
-    Ok(data(Value::Array(
-        accounts
-            .iter()
-            .map(|account| {
-                account_with_quota_json(
-                    account,
-                    state
-                        .manager
-                        .cached_quota(session.user.id.as_str(), account, now),
-                )
-            })
-            .collect(),
-    )))
+    let mut values = Vec::with_capacity(accounts.len());
+    for account in &accounts {
+        let quota = state
+            .manager
+            .cached_quota(session.user.id.as_str(), account, now)
+            .await;
+        values.push(account_with_quota_json(account, quota));
+    }
+    Ok(data(Value::Array(values)))
 }
 
 async fn get_account(
@@ -107,15 +103,11 @@ async fn create_account(
             credential_json,
             visibility,
         } => {
-            if provider != ProviderKind::Grok {
-                return Err(ApiError::invalid_request(
-                    "credential_json onboarding is only supported for Grok",
-                ));
-            }
             state
                 .manager
-                .import_grok_account(
+                .create_credential_account(
                     session.user.id.as_str(),
+                    provider,
                     label,
                     SecretString::from(json_document(credential_json)),
                     visibility.unwrap_or_default(),
@@ -130,11 +122,6 @@ async fn create_account(
             api_key,
             visibility,
         } => {
-            if provider == ProviderKind::Grok {
-                return Err(ApiError::invalid_request(
-                    "Grok requires credential_json or OAuth onboarding",
-                ));
-            }
             state
                 .manager
                 .create_direct_account(
@@ -171,21 +158,14 @@ async fn update_account(
         .get_account(session.user.id.as_str(), &account_id)
         .await?;
     let label = request.label.unwrap_or_else(|| current.label.clone());
-    let config_json = match (current.provider, request.base_url) {
-        (ProviderKind::Grok, Some(_)) => {
-            return Err(ApiError::invalid_request(
-                "Grok account base_url is managed by its credential",
-            ));
-        }
-        (ProviderKind::Grok, None) => current.config_json,
-        (_, base_url) => {
-            let mut config: Value =
-                serde_json::from_str(&current.config_json).map_err(|_| ApiError::internal())?;
-            if let Some(base_url) = base_url {
-                config["base_url"] = Value::String(base_url);
-            }
-            config.to_string()
-        }
+    let config_json = if let Some(base_url) = request.base_url {
+        let mut config: Value =
+            serde_json::from_str(&current.config_json).map_err(|_| ApiError::internal())?;
+        let config = config.as_object_mut().ok_or_else(ApiError::internal)?;
+        config.insert("base_url".to_owned(), Value::String(base_url));
+        Value::Object(config.clone()).to_string()
+    } else {
+        current.config_json
     };
     let account = state
         .manager
@@ -617,10 +597,12 @@ mod tests {
     };
     use provider_auth::{ApiKeyAuthenticator, AuthService, UserSummary};
     use provider_core::{
-        AccountId, CredentialKind, ProviderManagementRepository, ProviderQuotaErrorKind,
-        ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
+        AccountId, CredentialKind, ProviderKind, ProviderManagementRepository,
+        ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
     };
-    use provider_drivers::{grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver};
+    use provider_drivers::{
+        codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
+    };
     use provider_management::{ProviderCredentialReplacement, ProviderManager};
     use provider_protocol::DefaultProtocolBridge;
     use provider_runtime::ProviderRuntimeCatalog;
@@ -632,6 +614,20 @@ mod tests {
     use crate::router_with_management;
 
     use super::unix_timestamp;
+
+    async fn captured_models(
+        State(authorization): State<Arc<Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+    ) -> &'static str {
+        authorization.lock().expect("authorization lock").push(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        r#"{"data":[{"id":"model-a","owned_by":"test"}]}"#
+    }
 
     #[derive(Clone, Default)]
     struct QuotaUpstreamState {
@@ -738,8 +734,9 @@ mod tests {
             .to_string(),
         );
         let created = manager
-            .import_grok_account(
+            .create_credential_account(
                 owner_grant.user.id.as_str(),
+                ProviderKind::Grok,
                 "shared Grok".to_owned(),
                 credential_json,
                 provider_core::ProviderVisibility::Shared,
@@ -767,25 +764,10 @@ mod tests {
     #[tokio::test]
     async fn enforces_provider_ownership_without_returning_credentials() {
         let authorization = Arc::new(Mutex::new(Vec::<String>::new()));
-        let upstream =
-            Router::new()
-                .route(
-                    "/models",
-                    get(
-                        |State(authorization): State<Arc<Mutex<Vec<String>>>>,
-                         headers: HeaderMap| async move {
-                            authorization.lock().expect("authorization lock").push(
-                                headers
-                                    .get(reqwest::header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                            );
-                            r#"{"data":[{"id":"model-a","owned_by":"test"}]}"#
-                        },
-                    ),
-                )
-                .with_state(authorization.clone());
+        let upstream = Router::new()
+            .route("/models", get(captured_models))
+            .route("/codex/models", get(captured_models))
+            .with_state(authorization.clone());
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
@@ -837,6 +819,12 @@ mod tests {
                 format!("{oauth_base_url}/discovery"),
             ))
             .expect("register Grok driver");
+        runtime
+            .register_driver(CodexDriver::for_test(
+                &format!("http://{upstream_address}"),
+                &oauth_base_url,
+            ))
+            .expect("register Codex driver");
         let auth = AuthService::new(repository.clone());
         let grant = auth
             .setup(
@@ -883,6 +871,90 @@ mod tests {
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/api/v1/providers");
         let base_url = format!("http://{upstream_address}");
+
+        let codex_direct = client
+            .post(&endpoint)
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "method": "direct",
+                    "provider": "codex",
+                    "label": "unsupported direct Codex",
+                    "base_url": base_url,
+                    "api_key": "not-an-oauth-credential"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("reject direct Codex account");
+        assert_eq!(codex_direct.status(), StatusCode::BAD_REQUEST);
+
+        let compatible_credential = client
+            .post(&endpoint)
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "method": "credential_json",
+                    "provider": "openai_compatible",
+                    "label": "unsupported compatible credential",
+                    "credential_json": {"type": "codex"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("reject compatible credential document");
+        assert_eq!(compatible_credential.status(), StatusCode::BAD_REQUEST);
+
+        let codex = client
+            .post(&endpoint)
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "method": "credential_json",
+                    "provider": "codex",
+                    "label": "Codex OAuth",
+                    "credential_json": {
+                        "type": "codex",
+                        "auth_kind": "oauth",
+                        "access_token": "codex-access",
+                        "refresh_token": "codex-refresh",
+                        "id_token": "e30.e30.sig",
+                        "last_refreshed_at": 1
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("create Codex credential account");
+        assert_eq!(codex.status(), StatusCode::CREATED);
+        let codex_body = codex.text().await.expect("Codex account response");
+        assert!(!codex_body.contains("codex-access"));
+        assert!(!codex_body.contains("codex-refresh"));
+        let codex_body: Value = serde_json::from_str(&codex_body).expect("Codex account JSON");
+        let codex_account_id = codex_body["data"]["account"]["id"]
+            .as_str()
+            .expect("Codex account ID");
+        assert_eq!(codex_body["data"]["account"]["provider"], "codex");
+        assert_eq!(
+            codex_body["data"]["account"]["config"],
+            serde_json::json!({})
+        );
+
+        let codex_base_url_update = client
+            .patch(format!("{endpoint}/{codex_account_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"base_url":"https://example.invalid"}"#)
+            .send()
+            .await
+            .expect("reject Codex base URL update");
+        assert_eq!(codex_base_url_update.status(), StatusCode::BAD_REQUEST);
 
         let with_key = client
             .post(&endpoint)
@@ -1104,7 +1176,7 @@ mod tests {
         runtime.shutdown();
         assert_eq!(
             authorization.lock().expect("authorization lock").as_slice(),
-            ["Bearer do-not-return", "", ""]
+            ["Bearer codex-access", "Bearer do-not-return", "", ""]
         );
     }
 
@@ -1147,7 +1219,9 @@ mod tests {
             .get_account(owner.id.as_str(), &account_id)
             .await
             .expect("owner account");
-        let owner_quota = manager.cached_quota(owner.id.as_str(), &owner_summary, now);
+        let owner_quota = manager
+            .cached_quota(owner.id.as_str(), &owner_summary, now)
+            .await;
         assert_eq!(
             owner_quota
                 .snapshot
@@ -1333,7 +1407,9 @@ mod tests {
             .iter()
             .find(|account| account.id == account_id)
             .expect("shared account summary");
-        let cached = manager.cached_quota(member.id.as_str(), summary, now + 94);
+        let cached = manager
+            .cached_quota(member.id.as_str(), summary, now + 94)
+            .await;
         assert_eq!(cached.support, ProviderQuotaSupport::Supported);
         assert!(cached.snapshot.is_none());
         context.upstream_server.abort();

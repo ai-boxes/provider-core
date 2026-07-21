@@ -100,10 +100,10 @@ impl GrokModelClient {
             })?;
         let status = response.status();
         if !status.is_success() {
-            let kind = if matches!(status.as_u16(), 401 | 403) {
-                ProviderErrorKind::Authentication
-            } else {
-                ProviderErrorKind::Upstream
+            let kind = match status.as_u16() {
+                401 | 403 => ProviderErrorKind::Authentication,
+                429 => ProviderErrorKind::RateLimited,
+                _ => ProviderErrorKind::Upstream,
             };
             return Err(ProviderError::new(
                 kind,
@@ -219,11 +219,42 @@ struct ModelResponse {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::{Router, extract::State, http::HeaderMap, routing::get};
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::get,
+    };
     use secrecy::SecretString;
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn maps_rate_limited_model_discovery() {
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind model endpoint");
+        let address = listener.local_addr().expect("model endpoint address");
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let credentials = GrokCredentials::from_json(&SecretString::from(format!(
+            r#"{{"type":"xai","auth_kind":"oauth","access_token":"model-token","base_url":"http://{address}/v1"}}"#
+        )))
+        .expect("credentials");
+
+        let error = match GrokModelClient::for_test().discover(&credentials).await {
+            Ok(_) => panic!("429 model discovery must fail"),
+            Err(error) => error,
+        };
+        server.abort();
+
+        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(error.upstream_status(), Some(429));
+    }
 
     #[tokio::test]
     async fn discovers_and_normalizes_remote_models() {

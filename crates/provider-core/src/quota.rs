@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{ProviderKind, StoredProviderAccount};
+use crate::{AccountId, ProviderKind, StoredProviderAccount};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +46,8 @@ pub enum QuotaMetricKind {
 pub enum QuotaUnit {
     Percent,
     UsdCents,
+    Count,
+    Credits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -51,14 +55,25 @@ pub enum QuotaUnit {
 pub enum QuotaPeriodKind {
     Weekly,
     Monthly,
+    Rolling,
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum QuotaAmount {
     Integer(i64),
     Decimal(f64),
+    DecimalString(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum QuotaScalar {
+    Bool(bool),
+    Integer(i64),
+    DecimalString(String),
+    Text(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -68,6 +83,8 @@ pub struct QuotaPeriod {
     pub starts_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ends_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -100,6 +117,8 @@ pub struct QuotaGroup {
     pub scope: QuotaGroupScope,
     #[serde(skip)]
     pub audience: QuotaGroupAudience,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, QuotaScalar>,
     pub metrics: Vec<QuotaMetric>,
 }
 
@@ -108,9 +127,19 @@ pub struct ProviderQuotaSnapshot {
     pub account_id: String,
     pub provider: ProviderKind,
     pub fetched_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<i64>,
     pub groups: Vec<QuotaGroup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderQuotaObservation {
+    pub credential_revision: u64,
+    pub generation: u64,
+    pub observed_at: i64,
+    pub groups: Vec<QuotaGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -215,7 +244,7 @@ impl ProviderQuotaError {
 
 #[async_trait]
 pub trait ProviderQuotaSource: Send + Sync {
-    async fn fetch_quota(&self) -> Result<ProviderQuotaSnapshot, ProviderQuotaError>;
+    async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError>;
 }
 
 #[async_trait]
@@ -226,4 +255,32 @@ pub trait ProviderQuotaControl: Send + Sync {
         &self,
         account: StoredProviderAccount,
     ) -> Result<ProviderQuotaFetch, ProviderQuotaError>;
+
+    async fn quota_observation(&self, _account_id: &AccountId) -> Option<ProviderQuotaObservation> {
+        None
+    }
+}
+
+pub fn merge_quota_groups(groups: &mut Vec<QuotaGroup>, updates: Vec<QuotaGroup>) {
+    for update in updates {
+        let Some(group) = groups.iter_mut().find(|group| group.key == update.key) else {
+            groups.push(update);
+            continue;
+        };
+
+        group.scope = update.scope;
+        group.audience = update.audience;
+        group.attributes.extend(update.attributes);
+        for metric in update.metrics {
+            if let Some(existing) = group
+                .metrics
+                .iter_mut()
+                .find(|existing| existing.key == metric.key)
+            {
+                *existing = metric;
+            } else {
+                group.metrics.push(metric);
+            }
+        }
+    }
 }

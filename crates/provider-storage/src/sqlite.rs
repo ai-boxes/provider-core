@@ -2,9 +2,9 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use provider_auth::{
-    ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome,
-    NewApiKey, NewSession, NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession,
-    StoredUser, UserId, UserRole, UserSummary,
+    ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey, NewSession,
+    NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession, StoredUser, UserId,
+    UserRole, UserSummary,
 };
 use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
@@ -854,7 +854,7 @@ impl AuthRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO api_keys
-                (id, owner_user_id, label, key_hash, enabled, expires_at, created_at, updated_at)
+                (id, owner_user_id, label, key, enabled, expires_at, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             "#,
@@ -862,7 +862,7 @@ impl AuthRepository for SqliteAccountRepository {
         .bind(key.id.as_str())
         .bind(key.owner_user_id.as_str())
         .bind(key.label)
-        .bind(key.key_hash.as_slice())
+        .bind(key.key.expose_secret())
         .bind(database_bool(key.enabled))
         .bind(key.expires_at)
         .bind(key.created_at)
@@ -876,10 +876,10 @@ impl AuthRepository for SqliteAccountRepository {
     async fn list_api_keys(
         &self,
         owner_user_id: &UserId,
-    ) -> Result<Vec<ApiKeySummary>, AuthRepositoryError> {
+    ) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, owner_user_id, label, enabled, expires_at, last_used_at,
+            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
                    created_at, updated_at
             FROM api_keys
             WHERE owner_user_id = ?
@@ -890,32 +890,55 @@ impl AuthRepository for SqliteAccountRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(|error| auth_repository_error("failed to list API keys", error))?;
-        rows.into_iter().map(api_key_summary).collect()
+        rows.into_iter().map(stored_api_key).collect()
     }
 
-    async fn set_api_key_enabled(
+    async fn load_api_key(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+    ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
+                   created_at, updated_at
+            FROM api_keys
+            WHERE id = ? AND owner_user_id = ?
+            "#,
+        )
+        .bind(key_id.as_str())
+        .bind(owner_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load API key", error))?;
+        row.map(stored_api_key).transpose()
+    }
+
+    async fn update_api_key(
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
         enabled: bool,
+        expires_at: Option<i64>,
         updated_at: i64,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
             UPDATE api_keys
-            SET enabled = ?, updated_at = ?
+            SET enabled = ?, expires_at = ?, updated_at = ?
             WHERE id = ? AND owner_user_id = ?
-            RETURNING id, owner_user_id, label, key_hash, enabled, expires_at,
+            RETURNING id, owner_user_id, label, key, enabled, expires_at,
                       last_used_at, created_at, updated_at
             "#,
         )
         .bind(database_bool(enabled))
+        .bind(expires_at)
         .bind(updated_at)
         .bind(key_id.as_str())
         .bind(owner_user_id.as_str())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|error| auth_repository_error("failed to update API key status", error))?;
+        .map_err(|error| auth_repository_error("failed to update API key", error))?;
         row.map(stored_api_key).transpose()
     }
 
@@ -936,7 +959,7 @@ impl AuthRepository for SqliteAccountRepository {
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT k.id, k.owner_user_id, k.label, k.key_hash, k.enabled, k.expires_at,
+            SELECT k.id, k.owner_user_id, k.label, k.key, k.enabled, k.expires_at,
                    k.last_used_at, k.created_at, k.updated_at
             FROM api_keys AS k
             INNER JOIN users AS u ON u.id = k.owner_user_id
@@ -1166,20 +1189,7 @@ fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
         id: auth_api_key_id(&row, "id")?,
         owner_user_id: auth_user_id(&row, "owner_user_id")?,
         label: auth_row_value(&row, "label")?,
-        key_hash: auth_hash(&row, "key_hash")?,
-        enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
-        expires_at: auth_row_value(&row, "expires_at")?,
-        last_used_at: auth_row_value(&row, "last_used_at")?,
-        created_at: auth_row_value(&row, "created_at")?,
-        updated_at: auth_row_value(&row, "updated_at")?,
-    })
-}
-
-fn api_key_summary(row: SqliteRow) -> Result<ApiKeySummary, AuthRepositoryError> {
-    Ok(ApiKeySummary {
-        id: auth_api_key_id(&row, "id")?,
-        owner_user_id: auth_user_id(&row, "owner_user_id")?,
-        label: auth_row_value(&row, "label")?,
+        key: SecretString::from(auth_row_value::<String>(&row, "key")?),
         enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
         expires_at: auth_row_value(&row, "expires_at")?,
         last_used_at: auth_row_value(&row, "last_used_at")?,
@@ -1400,6 +1410,67 @@ mod tests {
         assert_eq!(
             reloaded[0].credential.credential_json.expose_secret(),
             r#"{"access_token":"new"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn round_trips_codex_provider_accounts() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let owner = NewUser {
+            id: UserId::new("codex-owner").expect("user ID"),
+            username: "codex-owner".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 1,
+        };
+        repository
+            .create_initial_user(owner.clone(), test_session("codex-session", owner.id, 7, 8))
+            .await
+            .expect("create Codex owner");
+        let account_id = AccountId::new("codex-main").expect("account ID");
+        let credential_json = SecretString::from(
+            r#"{"type":"codex","auth_kind":"oauth","access_token":"secret","refresh_token":"refresh","id_token":"header.payload.signature","last_refreshed_at":10}"#
+                .to_owned(),
+        );
+        let account = NewProviderAccount {
+            id: account_id.clone(),
+            provider: ProviderKind::Codex,
+            label: "Codex Main".to_owned(),
+            config_json: "{}".to_owned(),
+            enabled: true,
+            credential: provider_core::NewCredential {
+                kind: CredentialKind::Oauth,
+                format_version: 1,
+                credential_json: credential_json.clone(),
+                expires_at: Some(100),
+                last_refreshed_at: Some(10),
+            },
+        };
+
+        assert_eq!(
+            repository
+                .create_provider_account(account, "codex-owner", ProviderVisibility::Shared)
+                .await
+                .expect("create Codex account"),
+            ProviderAccountCreateOutcome::Created
+        );
+        let stored = repository
+            .load_provider_account(&account_id)
+            .await
+            .expect("load Codex account")
+            .expect("stored Codex account");
+
+        assert_eq!(stored.provider, ProviderKind::Codex);
+        assert_eq!(stored.visibility, ProviderVisibility::Shared);
+        assert_eq!(stored.credential.kind, CredentialKind::Oauth);
+        assert_eq!(stored.credential.expires_at, Some(100));
+        assert_eq!(stored.credential.last_refreshed_at, Some(10));
+        assert_eq!(
+            stored.credential.credential_json.expose_secret(),
+            credential_json.expose_secret()
         );
     }
 

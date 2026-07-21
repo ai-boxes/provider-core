@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use provider_core::{
     AccountId, Provider, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
-    ProviderModel, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderRequest,
-    ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger, WireFormat,
+    ProviderModel, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
+    ProviderQuotaObservation, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind,
+    RefreshOutcome, RefreshTrigger, WireFormat,
 };
 use thiserror::Error;
 use tokio::{
@@ -178,6 +179,15 @@ impl ProviderRuntime {
         self.fetch_quota_entry(entry).await
     }
 
+    pub async fn quota_observation_for(
+        &self,
+        account_id: &AccountId,
+    ) -> Option<ProviderQuotaObservation> {
+        self.account_entry(account_id)
+            .await
+            .and_then(|entry| entry.account.quota_observation())
+    }
+
     async fn selected_account(&self) -> Result<Arc<AccountEntry>, ProviderError> {
         let accounts = self.inner.accounts.read().await;
         let available: Vec<_> = accounts
@@ -265,8 +275,7 @@ impl ProviderRuntime {
         entry: Arc<AccountEntry>,
     ) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
         let generation = entry.account.runtime_state().generation;
-        let first = fetch_account_quota(entry.account.as_ref()).await;
-        let snapshot = match first {
+        match fetch_account_quota(entry.account.as_ref()).await {
             Err(error) if error.upstream_status() == Some(401) => {
                 let account_id = entry.account.account_id().clone();
                 let refresh = self
@@ -274,14 +283,10 @@ impl ProviderRuntime {
                     .await;
                 self.report_refresh_result(account_id, &refresh);
                 refresh.map_err(refresh_quota_error)?;
-                fetch_account_quota(entry.account.as_ref()).await?
+                fetch_account_quota(entry.account.as_ref()).await
             }
-            result => result?,
-        };
-        Ok(ProviderQuotaFetch {
-            snapshot,
-            credential_revision: entry.account.credential_revision(),
-        })
+            result => result,
+        }
     }
 
     async fn refresh_entry(
@@ -384,7 +389,7 @@ fn refresh_quota_error(error: RefreshError) -> ProviderQuotaError {
 
 async fn fetch_account_quota(
     account: &dyn ProviderAccount,
-) -> Result<provider_core::ProviderQuotaSnapshot, ProviderQuotaError> {
+) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
     let source = account.quota_source().ok_or_else(|| {
         ProviderQuotaError::new(
             ProviderQuotaErrorKind::Unsupported,
@@ -568,6 +573,13 @@ mod tests {
         release_refresh: Notify,
     }
 
+    struct BlockingQuotaAccount {
+        id: AccountId,
+        revision: AtomicU64,
+        quota_started: Notify,
+        release_quota: Notify,
+    }
+
     struct TestDriver;
 
     impl ProviderDriver for TestDriver {
@@ -650,21 +662,94 @@ mod tests {
 
     #[async_trait]
     impl ProviderQuotaSource for UnauthorizedAccount {
-        async fn fetch_quota(&self) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
+        async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
             self.quota_calls.fetch_add(1, Ordering::SeqCst);
-            if self.generation.load(Ordering::SeqCst) == 0 {
+            let credential_revision = self.generation.load(Ordering::SeqCst);
+            if credential_revision == 0 {
                 return Err(ProviderQuotaError::new(
                     ProviderQuotaErrorKind::Authentication,
                     "quota returned unauthorized",
                 )
                 .with_upstream_status(401));
             }
-            Ok(ProviderQuotaSnapshot {
-                account_id: self.id.to_string(),
-                provider: provider_core::ProviderKind::Grok,
-                fetched_at: 1,
-                groups: Vec::new(),
-                warnings: Vec::new(),
+            Ok(ProviderQuotaFetch {
+                snapshot: ProviderQuotaSnapshot {
+                    account_id: self.id.to_string(),
+                    provider: provider_core::ProviderKind::Grok,
+                    fetched_at: 1,
+                    last_observed_at: None,
+                    groups: Vec::new(),
+                    warnings: Vec::new(),
+                },
+                credential_revision,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAccount for BlockingQuotaAccount {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn account_id(&self) -> &AccountId {
+            &self.id
+        }
+
+        fn runtime_state(&self) -> AccountRuntimeState {
+            AccountRuntimeState {
+                generation: self.revision.load(Ordering::SeqCst),
+                next_refresh_at: None,
+                auth_state: AccountAuthState::Active,
+                persistence_pending: false,
+            }
+        }
+
+        fn credential_revision(&self) -> u64 {
+            self.revision.load(Ordering::SeqCst)
+        }
+
+        fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+            Some(self)
+        }
+
+        async fn execute_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ProviderStream, ProviderError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
+            Ok(0)
+        }
+
+        async fn refresh_credentials(
+            &self,
+            _trigger: RefreshTrigger,
+        ) -> Result<RefreshOutcome, RefreshError> {
+            Ok(RefreshOutcome {
+                state: self.runtime_state(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProviderQuotaSource for BlockingQuotaAccount {
+        async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+            let credential_revision = self.revision.load(Ordering::SeqCst);
+            self.quota_started.notify_one();
+            self.release_quota.notified().await;
+            Ok(ProviderQuotaFetch {
+                snapshot: ProviderQuotaSnapshot {
+                    account_id: self.id.to_string(),
+                    provider: provider_core::ProviderKind::Grok,
+                    fetched_at: 1,
+                    last_observed_at: None,
+                    groups: Vec::new(),
+                    warnings: Vec::new(),
+                },
+                credential_revision,
             })
         }
     }
@@ -713,6 +798,32 @@ mod tests {
         assert_eq!(account.refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(account.generation.load(Ordering::SeqCst), 1);
         assert_eq!(account.execute_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn quota_fetch_reports_the_revision_used_to_start_the_request() {
+        let account = Arc::new(BlockingQuotaAccount {
+            id: AccountId::new("blocking-quota-account").expect("valid account ID"),
+            revision: AtomicU64::new(7),
+            quota_started: Notify::new(),
+            release_quota: Notify::new(),
+        });
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        runtime
+            .register(account.clone())
+            .await
+            .expect("register account");
+        let request_runtime = runtime.clone();
+        let account_id = account.id.clone();
+        let quota = tokio::spawn(async move { request_runtime.fetch_quota_for(&account_id).await });
+        account.quota_started.notified().await;
+        account.revision.store(8, Ordering::SeqCst);
+        account.release_quota.notify_one();
+        let fetched = quota.await.expect("quota task").expect("quota result");
+        runtime.shutdown();
+
+        assert_eq!(fetched.credential_revision, 7);
+        assert_eq!(account.credential_revision(), 8);
     }
 
     #[tokio::test]

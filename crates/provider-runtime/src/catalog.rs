@@ -8,9 +8,9 @@ use provider_core::{
     AccountId, AccountProvisioningInput, AccountRepository, ManagedProviderDriver,
     NewProviderAccount, ProviderAccount, ProviderAccountAccess, ProviderAccountUpdate,
     ProviderControl, ProviderControlError, ProviderKind, ProviderModel, ProviderQuotaControl,
-    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderRouteCandidate,
-    ProviderRouter, RefreshError, RefreshErrorKind, RefreshTrigger, StartedProviderOAuth,
-    StoredProviderAccount, StoredProviderModel,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaObservation,
+    ProviderRouteCandidate, ProviderRouter, RefreshError, RefreshErrorKind, RefreshTrigger,
+    StartedProviderOAuth, StoredProviderAccount, StoredProviderModel,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -144,6 +144,23 @@ impl ProviderQuotaControl for ProviderRuntimeCatalog {
             ));
         }
         fetch_detached_quota(detached, &self.inner.detached_refresh_limit).await
+    }
+
+    async fn quota_observation(&self, account_id: &AccountId) -> Option<ProviderQuotaObservation> {
+        let runtimes: Vec<_> = self
+            .inner
+            .runtimes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for runtime in runtimes {
+            if let Some(observation) = runtime.quota_observation_for(account_id).await {
+                return Some(observation);
+            }
+        }
+        None
     }
 }
 
@@ -296,8 +313,7 @@ async fn fetch_detached_quota(
     refresh_limit: &Arc<Semaphore>,
 ) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
     let generation = account.runtime_state().generation;
-    let first = fetch_quota_source(account.as_ref()).await;
-    let snapshot = match first {
+    match fetch_quota_source(account.as_ref()).await {
         Err(error) if error.upstream_status() == Some(401) => {
             let _permit = refresh_limit.acquire().await.map_err(|_| {
                 ProviderQuotaError::new(
@@ -311,19 +327,15 @@ async fn fetch_detached_quota(
                     .await
                     .map_err(refresh_quota_error)?;
             }
-            fetch_quota_source(account.as_ref()).await?
+            fetch_quota_source(account.as_ref()).await
         }
-        result => result?,
-    };
-    Ok(ProviderQuotaFetch {
-        snapshot,
-        credential_revision: account.credential_revision(),
-    })
+        result => result,
+    }
 }
 
 async fn fetch_quota_source(
     account: &dyn ProviderAccount,
-) -> Result<provider_core::ProviderQuotaSnapshot, ProviderQuotaError> {
+) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
     let source = account.quota_source().ok_or_else(|| {
         ProviderQuotaError::new(
             ProviderQuotaErrorKind::Unsupported,

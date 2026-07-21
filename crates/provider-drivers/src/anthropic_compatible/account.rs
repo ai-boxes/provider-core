@@ -280,6 +280,7 @@ fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {
     let kind = match status.as_u16() {
         400 | 422 => ProviderErrorKind::InvalidRequest,
         401 | 403 => ProviderErrorKind::Authentication,
+        429 => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
     ProviderError::new(kind, format!("{operation} returned HTTP {status}"))

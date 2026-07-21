@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    ApiKeyId, ApiKeySummary, NewApiKey, NewSession, NewUser, SessionId, StoredApiKey,
-    StoredSession, StoredUser, UserId, UserSummary,
+    ApiKeyId, NewApiKey, NewSession, NewUser, SessionId, StoredApiKey, StoredSession, StoredUser,
+    UserId, UserSummary,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,13 +86,20 @@ pub trait AuthRepository: Send + Sync {
     async fn list_api_keys(
         &self,
         owner_user_id: &UserId,
-    ) -> Result<Vec<ApiKeySummary>, AuthRepositoryError>;
+    ) -> Result<Vec<StoredApiKey>, AuthRepositoryError>;
 
-    async fn set_api_key_enabled(
+    async fn load_api_key(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+    ) -> Result<Option<StoredApiKey>, AuthRepositoryError>;
+
+    async fn update_api_key(
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
         enabled: bool,
+        expires_at: Option<i64>,
         updated_at: i64,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError>;
 

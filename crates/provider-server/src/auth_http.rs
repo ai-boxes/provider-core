@@ -7,15 +7,15 @@ use axum::{
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post},
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
-    CreatedApiKey, CredentialError, SessionGrant, UserSummary,
+    CreatedApiKey, CredentialError, SessionGrant, StoredApiKey, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -51,8 +51,11 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/keys", get(list_keys).post(create_key))
-        .route("/api/v1/keys/{key_id}/enabled", put(set_key_enabled))
-        .route("/api/v1/keys/{key_id}", delete(delete_key))
+        .route("/api/v1/keys/generate", post(generate_key))
+        .route(
+            "/api/v1/keys/{key_id}",
+            get(get_key).put(update_key).delete(delete_key),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.auth_service(),
             require_access,
@@ -172,6 +175,15 @@ async fn list_keys(
     Ok(data(Value::Array(keys.iter().map(api_key_json).collect())))
 }
 
+async fn generate_key(
+    Extension(_session): Extension<AuthenticatedSession>,
+) -> Result<Json<Value>, AuthApiError> {
+    let key = provider_auth::issue_api_key(None).map_err(|_| AuthApiError::internal())?;
+    Ok(data(json!({
+        "key": key.secret.expose_secret()
+    })))
+}
+
 async fn create_key(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -191,23 +203,41 @@ async fn create_key(
     Ok((StatusCode::CREATED, data(created_api_key_json(&key))))
 }
 
-async fn set_key_enabled(
+async fn get_key(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
     Path(key_id): Path<String>,
-    request: Result<Json<SetEnabledRequest>, JsonRejection>,
-) -> Result<StatusCode, AuthApiError> {
-    let request = json_request(request)?;
-    state
+) -> Result<Json<Value>, AuthApiError> {
+    let key = state
         .api_keys
-        .set_enabled(
+        .get(&session.user.id, &parse_api_key_id(&key_id)?)
+        .await?;
+    Ok(data(stored_api_key_json(&key)))
+}
+
+async fn update_key(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(key_id): Path<String>,
+    request: Result<Json<UpdateApiKeyRequest>, JsonRejection>,
+) -> Result<Json<Value>, AuthApiError> {
+    let request = json_request(request)?;
+    if request.enabled.is_none() && request.expires_at.is_none() {
+        return Err(AuthApiError::invalid_request(
+            "at least one API key field must be provided",
+        ));
+    }
+    let key = state
+        .api_keys
+        .update(
             &session.user.id,
             &parse_api_key_id(&key_id)?,
             request.enabled,
+            request.expires_at.map(|value| value.0),
             unix_timestamp(),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(data(api_key_json(&key)))
 }
 
 async fn delete_key(
@@ -253,8 +283,19 @@ struct CreateApiKeyRequest {
 }
 
 #[derive(Deserialize)]
-struct SetEnabledRequest {
-    enabled: bool,
+struct UpdateApiKeyRequest {
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_expiry")]
+    expires_at: Option<NullableExpiry>,
+}
+
+struct NullableExpiry(Option<i64>);
+
+fn deserialize_optional_expiry<'de, D>(deserializer: D) -> Result<Option<NullableExpiry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(|value| Some(NullableExpiry(value)))
 }
 
 fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, AuthApiError> {
@@ -313,6 +354,21 @@ fn api_key_json(key: &ApiKeySummary) -> Value {
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
         "label": key.label,
+        "key": key.key,
+        "enabled": key.enabled,
+        "expires_at": key.expires_at,
+        "last_used_at": key.last_used_at,
+        "created_at": key.created_at,
+        "updated_at": key.updated_at
+    })
+}
+
+fn stored_api_key_json(key: &StoredApiKey) -> Value {
+    json!({
+        "id": key.id.as_str(),
+        "owner_user_id": key.owner_user_id.as_str(),
+        "label": key.label,
+        "key": key.key.expose_secret(),
         "enabled": key.enabled,
         "expires_at": key.expires_at,
         "last_used_at": key.last_used_at,
@@ -430,7 +486,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn auth_lifecycle_rotates_secrets_and_never_lists_api_key_plaintext() {
+    async fn auth_lifecycle_manages_retrievable_api_keys() {
         let repository = Arc::new(
             SqliteAccountRepository::in_memory()
                 .await
@@ -493,6 +549,51 @@ mod tests {
             .expect("authenticated me");
         assert_eq!(me.status(), StatusCode::OK);
 
+        let unauthenticated_generation = post_json(
+            &client,
+            format!("{base_url}/api/v1/keys/generate"),
+            json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            unauthenticated_generation.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let generated_key = post_json(
+            &client,
+            format!("{base_url}/api/v1/keys/generate"),
+            json!({}),
+            Some(&access_token),
+        )
+        .await;
+        assert_eq!(generated_key.status(), StatusCode::OK);
+        let generated_key = response_json(generated_key).await;
+        let generated_key = generated_key["data"]["key"]
+            .as_str()
+            .expect("generated API key");
+        assert_eq!(generated_key.len(), 43);
+        assert!(
+            generated_key.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            )
+        );
+        let keys_after_generation = client
+            .get(format!("{base_url}/api/v1/keys"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list API keys after generation");
+        assert_eq!(keys_after_generation.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(keys_after_generation).await["data"]
+                .as_array()
+                .expect("API key list after generation")
+                .len(),
+            0
+        );
+
         let custom_key = "custom-key-12345";
         let created_key = post_json(
             &client,
@@ -516,12 +617,20 @@ mod tests {
             .await
             .expect("list API keys");
         assert_eq!(listed_keys.status(), StatusCode::OK);
-        assert!(
-            !listed_keys
-                .text()
-                .await
-                .expect("API key list body")
-                .contains(custom_key)
+        let listed_keys = response_json(listed_keys).await;
+        assert_eq!(listed_keys["data"][0]["key"], "cus**********345");
+        assert!(!listed_keys.to_string().contains(custom_key));
+
+        let retrieved_key = client
+            .get(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("retrieve API key");
+        assert_eq!(retrieved_key.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(retrieved_key).await["data"]["key"],
+            custom_key
         );
 
         let created_member = post_json(
@@ -542,36 +651,92 @@ mod tests {
         assert_eq!(member_login.status(), StatusCode::OK);
         let member_access = response_secret(&response_json(member_login).await, "access_token");
 
-        let foreign_disable = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
+        let foreign_read = client
+            .get(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("foreign API key read");
+        assert_eq!(foreign_read.status(), StatusCode::NOT_FOUND);
+
+        let foreign_update = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
             .bearer_auth(&member_access)
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"enabled":false}"#)
             .send()
             .await
-            .expect("foreign API key disable");
-        assert_eq!(foreign_disable.status(), StatusCode::NOT_FOUND);
+            .expect("foreign API key update");
+        assert_eq!(foreign_update.status(), StatusCode::NOT_FOUND);
+
+        let expires_at = unix_timestamp() + 3600;
+        let updated_expiry = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({ "expires_at": expires_at }).to_string())
+            .send()
+            .await
+            .expect("update API key expiry");
+        assert_eq!(updated_expiry.status(), StatusCode::OK);
+        let updated_expiry = response_json(updated_expiry).await;
+        assert_eq!(updated_expiry["data"]["expires_at"], expires_at);
+        assert_eq!(updated_expiry["data"]["enabled"], true);
+        assert_eq!(updated_expiry["data"]["key"], "cus**********345");
+
+        let invalid_expiry = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({ "expires_at": unix_timestamp() - 1 }).to_string())
+            .send()
+            .await
+            .expect("reject expired API key expiry");
+        assert_eq!(invalid_expiry.status(), StatusCode::BAD_REQUEST);
 
         let disabled = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
             .bearer_auth(&access_token)
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"enabled":false}"#)
             .send()
             .await
             .expect("disable API key");
-        assert_eq!(disabled.status(), StatusCode::NO_CONTENT);
+        assert_eq!(disabled.status(), StatusCode::OK);
+        assert_eq!(response_json(disabled).await["data"]["enabled"], false);
 
-        let disabled_keys = client
-            .get(format!("{base_url}/api/v1/keys"))
+        let old_enabled_route = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
             .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":true}"#)
             .send()
             .await
-            .expect("list disabled API key");
-        assert_eq!(
-            response_json(disabled_keys).await["data"][0]["enabled"],
-            false
-        );
+            .expect("old API key enabled route");
+        assert_eq!(old_enabled_route.status(), StatusCode::NOT_FOUND);
+
+        let cleared_expiry = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":true,"expires_at":null}"#)
+            .send()
+            .await
+            .expect("clear API key expiry");
+        assert_eq!(cleared_expiry.status(), StatusCode::OK);
+        let cleared_expiry = response_json(cleared_expiry).await;
+        assert_eq!(cleared_expiry["data"]["enabled"], true);
+        assert_eq!(cleared_expiry["data"]["expires_at"], Value::Null);
+
+        let empty_update = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("empty API key update");
+        assert_eq!(empty_update.status(), StatusCode::BAD_REQUEST);
 
         let deleted = client
             .delete(format!("{base_url}/api/v1/keys/{key_id}"))

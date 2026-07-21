@@ -16,6 +16,7 @@ pub type ProviderStream =
 pub enum ProviderErrorKind {
     InvalidRequest,
     Authentication,
+    RateLimited,
     Upstream,
     Internal,
 }

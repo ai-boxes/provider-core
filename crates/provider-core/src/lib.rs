@@ -36,8 +36,9 @@ pub use provider::{
 pub use proxy::{ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
 pub use quota::{
     ProviderQuotaControl, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
-    ProviderQuotaFreshness, ProviderQuotaSnapshot, ProviderQuotaSource, ProviderQuotaSupport,
-    ProviderQuotaView, QuotaAmount, QuotaBreakdown, QuotaGroup, QuotaGroupAudience,
-    QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod, QuotaPeriodKind, QuotaUnit,
+    ProviderQuotaFreshness, ProviderQuotaObservation, ProviderQuotaSnapshot, ProviderQuotaSource,
+    ProviderQuotaSupport, ProviderQuotaView, QuotaAmount, QuotaBreakdown, QuotaGroup,
+    QuotaGroupAudience, QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod,
+    QuotaPeriodKind, QuotaScalar, QuotaUnit, merge_quota_groups,
 };
 pub use token_count::{TokenCountError, TokenCounter};

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
 };
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -306,10 +306,21 @@ impl ApiKeyAuthenticator {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
             label,
-            key_hash: issued.digest,
+            key: issued.secret.clone(),
             enabled: true,
             expires_at,
             created_at: now,
+        };
+        let summary = ApiKeySummary {
+            id: key.id.clone(),
+            owner_user_id: key.owner_user_id.clone(),
+            label: key.label.clone(),
+            key: mask_api_key(key.key.expose_secret()),
+            enabled: true,
+            expires_at,
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
         };
         let _mutation = self.mutation.lock().await;
         if !self.repository.create_api_key(key.clone()).await? {
@@ -319,48 +330,66 @@ impl ApiKeyAuthenticator {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
-                key.key_hash,
+                issued.digest,
                 ActiveApiKey {
-                    id: key.id.clone(),
-                    owner_user_id: key.owner_user_id.clone(),
+                    id: key.id,
+                    owner_user_id: key.owner_user_id,
                     expires_at: key.expires_at,
                 },
             );
         Ok(CreatedApiKey {
-            summary: ApiKeySummary {
-                id: key.id,
-                owner_user_id: key.owner_user_id,
-                label: key.label,
-                enabled: true,
-                expires_at,
-                last_used_at: None,
-                created_at: now,
-                updated_at: now,
-            },
+            summary,
             key: issued.secret,
         })
     }
 
     pub async fn list(&self, owner_user_id: &UserId) -> Result<Vec<ApiKeySummary>, AuthError> {
-        Ok(self.repository.list_api_keys(owner_user_id).await?)
+        Ok(self
+            .repository
+            .list_api_keys(owner_user_id)
+            .await?
+            .iter()
+            .map(api_key_summary)
+            .collect())
     }
 
-    pub async fn set_enabled(
+    pub async fn get(
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
-        enabled: bool,
+    ) -> Result<StoredApiKey, AuthError> {
+        self.repository
+            .load_api_key(owner_user_id, key_id)
+            .await?
+            .ok_or(AuthError::NotFound)
+    }
+
+    pub async fn update(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+        enabled: Option<bool>,
+        expires_at: Option<Option<i64>>,
         now: i64,
-    ) -> Result<(), AuthError> {
+    ) -> Result<ApiKeySummary, AuthError> {
         let _mutation = self.mutation.lock().await;
-        let removed = if enabled {
-            None
-        } else {
-            self.remove_active(owner_user_id, key_id)
-        };
+        let current = self
+            .repository
+            .load_api_key(owner_user_id, key_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        if expires_at
+            .flatten()
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err(AuthError::InvalidExpiry);
+        }
+        let enabled = enabled.unwrap_or(current.enabled);
+        let expires_at = expires_at.unwrap_or(current.expires_at);
+        let removed = self.remove_active(owner_user_id, key_id);
         let updated = match self
             .repository
-            .set_api_key_enabled(owner_user_id, key_id, enabled, now)
+            .update_api_key(owner_user_id, key_id, enabled, expires_at, now)
             .await
         {
             Ok(Some(key)) => key,
@@ -373,20 +402,20 @@ impl ApiKeyAuthenticator {
                 return Err(error.into());
             }
         };
-        if enabled {
+        if updated.enabled {
             self.active
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(
-                    updated.key_hash,
+                    digest_secret(updated.key.expose_secret()),
                     ActiveApiKey {
-                        id: updated.id,
-                        owner_user_id: updated.owner_user_id,
+                        id: updated.id.clone(),
+                        owner_user_id: updated.owner_user_id.clone(),
                         expires_at: updated.expires_at,
                     },
                 );
         }
-        Ok(())
+        Ok(api_key_summary(&updated))
     }
 
     pub async fn delete(&self, owner_user_id: &UserId, key_id: &ApiKeyId) -> Result<(), AuthError> {
@@ -431,7 +460,7 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
     keys.into_iter()
         .map(|key| {
             (
-                key.key_hash,
+                digest_secret(key.key.expose_secret()),
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
@@ -440,6 +469,33 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
             )
         })
         .collect()
+}
+
+fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
+    ApiKeySummary {
+        id: key.id.clone(),
+        owner_user_id: key.owner_user_id.clone(),
+        label: key.label.clone(),
+        key: mask_api_key(key.key.expose_secret()),
+        enabled: key.enabled,
+        expires_at: key.expires_at,
+        last_used_at: key.last_used_at,
+        created_at: key.created_at,
+        updated_at: key.updated_at,
+    }
+}
+
+fn mask_api_key(key: &str) -> String {
+    let characters = key.chars().collect::<Vec<_>>();
+    if characters.len() <= 6 {
+        return "*".repeat(characters.len());
+    }
+    let prefix = characters[..3].iter().collect::<String>();
+    let suffix = characters[characters.len() - 3..]
+        .iter()
+        .collect::<String>();
+    let masked = "*".repeat(characters.len() - 6);
+    format!("{prefix}{masked}{suffix}")
 }
 
 fn normalize_username(username: String) -> Result<String, AuthError> {

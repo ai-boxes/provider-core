@@ -7,13 +7,9 @@ use secrecy::ExposeSecret;
 
 use super::{
     credentials::GrokCredentials,
-    identity::{
-        CLIENT_IDENTIFIER, CLIENT_MODE, CLIENT_VERSION, DEFAULT_PROXY_BASE_URL, TOKEN_AUTH_HEADER,
-        TOKEN_AUTH_VALUE, user_agent,
-    },
+    identity::{DEFAULT_PROXY_BASE_URL, inference_headers},
 };
 
-const CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
 const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 
 /// HTTP client for the Grok CLI Responses upstream.
@@ -57,25 +53,20 @@ impl GrokClient {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(&generated_session_id);
-        let request = self
-            .http
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(credentials.access_token().expose_secret())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(TOKEN_AUTH_HEADER, TOKEN_AUTH_VALUE)
-            .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
-            .header("x-authenticateresponse", "authenticate-response")
-            .header("x-grok-client-mode", CLIENT_MODE)
-            .header("x-grok-client-identifier", CLIENT_IDENTIFIER)
-            .header("x-grok-user-id", user_id)
-            .header(CONVERSATION_ID_HEADER, session_id)
-            .header("x-grok-req-id", request_id)
-            .header("x-grok-model-override", model)
-            .header("x-grok-session-id", session_id)
-            .header("x-grok-agent-id", self.agent_id.as_ref())
-            .header(reqwest::header::USER_AGENT, user_agent())
-            .body(payload);
+        let request = inference_headers(
+            self.http
+                .post(format!("{}/responses", self.base_url))
+                .bearer_auth(credentials.access_token().expose_secret())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "text/event-stream"),
+        )
+        .header("x-grok-user-id", user_id)
+        .header(CONVERSATION_ID_HEADER, session_id)
+        .header("x-grok-req-id", request_id)
+        .header("x-grok-model-override", model)
+        .header("x-grok-session-id", session_id)
+        .header("x-grok-agent-id", self.agent_id.as_ref())
+        .body(payload);
 
         let response = request.send().await.map_err(|error| {
             ProviderError::new(
@@ -114,6 +105,7 @@ fn status_error(status: StatusCode) -> ProviderError {
             ProviderErrorKind::InvalidRequest
         }
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Authentication,
+        StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
 
@@ -166,8 +158,8 @@ mod tests {
 
         *capture.lock().expect("capture lock") = Some(CapturedRequest {
             authorization: header(&headers, reqwest::header::AUTHORIZATION.as_str()),
-            token_auth: header(&headers, TOKEN_AUTH_HEADER),
-            client_version: header(&headers, CLIENT_VERSION_HEADER),
+            token_auth: header(&headers, "x-xai-token-auth"),
+            client_version: header(&headers, "x-grok-client-version"),
             user_agent: header(&headers, reqwest::header::USER_AGENT.as_str()),
             conversation_id: header(&headers, CONVERSATION_ID_HEADER),
             authenticate_response: header(&headers, "x-authenticateresponse"),
@@ -250,13 +242,13 @@ mod tests {
             .clone()
             .expect("captured request");
         assert_eq!(captured.authorization, "Bearer upstream-token");
-        assert_eq!(captured.token_auth, TOKEN_AUTH_VALUE);
-        assert_eq!(captured.client_version, CLIENT_VERSION);
-        assert_eq!(captured.user_agent, user_agent());
+        assert_eq!(captured.token_auth, "xai-grok-cli");
+        assert_eq!(captured.client_version, "0.2.105");
+        assert!(captured.user_agent.starts_with("grok-shell/0.2.105 ("));
         assert_eq!(captured.conversation_id, "session-1");
         assert_eq!(captured.authenticate_response, "authenticate-response");
-        assert_eq!(captured.client_mode, CLIENT_MODE);
-        assert_eq!(captured.client_identifier, CLIENT_IDENTIFIER);
+        assert_eq!(captured.client_mode, "headless");
+        assert_eq!(captured.client_identifier, "grok-shell");
         assert_eq!(captured.user_id, "test-user");
         assert!(!captured.request_id.is_empty());
         assert_eq!(captured.model_override, "grok-4.5");

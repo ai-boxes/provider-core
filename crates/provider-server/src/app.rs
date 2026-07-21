@@ -3,7 +3,7 @@ use std::{error::Error, sync::Arc};
 use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::{AccountRepository, ProviderControl, ProxyService};
 use provider_drivers::{
-    anthropic_compatible::AnthropicCompatibleDriver, grok::GrokDriver,
+    anthropic_compatible::AnthropicCompatibleDriver, codex::CodexDriver, grok::GrokDriver,
     openai_compatible::OpenAiCompatibleDriver,
 };
 use provider_management::{ModelCatalogService, ProviderManager};
@@ -21,6 +21,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
     let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
+    runtime.register_driver(Arc::new(CodexDriver::new()))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
     let model_catalog = ModelCatalogService::new(repository.clone());

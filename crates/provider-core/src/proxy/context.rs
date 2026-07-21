@@ -8,6 +8,8 @@ use crate::WireFormat;
 #[non_exhaustive]
 pub struct RequestMetadata {
     pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub client_request_id: Option<String>,
 }
 
 /// Provider-neutral request envelope that preserves the source JSON payload.
