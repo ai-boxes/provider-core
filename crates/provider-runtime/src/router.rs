@@ -1,10 +1,11 @@
 use std::{
-    collections::{BTreeMap, hash_map::RandomState},
+    collections::{BTreeMap, HashMap, hash_map::RandomState},
     hash::BuildHasher,
     sync::{
-        Arc, PoisonError, RwLock,
+        Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -22,10 +23,32 @@ pub struct ProviderModelRouter {
     inner: Arc<RouterInner>,
 }
 
+const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(60 * 60);
+const SESSION_AFFINITY_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
 struct RouterInner {
     accounts: RwLock<BTreeMap<AccountId, RoutedAccount>>,
+    affinities: Mutex<SessionAffinities>,
     selection_state: RandomState,
     selection_counter: AtomicU64,
+}
+
+#[derive(Default)]
+struct SessionAffinities {
+    entries: HashMap<SessionAffinityKey, SessionAffinity>,
+    last_cleanup: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SessionAffinityKey {
+    user_id: String,
+    model: String,
+    session_id: String,
+}
+
+struct SessionAffinity {
+    account_id: AccountId,
+    last_used: Instant,
 }
 
 struct RoutedAccount {
@@ -58,6 +81,7 @@ impl ProviderModelRouter {
         Self {
             inner: Arc::new(RouterInner {
                 accounts: RwLock::new(BTreeMap::new()),
+                affinities: Mutex::new(SessionAffinities::default()),
                 selection_state: RandomState::new(),
                 selection_counter: AtomicU64::new(0),
             }),
@@ -92,7 +116,13 @@ impl ProviderModelRouter {
     }
 
     pub fn remove_account(&self, account_id: &AccountId) -> bool {
-        self.accounts().remove(account_id).is_some()
+        let removed = self.accounts().remove(account_id).is_some();
+        if removed {
+            self.affinities()
+                .entries
+                .retain(|_, affinity| affinity.account_id != *account_id);
+        }
+        removed
     }
 
     pub fn update_account_access(
@@ -145,6 +175,13 @@ impl ProviderModelRouter {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn affinities(&self) -> std::sync::MutexGuard<'_, SessionAffinities> {
+        self.inner
+            .affinities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl ProviderRouter for ProviderModelRouter {
@@ -184,11 +221,18 @@ impl ProviderRouter for ProviderModelRouter {
         models.into_values().collect()
     }
 
-    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
+    fn routes(
+        &self,
+        user_id: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        session_id: Option<&str>,
+    ) -> Vec<ProviderRouteCandidate> {
         let mut routes = Vec::new();
-        for account in self.account_snapshot().values() {
+        for (account_id, account) in self.account_snapshot().iter() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
+                || !native_formats.contains(&account.route.native_format())
             {
                 continue;
             }
@@ -198,21 +242,60 @@ impl ProviderRouter for ProviderModelRouter {
                     && provider_model.routable
                     && provider_model.effective_model() == model
             }) {
-                routes.push(ProviderRouteCandidate {
-                    upstream_model: provider_model.upstream_model.clone(),
-                    route: account.route.clone(),
-                });
+                routes.push((
+                    account_id.clone(),
+                    ProviderRouteCandidate {
+                        upstream_model: provider_model.upstream_model.clone(),
+                        route: account.route.clone(),
+                    },
+                ));
             }
         }
-        if routes.len() > 1 {
-            let index = random_index(
-                &self.inner.selection_state,
-                &self.inner.selection_counter,
-                routes.len(),
-            );
-            routes.rotate_left(index);
+        if routes.is_empty() {
+            return Vec::new();
         }
-        routes
+
+        let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            randomize_routes(&self.inner, &mut routes);
+            return routes.into_iter().map(|(_, route)| route).collect();
+        };
+        let key = SessionAffinityKey {
+            user_id: user_id.to_owned(),
+            model: model.to_owned(),
+            session_id: session_id.to_owned(),
+        };
+        let now = Instant::now();
+        let mut affinities = self.affinities();
+        if affinities.last_cleanup.is_none_or(|last_cleanup| {
+            now.duration_since(last_cleanup) >= SESSION_AFFINITY_CLEANUP_INTERVAL
+        }) {
+            affinities.entries.retain(|_, affinity| {
+                now.duration_since(affinity.last_used) < SESSION_AFFINITY_TTL
+            });
+            affinities.last_cleanup = Some(now);
+        }
+        if let Some(affinity) = affinities.entries.get_mut(&key) {
+            if now.duration_since(affinity.last_used) < SESSION_AFFINITY_TTL
+                && let Some(index) = routes
+                    .iter()
+                    .position(|(account_id, _)| *account_id == affinity.account_id)
+            {
+                affinity.last_used = now;
+                routes.rotate_left(index);
+                return routes.into_iter().map(|(_, route)| route).collect();
+            }
+            affinities.entries.remove(&key);
+        }
+
+        randomize_routes(&self.inner, &mut routes);
+        affinities.entries.insert(
+            key,
+            SessionAffinity {
+                account_id: routes[0].0.clone(),
+                last_used: now,
+            },
+        );
+        routes.into_iter().map(|(_, route)| route).collect()
     }
 }
 
@@ -239,6 +322,17 @@ impl ProviderRoute for RuntimeAccountRoute {
         self.runtime
             .count_tokens_for(&self.account_id, request)
             .await
+    }
+}
+
+fn randomize_routes(inner: &RouterInner, routes: &mut [(AccountId, ProviderRouteCandidate)]) {
+    if routes.len() > 1 {
+        let index = random_index(
+            &inner.selection_state,
+            &inner.selection_counter,
+            routes.len(),
+        );
+        routes.rotate_left(index);
     }
 }
 
@@ -367,9 +461,18 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model.id, "shared");
         assert_eq!(models[0].native_formats, [WireFormat::OpenAiResponses]);
-        assert!(router.routes("owner-a", "grok-imagine-image").is_empty());
+        assert!(
+            router
+                .routes(
+                    "owner-a",
+                    "grok-imagine-image",
+                    &[WireFormat::OpenAiResponses],
+                    None
+                )
+                .is_empty()
+        );
 
-        let routes = router.routes("owner-a", "shared");
+        let routes = router.routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None);
         assert_eq!(routes.len(), 2);
         let mut outputs = Vec::new();
         for route in routes {
@@ -399,15 +502,34 @@ mod tests {
             outputs,
             vec!["account-a:upstream-a", "account-b:upstream-b"]
         );
-        assert_eq!(router.routes("owner-b", "shared").len(), 1);
-        assert_eq!(router.routes("other-user", "shared").len(), 1);
+        assert_eq!(
+            router
+                .routes("owner-b", "shared", &[WireFormat::OpenAiResponses], None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            router
+                .routes("other-user", "shared", &[WireFormat::OpenAiResponses], None)
+                .len(),
+            1
+        );
 
         assert!(
             router
                 .update_account_access(&second.id, access("owner-b", ProviderVisibility::Private),)
         );
-        assert!(router.routes("other-user", "shared").is_empty());
-        assert_eq!(router.routes("owner-b", "shared").len(), 1);
+        assert!(
+            router
+                .routes("other-user", "shared", &[WireFormat::OpenAiResponses], None)
+                .is_empty()
+        );
+        assert_eq!(
+            router
+                .routes("owner-b", "shared", &[WireFormat::OpenAiResponses], None)
+                .len(),
+            1
+        );
 
         assert!(router.update_account_access(
             &first.id,
@@ -416,15 +538,229 @@ mod tests {
                 visibility: ProviderVisibility::Private,
             },
         ));
-        assert!(router.routes("owner-a", "shared").is_empty());
+        assert!(
+            router
+                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .is_empty()
+        );
         router.claim_unowned_account_access("owner-a");
-        assert_eq!(router.routes("owner-a", "shared").len(), 1);
+        assert_eq!(
+            router
+                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .len(),
+            1
+        );
         assert!(router.update_account_models(
             &first.id,
             vec![stored_model(&first.id, "upstream-a", "updated")],
         ));
-        assert!(router.routes("owner-a", "shared").is_empty());
-        assert_eq!(router.routes("owner-a", "updated").len(), 1);
+        assert!(
+            router
+                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .is_empty()
+        );
+        assert_eq!(
+            router
+                .routes("owner-a", "updated", &[WireFormat::OpenAiResponses], None)
+                .len(),
+            1
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn keeps_session_on_the_same_account_until_it_becomes_invalid() {
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let first = Arc::new(TestAccount {
+            id: AccountId::new("affinity-a").expect("account ID"),
+        });
+        let second = Arc::new(TestAccount {
+            id: AccountId::new("affinity-b").expect("account ID"),
+        });
+        for account in [&first, &second] {
+            runtime
+                .register(account.clone())
+                .await
+                .expect("register account");
+        }
+
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                first.clone(),
+                vec![stored_model(&first.id, "upstream-a", "shared")],
+                access("owner", ProviderVisibility::Shared),
+            )
+            .expect("first route");
+        router
+            .replace_account_models(
+                runtime.clone(),
+                second.clone(),
+                vec![stored_model(&second.id, "upstream-b", "shared")],
+                access("owner", ProviderVisibility::Shared),
+            )
+            .expect("second route");
+
+        let first_selection = router.routes(
+            "caller",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            Some("cc_session"),
+        );
+        let selected_model = first_selection[0].upstream_model.clone();
+        assert_eq!(
+            router.routes(
+                "caller",
+                "shared",
+                &[WireFormat::OpenAiResponses],
+                Some("cc_session")
+            )[0]
+            .upstream_model,
+            selected_model
+        );
+        assert_eq!(
+            router
+                .routes(
+                    "caller",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    Some("different_session")
+                )
+                .len(),
+            2
+        );
+
+        let third = Arc::new(TestAccount {
+            id: AccountId::new("affinity-c").expect("account ID"),
+        });
+        runtime
+            .register(third.clone())
+            .await
+            .expect("register third account");
+        router
+            .replace_account_models(
+                runtime.clone(),
+                third.clone(),
+                vec![stored_model(&third.id, "upstream-c", "shared")],
+                access("owner", ProviderVisibility::Shared),
+            )
+            .expect("third route");
+        assert_eq!(
+            router.routes(
+                "caller",
+                "shared",
+                &[WireFormat::OpenAiResponses],
+                Some("cc_session")
+            )[0]
+            .upstream_model,
+            selected_model
+        );
+
+        let selected_account = if selected_model == "upstream-a" {
+            &first.id
+        } else {
+            &second.id
+        };
+        assert!(router.remove_account(selected_account));
+        let replacement = router.routes(
+            "caller",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            Some("cc_session"),
+        )[0]
+        .upstream_model
+        .clone();
+        assert_ne!(replacement, selected_model);
+        assert!(matches!(
+            replacement.as_str(),
+            "upstream-a" | "upstream-b" | "upstream-c"
+        ));
+        assert_eq!(
+            router.routes(
+                "caller",
+                "shared",
+                &[WireFormat::OpenAiResponses],
+                Some("cc_session")
+            )[0]
+            .upstream_model,
+            replacement
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn removes_expired_affinity_during_route_selection() {
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let account = Arc::new(TestAccount {
+            id: AccountId::new("affinity-account").expect("account ID"),
+        });
+        runtime
+            .register(account.clone())
+            .await
+            .expect("register account");
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                account.clone(),
+                vec![stored_model(&account.id, "upstream", "shared")],
+                access("owner", ProviderVisibility::Shared),
+            )
+            .expect("route");
+        let expired_key = SessionAffinityKey {
+            user_id: "caller".to_owned(),
+            model: "shared".to_owned(),
+            session_id: "expired-session".to_owned(),
+        };
+        router.affinities().entries.insert(
+            expired_key.clone(),
+            SessionAffinity {
+                account_id: account.id.clone(),
+                last_used: Instant::now() - SESSION_AFFINITY_TTL - Duration::from_secs(1),
+            },
+        );
+
+        assert_eq!(
+            router.routes(
+                "caller",
+                "shared",
+                &[WireFormat::OpenAiResponses],
+                Some("active-session")
+            )[0]
+            .upstream_model,
+            "upstream"
+        );
+        let affinities = router.affinities();
+        assert!(!affinities.entries.contains_key(&expired_key));
+        assert!(affinities.entries.contains_key(&SessionAffinityKey {
+            user_id: "caller".to_owned(),
+            model: "shared".to_owned(),
+            session_id: "active-session".to_owned(),
+        }));
+        drop(affinities);
+
+        let expired_at = Instant::now() - SESSION_AFFINITY_TTL - Duration::from_secs(1);
+        router.affinities().entries.insert(
+            expired_key.clone(),
+            SessionAffinity {
+                account_id: account.id.clone(),
+                last_used: expired_at,
+            },
+        );
+        assert_eq!(
+            router.routes(
+                "caller",
+                "shared",
+                &[WireFormat::OpenAiResponses],
+                Some("expired-session")
+            )[0]
+            .upstream_model,
+            "upstream"
+        );
+        let affinities = router.affinities();
+        assert!(affinities.entries[&expired_key].last_used > expired_at);
+        drop(affinities);
         runtime.shutdown();
     }
 

@@ -228,6 +228,57 @@ impl AuthService {
         })
     }
 
+    pub async fn set_user_enabled(
+        &self,
+        actor: &UserSummary,
+        user_id: &UserId,
+        enabled: bool,
+        now: i64,
+    ) -> Result<UserSummary, AuthError> {
+        require_super_admin(actor)?;
+        if !enabled && actor.id == *user_id {
+            return Err(AuthError::Forbidden);
+        }
+        if !self
+            .repository
+            .set_user_enabled(user_id, enabled, now)
+            .await?
+        {
+            return Err(AuthError::NotFound);
+        }
+        let user = self
+            .repository
+            .load_user(user_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        Ok(user_summary(&user))
+    }
+
+    pub async fn reset_user_password(
+        &self,
+        actor: &UserSummary,
+        user_id: &UserId,
+        password: SecretString,
+        now: i64,
+    ) -> Result<UserSummary, AuthError> {
+        require_super_admin(actor)?;
+        let password_hash = password_hash(password).await?;
+        if !self
+            .repository
+            .update_user_password(user_id, password_hash, now)
+            .await?
+        {
+            return Err(AuthError::NotFound);
+        }
+        self.repository.revoke_user_sessions(user_id, now).await?;
+        let user = self
+            .repository
+            .load_user(user_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        Ok(user_summary(&user))
+    }
+
     async fn create_session(&self, user: UserSummary, now: i64) -> Result<SessionGrant, AuthError> {
         let tokens = issue_session_tokens(now)?;
         self.repository
@@ -499,7 +550,7 @@ fn mask_api_key(key: &str) -> String {
 }
 
 fn normalize_username(username: String) -> Result<String, AuthError> {
-    let username = username.trim().to_lowercase();
+    let username = username.trim().to_owned();
     if username.is_empty() || username.len() > 128 {
         return Err(AuthError::InvalidUsername);
     }

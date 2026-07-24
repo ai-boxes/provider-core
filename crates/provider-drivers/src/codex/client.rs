@@ -217,11 +217,11 @@ mod tests {
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::TryStreamExt;
-    use provider_core::RequestMetadata;
+    use provider_core::{ProviderRequest, RequestMetadata, WireFormat};
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
-    use crate::codex::request::PreparedCodexRequest;
+    use crate::codex::request::{PreparedCodexRequest, prepare_request};
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Option<(reqwest::header::HeaderMap, Bytes)>>>);
@@ -269,17 +269,15 @@ mod tests {
         let mut metadata = RequestMetadata::default();
         metadata.session_id = Some("session-1".to_owned());
         metadata.thread_id = Some("thread-1".to_owned());
-        let payload = Bytes::from_static(br#"{"model":"gpt-5.5","stream":true}"#);
+        let prepared = prepare_request(ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.5".to_owned(),
+            payload: Bytes::from_static(br#"{"model":"caller-model","stream":false}"#),
+            metadata,
+        })
+        .expect("prepared request");
 
-        let response = client
-            .execute_stream(
-                &credentials,
-                PreparedCodexRequest {
-                    payload: payload.clone(),
-                    metadata,
-                },
-            )
-            .await;
+        let response = client.execute_stream(&credentials, prepared).await;
         let response = match response {
             Ok(response) => response,
             Err(_) => panic!("stream response must succeed"),
@@ -312,10 +310,15 @@ mod tests {
             header(&headers, reqwest::header::USER_AGENT.as_str())
                 .starts_with("codex_cli_rs/0.144.5 (")
         );
-        assert_eq!(header(&headers, "session-id"), "session-1");
+        let session_id = header(&headers, "session-id");
+        assert_eq!(session_id, "session-1");
         assert_eq!(header(&headers, "thread-id"), "thread-1");
         assert_eq!(header(&headers, "x-client-request-id"), "thread-1");
-        assert_eq!(captured_body, payload);
+        let captured_body: Value =
+            serde_json::from_slice(&captured_body).expect("captured request JSON");
+        assert_eq!(captured_body["model"], "gpt-5.5");
+        assert_eq!(captured_body["stream"], true);
+        assert_eq!(captured_body["prompt_cache_key"], session_id);
     }
 
     #[tokio::test]

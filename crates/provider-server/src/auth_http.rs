@@ -7,11 +7,11 @@ use axum::{
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
-    CreatedApiKey, CredentialError, SessionGrant, StoredApiKey, UserSummary,
+    CreatedApiKey, CredentialError, SessionGrant, StoredApiKey, UserId, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
@@ -50,6 +50,8 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/users", get(list_users).post(create_user))
+        .route("/api/v1/users/{user_id}", put(update_user))
+        .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/generate", post(generate_key))
         .route(
@@ -167,6 +169,44 @@ async fn create_user(
     Ok((StatusCode::CREATED, data(user_json(&user))))
 }
 
+async fn update_user(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(user_id): Path<String>,
+    request: Result<Json<UpdateUserRequest>, JsonRejection>,
+) -> Result<Json<Value>, AuthApiError> {
+    let request = json_request(request)?;
+    let user = state
+        .auth
+        .set_user_enabled(
+            &session.user,
+            &parse_user_id(&user_id)?,
+            request.enabled,
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(data(user_json(&user)))
+}
+
+async fn reset_user_password(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(user_id): Path<String>,
+    request: Result<Json<ResetUserPasswordRequest>, JsonRejection>,
+) -> Result<Json<Value>, AuthApiError> {
+    let request = json_request(request)?;
+    let user = state
+        .auth
+        .reset_user_password(
+            &session.user,
+            &parse_user_id(&user_id)?,
+            SecretString::from(request.password),
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(data(user_json(&user)))
+}
+
 async fn list_keys(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -271,6 +311,16 @@ struct UserCredentialsRequest {
 }
 
 #[derive(Deserialize)]
+struct UpdateUserRequest {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ResetUserPasswordRequest {
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
 }
@@ -320,6 +370,10 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthApiError> {
 
 fn parse_api_key_id(value: &str) -> Result<ApiKeyId, AuthApiError> {
     ApiKeyId::new(value).map_err(|_| AuthApiError::invalid_request("invalid API key ID"))
+}
+
+fn parse_user_id(value: &str) -> Result<UserId, AuthApiError> {
+    UserId::new(value).map_err(|_| AuthApiError::invalid_request("invalid user ID"))
 }
 
 fn session_grant_json(grant: &SessionGrant) -> Value {
@@ -538,7 +592,7 @@ mod tests {
         let setup_body = response_json(setup).await;
         let access_token = response_secret(&setup_body, "access_token");
         let refresh_token = response_secret(&setup_body, "refresh_token");
-        assert_eq!(setup_body["data"]["user"]["username"], "admin");
+        assert_eq!(setup_body["data"]["user"]["username"], "Admin");
         assert!(!setup_body.to_string().contains("password_hash"));
 
         let me = client
@@ -798,6 +852,207 @@ mod tests {
             .await
             .expect("logged out me");
         assert_eq!(logged_out_me.status(), StatusCode::UNAUTHORIZED);
+
+        server.abort();
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn super_admin_manages_users_and_revokes_sessions_on_password_reset() {
+        let repository = Arc::new(
+            SqliteAccountRepository::in_memory()
+                .await
+                .expect("repository"),
+        );
+        let auth = AuthService::new(repository.clone());
+        let api_keys = ApiKeyAuthenticator::load(repository.clone())
+            .await
+            .expect("API key index");
+        let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+        let manager = ProviderManager::new(repository, runtime.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth server");
+        let address = listener.local_addr().expect("auth address");
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                router(AuthHttpState::new(auth, api_keys, manager)),
+            )
+            .into_future(),
+        );
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{address}");
+
+        let setup = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/setup"),
+            json!({ "username": "Admin", "password": "secret" }),
+            None,
+        )
+        .await;
+        assert_eq!(setup.status(), StatusCode::CREATED);
+        let setup_body = response_json(setup).await;
+        let admin_access = response_secret(&setup_body, "access_token");
+        let admin_id = setup_body["data"]["user"]["id"]
+            .as_str()
+            .expect("admin user ID")
+            .to_owned();
+
+        let created_member = post_json(
+            &client,
+            format!("{base_url}/api/v1/users"),
+            json!({ "username": "Member", "password": "secret2" }),
+            Some(&admin_access),
+        )
+        .await;
+        assert_eq!(created_member.status(), StatusCode::CREATED);
+        let created_member = response_json(created_member).await;
+        assert_eq!(created_member["data"]["username"], "Member");
+        assert_eq!(created_member["data"]["role"], "user");
+        assert_eq!(created_member["data"]["enabled"], true);
+        let member_id = created_member["data"]["id"]
+            .as_str()
+            .expect("member user ID")
+            .to_owned();
+
+        let listed_users = client
+            .get(format!("{base_url}/api/v1/users"))
+            .bearer_auth(&admin_access)
+            .send()
+            .await
+            .expect("list users");
+        assert_eq!(listed_users.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(listed_users).await["data"]
+                .as_array()
+                .expect("user list")
+                .len(),
+            2
+        );
+
+        let member_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "Member", "password": "secret2" }),
+            None,
+        )
+        .await;
+        assert_eq!(member_login.status(), StatusCode::OK);
+        let member_login = response_json(member_login).await;
+        let member_access = response_secret(&member_login, "access_token");
+
+        let forbidden_list = client
+            .get(format!("{base_url}/api/v1/users"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("member list users");
+        assert_eq!(forbidden_list.status(), StatusCode::FORBIDDEN);
+
+        let self_disable = client
+            .put(format!("{base_url}/api/v1/users/{admin_id}"))
+            .bearer_auth(&admin_access)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":false}"#)
+            .send()
+            .await
+            .expect("self disable");
+        assert_eq!(self_disable.status(), StatusCode::FORBIDDEN);
+
+        let disabled_member = client
+            .put(format!("{base_url}/api/v1/users/{member_id}"))
+            .bearer_auth(&admin_access)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":false}"#)
+            .send()
+            .await
+            .expect("disable member");
+        assert_eq!(disabled_member.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(disabled_member).await["data"]["enabled"],
+            false
+        );
+
+        let disabled_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "Member", "password": "secret2" }),
+            None,
+        )
+        .await;
+        assert_eq!(disabled_login.status(), StatusCode::UNAUTHORIZED);
+
+        let disabled_me = client
+            .get(format!("{base_url}/api/v1/auth/me"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("disabled member me");
+        assert_eq!(disabled_me.status(), StatusCode::UNAUTHORIZED);
+
+        let enabled_member = client
+            .put(format!("{base_url}/api/v1/users/{member_id}"))
+            .bearer_auth(&admin_access)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":true}"#)
+            .send()
+            .await
+            .expect("enable member");
+        assert_eq!(enabled_member.status(), StatusCode::OK);
+        assert_eq!(response_json(enabled_member).await["data"]["enabled"], true);
+
+        let member_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "Member", "password": "secret2" }),
+            None,
+        )
+        .await;
+        assert_eq!(member_login.status(), StatusCode::OK);
+        let member_access = response_secret(&response_json(member_login).await, "access_token");
+
+        let reset_password = client
+            .put(format!("{base_url}/api/v1/users/{member_id}/password"))
+            .bearer_auth(&admin_access)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"password":"secret3"}"#)
+            .send()
+            .await
+            .expect("reset member password");
+        assert_eq!(reset_password.status(), StatusCode::OK);
+        assert!(
+            !response_json(reset_password)
+                .await
+                .to_string()
+                .contains("secret3")
+        );
+
+        let revoked_me = client
+            .get(format!("{base_url}/api/v1/auth/me"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("revoked member me");
+        assert_eq!(revoked_me.status(), StatusCode::UNAUTHORIZED);
+
+        let old_password_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "Member", "password": "secret2" }),
+            None,
+        )
+        .await;
+        assert_eq!(old_password_login.status(), StatusCode::UNAUTHORIZED);
+
+        let new_password_login = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/login"),
+            json!({ "username": "Member", "password": "secret3" }),
+            None,
+        )
+        .await;
+        assert_eq!(new_password_login.status(), StatusCode::OK);
 
         server.abort();
         runtime.shutdown();

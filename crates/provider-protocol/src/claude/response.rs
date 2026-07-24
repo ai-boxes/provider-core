@@ -116,6 +116,7 @@ struct ClaudeEventConverter {
     pending_tool: Option<PendingTool>,
     emitted_text: bool,
     emitted_tool: bool,
+    web_search_requests: u64,
 }
 
 impl ClaudeEventConverter {
@@ -129,6 +130,7 @@ impl ClaudeEventConverter {
             pending_tool: None,
             emitted_text: false,
             emitted_tool: false,
+            web_search_requests: 0,
         }
     }
 
@@ -345,8 +347,80 @@ impl ClaudeEventConverter {
                 }
                 self.close_block(output);
             }
+            Some("web_search_call") => self.emit_web_search(item, output),
             _ => {}
         }
+    }
+
+    fn emit_web_search(&mut self, item: &Value, output: &mut Vec<Bytes>) {
+        self.close_block(output);
+        let id = item
+            .get("id")
+            .or_else(|| item.get("call_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("web_search_{}", self.block_index));
+        let query = item
+            .get("action")
+            .and_then(|action| action.get("query"))
+            .or_else(|| item.get("query"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let tool_index = self.block_index;
+        output.push(sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id.clone(),
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        ));
+        if !query.is_empty() {
+            output.push(sse_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": tool_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::json!({ "query": query }).to_string()
+                    }
+                }),
+            ));
+        }
+        output.push(sse_event(
+            "content_block_stop",
+            serde_json::json!({ "type": "content_block_stop", "index": tool_index }),
+        ));
+        self.block_index += 1;
+
+        let content = web_search_results(item);
+        let result_index = self.block_index;
+        output.push(sse_event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": result_index,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                }
+            }),
+        ));
+        output.push(sse_event(
+            "content_block_stop",
+            serde_json::json!({ "type": "content_block_stop", "index": result_index }),
+        ));
+        self.block_index += 1;
+        self.web_search_requests += 1;
     }
 
     fn function_arguments(&mut self, event: &Value, is_delta: bool, output: &mut Vec<Bytes>) {
@@ -405,23 +479,56 @@ impl ClaudeEventConverter {
         if cached > 0 {
             claude_usage["cache_read_input_tokens"] = Value::Number(cached.into());
         }
+        if self.web_search_requests > 0 {
+            claude_usage["server_tool_use"] = serde_json::json!({
+                "web_search_requests": self.web_search_requests
+            });
+        }
+        let upstream_stop_reason =
+            response
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    response
+                        .get("incomplete_details")
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                });
         let stop_reason = if self.emitted_tool {
             "tool_use"
+        } else if upstream_stop_reason
+            .is_some_and(|reason| matches!(reason, "max_tokens" | "max_output_tokens"))
+        {
+            "max_tokens"
+        } else if upstream_stop_reason == Some("content_filter") {
+            "refusal"
+        } else if upstream_stop_reason.is_some_and(|reason| {
+            matches!(
+                reason,
+                "end_turn" | "stop_sequence" | "pause_turn" | "refusal"
+            )
+        }) {
+            upstream_stop_reason.unwrap_or("end_turn")
         } else if response
             .get("incomplete_details")
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str)
-            .is_some_and(|reason| matches!(reason, "max_tokens" | "max_output_tokens"))
+            == Some("model_context_window_exceeded")
         {
-            "max_tokens"
+            "model_context_window_exceeded"
         } else {
             "end_turn"
         };
+        let stop_sequence = response
+            .get("stop_sequence")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or(Value::Null);
         output.push(sse_event(
             "message_delta",
             serde_json::json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                "delta": { "stop_reason": stop_reason, "stop_sequence": stop_sequence },
                 "usage": claude_usage
             }),
         ));
@@ -560,6 +667,36 @@ struct PendingTool {
     arguments: String,
 }
 
+fn web_search_results(item: &Value) -> Vec<Value> {
+    item.get("results")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            item.get("action")
+                .and_then(|action| action.get("sources"))
+                .and_then(Value::as_array)
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let url = result
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())?;
+            let title = result
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(url);
+            Some(serde_json::json!({
+                "type": "web_search_result",
+                "title": title,
+                "url": url,
+                "page_age": null
+            }))
+        })
+        .collect()
+}
+
 fn claude_error(event: &Value) -> Bytes {
     let error = event.get("error").unwrap_or(&Value::Null);
     let error_type = error
@@ -630,6 +767,44 @@ mod tests {
         assert!(output.contains(r#""type":"input_json_delta""#));
         assert!(output.contains(r#""partial_json":"{\"cmd\":\"pwd\"}""#));
         assert!(output.contains(r#""stop_reason":"tool_use""#));
+        assert!(output.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn converts_web_search_and_incomplete_reason() {
+        let upstream: ProviderStream = Box::pin(stream::iter([Ok(Bytes::from_static(
+            br#"event: created
+data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.5"}}
+
+event: search
+data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"weather","sources":[{"url":"https://example.com","title":"Weather"}]}}}
+
+event: incomplete
+data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":3,"output_tokens":1,"input_tokens_details":{"cached_tokens":1}}}}
+
+"#,
+        ))]));
+        let converted = adapt_responses_stream_to_claude(
+            upstream,
+            ClaudeResponseContext::new("grok-4.5".to_owned(), HashMap::new()),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("converted stream")
+        .concat();
+        let output = String::from_utf8(converted).expect("UTF-8 SSE");
+
+        assert!(output.contains(r#""type":"server_tool_use""#));
+        assert!(output.contains(r#""id":"ws_1""#));
+        assert!(output.contains(r#""partial_json":"{\"query\":\"weather\"}""#));
+        assert!(output.contains(r#""type":"web_search_tool_result""#));
+        assert!(output.contains(r#""url":"https://example.com""#));
+        assert!(output.contains(r#""web_search_requests":1"#));
+        assert!(output.contains(r#""cache_read_input_tokens":1"#));
+        assert!(output.contains(r#""input_tokens":2"#));
+        assert!(output.contains(r#""stop_reason":"refusal""#));
         assert!(output.contains("event: message_stop"));
     }
 }

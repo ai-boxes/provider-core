@@ -18,19 +18,42 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 
-type CapturedBodies = Arc<Mutex<Vec<Value>>>;
+#[derive(Clone, Debug)]
+struct CapturedRequest {
+    body: Value,
+    conversation_id: String,
+    session_id: String,
+}
+
+type CapturedRequests = Arc<Mutex<Vec<CapturedRequest>>>;
 
 async fn grok_responses(
-    State(captured): State<CapturedBodies>,
+    State(captured): State<CapturedRequests>,
     request: Request,
 ) -> Response<Body> {
+    let conversation_id = request
+        .headers()
+        .get("x-grok-conv-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let session_id = request
+        .headers()
+        .get("x-grok-session-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
     let body = to_bytes(request.into_body(), usize::MAX)
         .await
         .expect("upstream request body");
     captured
         .lock()
-        .expect("captured bodies lock")
-        .push(serde_json::from_slice(&body).expect("upstream request JSON"));
+        .expect("captured requests lock")
+        .push(CapturedRequest {
+            body: serde_json::from_slice(&body).expect("upstream request JSON"),
+            conversation_id,
+            session_id,
+        });
 
     let chunks = stream::iter([Ok::<_, std::convert::Infallible>(Bytes::from_static(
         b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.5\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"output_text\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
@@ -53,7 +76,7 @@ async fn spawn(router: Router) -> (String, JoinHandle<std::io::Result<()>>) {
 
 #[tokio::test]
 async fn proxies_codex_and_claude_through_mock_grok() {
-    let captured = CapturedBodies::default();
+    let captured = CapturedRequests::default();
     let upstream = Router::new()
         .route("/v1/responses", post(grok_responses))
         .with_state(captured.clone());
@@ -125,7 +148,23 @@ async fn proxies_codex_and_claude_through_mock_grok() {
             json!({
                 "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
                 "max_tokens": 128,
-                "messages": [{ "role": "user", "content": "hello" }]
+                "metadata": {
+                    "user_id": "{\"device_id\":\"device-a\",\"session_id\":\"private-session-value\"}"
+                },
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "visible thinking must not replay",
+                                "signature": "Eclaude-signature"
+                            },
+                            { "type": "text", "text": "previous answer" }
+                        ]
+                    },
+                    { "role": "user", "content": "hello" }
+                ]
             })
             .to_string(),
         )
@@ -139,12 +178,85 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     assert!(claude.contains(r#""type":"text_delta""#));
     assert!(claude.contains("event: message_stop"));
 
-    let captured = captured.lock().expect("captured bodies lock");
-    assert_eq!(captured.len(), 2);
-    assert_eq!(captured[0]["model"], "grok-4.5");
-    assert_eq!(captured[0]["stream"], true);
-    assert_eq!(captured[1]["model"], "grok-4.20-0309-non-reasoning");
-    assert_eq!(captured[1]["input"][0]["role"], "user");
+    let claude_second = client
+        .post(format!("{server_url}/v1/messages"))
+        .header("x-api-key", &api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
+                "max_tokens": 128,
+                "metadata": {
+                    "user_id": "{\"device_id\":\"device-b\",\"session_id\":\"private-session-value\"}"
+                },
+                "messages": [{ "role": "user", "content": "next" }]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("second Claude response")
+        .text()
+        .await
+        .expect("second Claude SSE");
+    assert!(claude_second.contains("event: message_stop"));
+
+    let different_session = client
+        .post(format!("{server_url}/v1/messages"))
+        .header("x-api-key", &api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
+                "max_tokens": 128,
+                "metadata": {
+                    "user_id": "{\"session_id\":\"different-private-session\"}"
+                },
+                "messages": [{ "role": "user", "content": "other" }]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("different-session Claude response")
+        .text()
+        .await
+        .expect("different-session Claude SSE");
+    assert!(different_session.contains("event: message_stop"));
+
+    let captured = captured.lock().expect("captured requests lock");
+    assert_eq!(captured.len(), 4);
+    assert_eq!(captured[0].body["model"], "grok-4.5");
+    assert_eq!(captured[0].body["stream"], true);
+    assert_eq!(captured[1].body["model"], "grok-4.20-0309-non-reasoning");
+    assert_eq!(captured[1].body["input"][0]["role"], "assistant");
+    assert_eq!(
+        captured[1].body["input"][0]["content"][0]["text"],
+        "previous answer"
+    );
+    assert!(
+        !captured[1]
+            .body
+            .to_string()
+            .contains("visible thinking must not replay")
+    );
+    assert!(!captured[1].body.to_string().contains("Eclaude-signature"));
+    let cache_key = captured[1].body["prompt_cache_key"]
+        .as_str()
+        .expect("Claude prompt cache key");
+    assert!(cache_key.starts_with("cc_"));
+    assert!(!cache_key.contains("private-session-value"));
+    assert_eq!(captured[1].conversation_id, cache_key);
+    assert_eq!(captured[1].session_id, cache_key);
+    assert_eq!(captured[2].body["prompt_cache_key"], cache_key);
+    assert_eq!(captured[2].conversation_id, cache_key);
+    assert_eq!(captured[2].session_id, cache_key);
+    let different_cache_key = captured[3].body["prompt_cache_key"]
+        .as_str()
+        .expect("different prompt cache key");
+    assert_ne!(different_cache_key, cache_key);
+    assert_eq!(captured[3].conversation_id, different_cache_key);
+    assert_eq!(captured[3].session_id, different_cache_key);
 
     runtime.shutdown();
     server.abort();

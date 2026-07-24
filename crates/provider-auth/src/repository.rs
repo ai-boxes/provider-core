@@ -81,6 +81,12 @@ pub trait AuthRepository: Send + Sync {
         revoked_at: i64,
     ) -> Result<bool, AuthRepositoryError>;
 
+    async fn revoke_user_sessions(
+        &self,
+        user_id: &UserId,
+        revoked_at: i64,
+    ) -> Result<u64, AuthRepositoryError>;
+
     async fn create_api_key(&self, key: NewApiKey) -> Result<bool, AuthRepositoryError>;
 
     async fn list_api_keys(

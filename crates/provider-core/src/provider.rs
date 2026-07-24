@@ -110,7 +110,13 @@ pub struct RoutableProviderModel {
 pub trait ProviderRouter: Send + Sync {
     fn models(&self, user_id: &str) -> Vec<RoutableProviderModel>;
 
-    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate>;
+    fn routes(
+        &self,
+        user_id: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        session_id: Option<&str>,
+    ) -> Vec<ProviderRouteCandidate>;
 }
 
 /// Shared metadata and native protocol implemented by one upstream driver.

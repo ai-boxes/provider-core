@@ -303,8 +303,16 @@ impl ProviderRouter for ProviderRuntimeCatalog {
         self.inner.router.models(user_id)
     }
 
-    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
-        self.inner.router.routes(user_id, model)
+    fn routes(
+        &self,
+        user_id: &str,
+        model: &str,
+        native_formats: &[provider_core::WireFormat],
+        session_id: Option<&str>,
+    ) -> Vec<ProviderRouteCandidate> {
+        self.inner
+            .router
+            .routes(user_id, model, native_formats, session_id)
     }
 }
 

@@ -12,10 +12,13 @@ use provider_core::{
     RequestMetadata, WireFormat,
 };
 use provider_management::ProviderManager;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CLAUDE_MODEL_PREFIX: &str = "claude-fable-5-dd-";
+const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
+const CLAUDE_CODE_SESSION_SUFFIX: &str = "_session_";
 
 #[derive(Clone)]
 struct AppState {
@@ -161,14 +164,8 @@ async fn messages(
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
-    proxy_stream(
-        &state.service,
-        key.owner_user_id.as_str(),
-        WireFormat::ClaudeMessages,
-        &headers,
-        body,
-    )
-    .await
+    let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
+    proxy_prepared_stream(&state.service, key.owner_user_id.as_str(), request).await
 }
 
 async fn count_tokens(
@@ -177,7 +174,7 @@ async fn count_tokens(
     body: Bytes,
 ) -> Result<Json<Value>, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
-    let request = proxy_request(WireFormat::ClaudeMessages, &headers, body)?;
+    let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
     let count = state
         .service
         .count_tokens(key.owner_user_id.as_str(), request)
@@ -195,6 +192,15 @@ async fn proxy_stream(
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let request = proxy_request(protocol, headers, body)?;
+    proxy_prepared_stream(service, user_id, request).await
+}
+
+async fn proxy_prepared_stream(
+    service: &ProxyService,
+    user_id: &str,
+    request: ProxyRequest,
+) -> Result<Response, HttpError> {
+    let protocol = request.format;
     let stream = service
         .execute_stream(user_id, request)
         .await
@@ -239,6 +245,34 @@ fn proxy_request(
     Ok(request.with_metadata(request_metadata(headers, protocol)?))
 }
 
+fn proxy_request_for_key(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+    key: &AuthenticatedApiKey,
+) -> Result<ProxyRequest, HttpError> {
+    let mut request = proxy_request(protocol, headers, body)?;
+    if protocol == WireFormat::ClaudeMessages {
+        let mut payload: Value = serde_json::from_slice(&request.payload)
+            .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
+        let Some(root) = payload.as_object_mut() else {
+            return Err(HttpError::invalid_request(
+                protocol,
+                "request body must be a JSON object",
+            ));
+        };
+        if let Some(session_id) = claude_code_session_id(headers, root, protocol)? {
+            request.metadata.session_id =
+                Some(claude_code_cache_key(key, &request.model, &session_id));
+        }
+        root.remove("metadata");
+        request.payload = serde_json::to_vec(&payload)
+            .map(Bytes::from)
+            .map_err(|_| HttpError::internal(protocol))?;
+    }
+    Ok(request)
+}
+
 fn request_metadata(
     headers: &HeaderMap,
     protocol: WireFormat,
@@ -248,6 +282,77 @@ fn request_metadata(
     metadata.thread_id = metadata_header(headers, "thread-id", protocol)?;
     metadata.client_request_id = metadata_header(headers, "x-client-request-id", protocol)?;
     Ok(metadata)
+}
+
+fn claude_code_session_id(
+    headers: &HeaderMap,
+    body: &Map<String, Value>,
+    protocol: WireFormat,
+) -> Result<Option<String>, HttpError> {
+    if let Some(session_id) = metadata_header(headers, CLAUDE_CODE_SESSION_HEADER, protocol)? {
+        return Ok(Some(session_id));
+    }
+    if let Some(user_id) = body
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+    {
+        if let Ok(metadata) = serde_json::from_str::<Value>(user_id)
+            && let Some(session_id) = metadata.get("session_id").and_then(Value::as_str)
+        {
+            return validated_session_id(session_id, protocol);
+        }
+        if let Some((_, session_id)) = user_id.rsplit_once(CLAUDE_CODE_SESSION_SUFFIX)
+            && valid_legacy_claude_session_id(session_id)
+        {
+            return validated_session_id(session_id, protocol);
+        }
+    }
+    metadata_header(headers, "session-id", protocol)
+}
+
+fn valid_legacy_claude_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase() || byte == b'-')
+}
+
+fn validated_session_id(value: &str, protocol: WireFormat) -> Result<Option<String>, HttpError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !valid_metadata_value(value) {
+        return Err(HttpError::invalid_request(
+            protocol,
+            "request metadata header is invalid",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn claude_code_cache_key(key: &AuthenticatedApiKey, model: &str, session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        "claude-code-cache-v1",
+        key.key_id.as_str(),
+        key.owner_user_id.as_str(),
+        model,
+        session_id,
+    ] {
+        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(35);
+    encoded.push_str("cc_");
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn metadata_header(
@@ -265,17 +370,20 @@ fn metadata_header(
     if value.is_empty() {
         return Ok(None);
     }
-    if value.len() > 256
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
-    {
+    if !valid_metadata_value(value) {
         return Err(HttpError::invalid_request(
             protocol,
             "request metadata header is invalid",
         ));
     }
     Ok(Some(value.to_owned()))
+}
+
+fn valid_metadata_value(value: &str) -> bool {
+    value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
 }
 
 fn authenticate_api_key(
@@ -404,7 +512,7 @@ mod tests {
 
     use async_trait::async_trait;
     use futures_util::stream;
-    use provider_auth::AuthService;
+    use provider_auth::{ApiKeyId, AuthService, UserId};
     use provider_core::{
         Provider, ProviderModel, ProviderRequest, ProviderStream, RequestMetadata,
     };
@@ -639,6 +747,104 @@ mod tests {
         assert_eq!(disabled_key.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
+    }
+
+    #[test]
+    fn derives_isolated_claude_code_cache_keys() {
+        let first_key = AuthenticatedApiKey {
+            key_id: ApiKeyId::new("key-a").expect("API key ID"),
+            owner_user_id: UserId::new("user-a").expect("user ID"),
+        };
+        let second_key = AuthenticatedApiKey {
+            key_id: ApiKeyId::new("key-b").expect("API key ID"),
+            owner_user_id: UserId::new("user-a").expect("user ID"),
+        };
+        let first = claude_code_cache_key(&first_key, "grok-4.5", "session-1");
+
+        assert_eq!(
+            first,
+            claude_code_cache_key(&first_key, "grok-4.5", "session-1")
+        );
+        assert_ne!(
+            first,
+            claude_code_cache_key(&first_key, "grok-4.5", "session-2")
+        );
+        assert_ne!(
+            first,
+            claude_code_cache_key(&first_key, "grok-4.6", "session-1")
+        );
+        assert_ne!(
+            first,
+            claude_code_cache_key(&second_key, "grok-4.5", "session-1")
+        );
+        assert!(first.starts_with("cc_"));
+        assert!(!first.contains("session-1"));
+    }
+
+    #[test]
+    fn extracts_claude_code_session_with_expected_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session-id",
+            "fallback-session".parse().expect("fallback header"),
+        );
+        let payload: Value = serde_json::from_slice(
+            br#"{
+            "metadata":{"user_id":"{\"device_id\":\"device-a\",\"session_id\":\"payload-session\"}"}
+        }"#,
+        )
+        .expect("payload JSON");
+        let body = payload.as_object().expect("payload object");
+        let payload_session =
+            match claude_code_session_id(&headers, body, WireFormat::ClaudeMessages) {
+                Ok(value) => value,
+                Err(_) => panic!("payload session should be valid"),
+            };
+        assert_eq!(payload_session.as_deref(), Some("payload-session"));
+
+        headers.insert(
+            CLAUDE_CODE_SESSION_HEADER,
+            "header-session".parse().expect("Claude session header"),
+        );
+        let header_session =
+            match claude_code_session_id(&headers, body, WireFormat::ClaudeMessages) {
+                Ok(value) => value,
+                Err(_) => panic!("header session should be valid"),
+            };
+        assert_eq!(header_session.as_deref(), Some("header-session"));
+    }
+
+    #[test]
+    fn extracts_legacy_session_and_rejects_bare_user_id() {
+        let headers = HeaderMap::new();
+        let legacy: Value = serde_json::from_slice(
+            br#"{"metadata":{"user_id":"user_account_session_123e4567-e89b-12d3-a456-426614174000"}}"#,
+        )
+        .expect("legacy JSON");
+        let legacy_session = match claude_code_session_id(
+            &headers,
+            legacy.as_object().expect("legacy object"),
+            WireFormat::ClaudeMessages,
+        ) {
+            Ok(value) => value,
+            Err(_) => panic!("legacy session should be valid"),
+        };
+        assert_eq!(
+            legacy_session.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        let bare: Value =
+            serde_json::from_slice(br#"{"metadata":{"user_id":"same-user-across-chats"}}"#)
+                .expect("bare JSON");
+        let bare_session = match claude_code_session_id(
+            &headers,
+            bare.as_object().expect("bare object"),
+            WireFormat::ClaudeMessages,
+        ) {
+            Ok(value) => value,
+            Err(_) => panic!("bare user ID should be ignored"),
+        };
+        assert_eq!(bare_session, None);
     }
 
     #[test]

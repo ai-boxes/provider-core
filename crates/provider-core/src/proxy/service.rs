@@ -84,13 +84,23 @@ impl ProxyService {
         user_id: &str,
         request: &ProxyRequest,
     ) -> Result<ProviderRouteCandidate, ProviderError> {
+        let native_formats = [
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChatCompletions,
+            WireFormat::ClaudeMessages,
+        ]
+        .into_iter()
+        .filter(|target| self.protocol.supports(request.format, *target))
+        .collect::<Vec<_>>();
         self.router
-            .routes(user_id, &request.model)
+            .routes(
+                user_id,
+                &request.model,
+                &native_formats,
+                request.metadata.session_id.as_deref(),
+            )
             .into_iter()
-            .find(|candidate| {
-                self.protocol
-                    .supports(request.format, candidate.route.native_format())
-            })
+            .next()
             .ok_or_else(|| {
                 ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
@@ -136,8 +146,15 @@ impl ProviderRouter for SingleProviderRouter {
         }
     }
 
-    fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate> {
-        if !self.access.allows(user_id) {
+    fn routes(
+        &self,
+        user_id: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        _session_id: Option<&str>,
+    ) -> Vec<ProviderRouteCandidate> {
+        if !self.access.allows(user_id) || !native_formats.contains(&self.provider.native_format())
+        {
             return Vec::new();
         }
         vec![ProviderRouteCandidate {

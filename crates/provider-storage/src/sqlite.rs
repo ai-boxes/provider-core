@@ -850,6 +850,27 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn revoke_user_sessions(
+        &self,
+        user_id: &UserId,
+        revoked_at: i64,
+    ) -> Result<u64, AuthRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE user_sessions
+            SET revoked_at = ?, updated_at = ?
+            WHERE user_id = ? AND revoked_at IS NULL
+            "#,
+        )
+        .bind(revoked_at)
+        .bind(revoked_at)
+        .bind(user_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to revoke user sessions", error))?;
+        Ok(result.rows_affected())
+    }
+
     async fn create_api_key(&self, key: NewApiKey) -> Result<bool, AuthRepositoryError> {
         let result = sqlx::query(
             r#"

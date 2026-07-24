@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use bytes::Bytes;
 use provider_core::{
     ProviderError, ProviderErrorKind, ProviderRequest, RequestMetadata, WireFormat,
@@ -39,13 +40,13 @@ pub(crate) fn prepare_request(
     let mut payload: Value = serde_json::from_slice(&request.payload).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "Codex Responses request body must be valid JSON",
+            "Grok Responses request body must be valid JSON",
         )
     })?;
     let body = payload.as_object_mut().ok_or_else(|| {
         ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "Codex Responses request body must be a JSON object",
+            "Grok Responses request body must be a JSON object",
         )
     })?;
 
@@ -57,6 +58,7 @@ pub(crate) fn prepare_request(
 
     normalize_tools(body);
     normalize_input(body);
+    normalize_reasoning(body);
 
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.session_id.as_deref()).or_else(|| {
@@ -160,6 +162,46 @@ fn normalize_input(body: &mut Map<String, Value>) {
     };
 
     input.retain_mut(normalize_input_item);
+}
+
+fn normalize_reasoning(body: &mut Map<String, Value>) {
+    let Some(Value::Array(input)) = body.get_mut("input") else {
+        return;
+    };
+    input.retain_mut(|item| {
+        let Some(item) = item.as_object_mut() else {
+            return true;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return true;
+        }
+        item.remove("status");
+        item.get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(is_grok_encrypted_content)
+    });
+}
+
+fn is_grok_encrypted_content(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed != value {
+        return false;
+    }
+    let value = trimmed;
+    if value.is_empty()
+        || value.len() > 8 * 1024 * 1024
+        || matches!(value.as_bytes().first(), Some(b'E' | b'R'))
+        || value.starts_with("gAAAA")
+        || value.contains('=')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    {
+        return false;
+    }
+    STANDARD_NO_PAD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() >= 50)
 }
 
 fn normalize_input_item(item: &mut Value) -> bool {
@@ -303,5 +345,40 @@ mod tests {
 
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
         assert!(!error.message().contains("do-not-echo"));
+    }
+
+    #[test]
+    fn drops_cross_provider_reasoning_signatures_and_keeps_grok_replay() {
+        let grok_signature = STANDARD_NO_PAD.encode([0x5a; 64]);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type":"summary_text","text":"Claude summary"}],
+                    "encrypted_content": "Eclaude-signature"
+                },
+                {
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type":"summary_text","text":"Grok summary"}],
+                    "encrypted_content": grok_signature
+                }
+            ]
+        }))
+        .expect("request JSON");
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: payload.into(),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("prepared request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+
+        assert_eq!(body["input"].as_array().expect("input").len(), 1);
+        assert_eq!(body["input"][0]["encrypted_content"], grok_signature);
+        assert_eq!(body["input"][0]["summary"][0]["text"], "Grok summary");
+        assert!(body["input"][0].get("status").is_none());
     }
 }
