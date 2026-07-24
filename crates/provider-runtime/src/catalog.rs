@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use provider_core::{
     AccountId, AccountProvisioningInput, AccountRepository, ManagedProviderDriver,
     NewProviderAccount, ProviderAccount, ProviderAccountAccess, ProviderAccountUpdate,
-    ProviderControl, ProviderControlError, ProviderKind, ProviderModel, ProviderQuotaControl,
-    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaObservation,
-    ProviderRouteCandidate, ProviderRouter, RefreshError, RefreshErrorKind, RefreshTrigger,
-    StartedProviderOAuth, StoredProviderAccount, StoredProviderModel,
+    ProviderControl, ProviderControlError, ProviderKind, ProviderQuotaControl, ProviderQuotaError,
+    ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaObservation, ProviderRouteCandidate,
+    ProviderRouter, RefreshError, RefreshErrorKind, RefreshTrigger, StartedProviderOAuth,
+    StoredProviderAccount, StoredProviderModel,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -299,7 +299,7 @@ impl ProviderControl for ProviderRuntimeCatalog {
 }
 
 impl ProviderRouter for ProviderRuntimeCatalog {
-    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+    fn models(&self, user_id: &str) -> Vec<provider_core::RoutableProviderModel> {
         self.inner.router.models(user_id)
     }
 

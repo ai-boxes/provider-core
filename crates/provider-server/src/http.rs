@@ -13,6 +13,9 @@ use provider_core::{
 };
 use provider_management::ProviderManager;
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+const CLAUDE_MODEL_PREFIX: &str = "claude-fable-5-dd-";
 
 #[derive(Clone)]
 struct AppState {
@@ -52,11 +55,88 @@ async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
-    let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
-    Ok(Json(json!({
-        "object": "list",
-        "data": state.service.models(key.owner_user_id.as_str())
-    })))
+    let protocol = models_protocol(&headers);
+    let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
+    let models = state.service.models(key.owner_user_id.as_str(), protocol);
+    Ok(Json(match protocol {
+        WireFormat::ClaudeMessages => claude_models_response(models),
+        WireFormat::OpenAiResponses | WireFormat::OpenAiChatCompletions => json!({
+            "object": "list",
+            "data": models
+        }),
+    }))
+}
+
+fn models_protocol(headers: &HeaderMap) -> WireFormat {
+    if headers
+        .get("anthropic-version")
+        .is_some_and(|value| !value.is_empty())
+        || headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("claude-cli"))
+    {
+        WireFormat::ClaudeMessages
+    } else {
+        WireFormat::OpenAiResponses
+    }
+}
+
+fn claude_models_response(models: Vec<provider_core::ProviderModel>) -> Value {
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let id = ensure_claude_model_id(&model.id);
+            let mut value = json!({
+                "id": id,
+                "type": "model",
+                "display_name": model.id,
+            });
+            if let Some(created_at) = model.created.and_then(format_timestamp) {
+                value["created_at"] = Value::String(created_at);
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(|model| model.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let last_id = data
+        .last()
+        .and_then(|model| model.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    })
+}
+
+fn format_timestamp(timestamp: u64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp(i64::try_from(timestamp).ok()?)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn ensure_claude_model_id(id: &str) -> String {
+    if id.starts_with("claude-") {
+        id.to_owned()
+    } else {
+        format!(
+            "{CLAUDE_MODEL_PREFIX}{}",
+            id.chars().rev().collect::<String>()
+        )
+    }
+}
+
+fn resolve_claude_model_id(id: &str) -> String {
+    id.strip_prefix(CLAUDE_MODEL_PREFIX)
+        .map_or_else(|| id.to_owned(), |encoded| encoded.chars().rev().collect())
 }
 
 async fn responses(
@@ -133,13 +213,26 @@ fn proxy_request(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<ProxyRequest, HttpError> {
-    let payload: Value = serde_json::from_slice(&body)
+    let mut payload: Value = serde_json::from_slice(&body)
         .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
     let model = payload
         .as_object()
         .and_then(|payload| payload.get("model"))
         .and_then(Value::as_str)
-        .ok_or_else(|| HttpError::invalid_request(protocol, "model must be a non-empty string"))?;
+        .ok_or_else(|| HttpError::invalid_request(protocol, "model must be a non-empty string"))?
+        .to_owned();
+
+    let model = if protocol == WireFormat::ClaudeMessages {
+        resolve_claude_model_id(&model)
+    } else {
+        model
+    };
+    let body = if payload["model"].as_str() == Some(model.as_str()) {
+        body
+    } else {
+        payload["model"] = Value::String(model.clone());
+        Bytes::from(serde_json::to_vec(&payload).map_err(|_| HttpError::internal(protocol))?)
+    };
 
     let request = ProxyRequest::new(protocol, model, body)
         .map_err(|error| HttpError::from_proxy_request(protocol, error))?;
@@ -440,6 +533,25 @@ mod tests {
         )
         .await;
         assert_eq!(models["data"][0]["id"], "grok-4.5");
+        assert_eq!(models["object"], "list");
+
+        let claude_models = response_json(
+            client
+                .get(format!("{base_url}/v1/models"))
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+                .expect("Claude models response"),
+        )
+        .await;
+        assert!(claude_models.get("object").is_none());
+        assert_eq!(claude_models["has_more"], false);
+        assert_eq!(claude_models["data"][0]["id"], "claude-fable-5-dd-5.4-korg");
+        assert_eq!(claude_models["data"][0]["type"], "model");
+        assert_eq!(claude_models["data"][0]["display_name"], "grok-4.5");
+        assert_eq!(claude_models["first_id"], claude_models["data"][0]["id"]);
+        assert_eq!(claude_models["last_id"], claude_models["data"][0]["id"]);
 
         for path in ["/v1/responses", "/v1/messages"] {
             let mut request = client
@@ -527,5 +639,37 @@ mod tests {
         assert_eq!(disabled_key.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
+    }
+
+    #[test]
+    fn detects_claude_model_catalog_requests() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(models_protocol(&headers), WireFormat::OpenAiResponses);
+
+        headers.insert(
+            header::USER_AGENT,
+            "claude-cli/2.1.0".parse().expect("header"),
+        );
+        assert_eq!(models_protocol(&headers), WireFormat::ClaudeMessages);
+
+        headers.remove(header::USER_AGENT);
+        headers.insert("anthropic-version", "2023-06-01".parse().expect("header"));
+        assert_eq!(models_protocol(&headers), WireFormat::ClaudeMessages);
+    }
+
+    #[test]
+    fn resolves_claude_catalog_model_ids_in_request_body() {
+        let request = match proxy_request(
+            WireFormat::ClaudeMessages,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"claude-fable-5-dd-5.4-korg","messages":[]}"#),
+        ) {
+            Ok(request) => request,
+            Err(_) => panic!("proxy request should be valid"),
+        };
+
+        assert_eq!(request.model, "grok-4.5");
+        let payload: Value = serde_json::from_slice(&request.payload).expect("request payload");
+        assert_eq!(payload["model"], "grok-4.5");
     }
 }

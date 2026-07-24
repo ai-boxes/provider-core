@@ -100,9 +100,15 @@ pub struct ProviderRouteCandidate {
     pub route: Arc<dyn ProviderRoute>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RoutableProviderModel {
+    pub model: ProviderModel,
+    pub native_formats: Vec<WireFormat>,
+}
+
 /// In-memory model index used before protocol conversion and provider execution.
 pub trait ProviderRouter: Send + Sync {
-    fn models(&self, user_id: &str) -> Vec<ProviderModel>;
+    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel>;
 
     fn routes(&self, user_id: &str, model: &str) -> Vec<ProviderRouteCandidate>;
 }

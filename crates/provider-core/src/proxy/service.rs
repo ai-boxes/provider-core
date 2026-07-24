@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::{
     ProtocolBridge, Provider, ProviderAccountAccess, ProviderError, ProviderErrorKind,
     ProviderModel, ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter,
-    ProviderStream, ProxyRequest, WireFormat,
+    ProviderStream, ProxyRequest, RoutableProviderModel, WireFormat,
 };
 
 /// Application service that delegates proxy operations to the active provider.
@@ -34,8 +34,18 @@ impl ProxyService {
     }
 
     #[must_use]
-    pub fn models(&self, user_id: &str) -> Vec<ProviderModel> {
-        self.router.models(user_id)
+    pub fn models(&self, user_id: &str, source_format: WireFormat) -> Vec<ProviderModel> {
+        self.router
+            .models(user_id)
+            .into_iter()
+            .filter(|model| {
+                model
+                    .native_formats
+                    .iter()
+                    .any(|target| self.protocol.supports(source_format, *target))
+            })
+            .map(|model| model.model)
+            .collect()
     }
 
     pub async fn execute_stream(
@@ -110,9 +120,17 @@ impl SingleProviderRouter {
 }
 
 impl ProviderRouter for SingleProviderRouter {
-    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel> {
         if self.access.allows(user_id) {
-            self.provider.models().to_vec()
+            self.provider
+                .models()
+                .iter()
+                .cloned()
+                .map(|model| RoutableProviderModel {
+                    model,
+                    native_formats: vec![self.provider.native_format()],
+                })
+                .collect()
         } else {
             Vec::new()
         }

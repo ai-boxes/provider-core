@@ -21,6 +21,7 @@ provider-storage.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use provider_core::{
     AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
     ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
-    ProviderVisibility, StoredProviderModel, WireFormat,
+    ProviderVisibility, RoutableProviderModel, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -148,7 +148,7 @@ impl ProviderModelRouter {
 }
 
 impl ProviderRouter for ProviderModelRouter {
-    fn models(&self, user_id: &str) -> Vec<ProviderModel> {
+    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel> {
         let mut models = BTreeMap::new();
         for account in self.account_snapshot().values() {
             if !account.access.allows(user_id)
@@ -162,7 +162,8 @@ impl ProviderRouter for ProviderModelRouter {
                 .filter(|model| model.enabled && model.available && model.routable)
             {
                 let effective_model = model.effective_model().to_owned();
-                models.entry(effective_model.clone()).or_insert_with(|| {
+                let native_format = account.route.native_format();
+                let entry = models.entry(effective_model.clone()).or_insert_with(|| {
                     let mut provider_model = serde_json::from_str::<ProviderModel>(
                         &model.metadata_json,
                     )
@@ -170,8 +171,14 @@ impl ProviderRouter for ProviderModelRouter {
                         ProviderModel::new(&effective_model, account.account.provider_name())
                     });
                     provider_model.id = effective_model;
-                    provider_model
+                    RoutableProviderModel {
+                        model: provider_model,
+                        native_formats: Vec::new(),
+                    }
                 });
+                if !entry.native_formats.contains(&native_format) {
+                    entry.native_formats.push(native_format);
+                }
             }
         }
         models.into_values().collect()
@@ -358,7 +365,8 @@ mod tests {
 
         let models = router.models("owner-a");
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "shared");
+        assert_eq!(models[0].model.id, "shared");
+        assert_eq!(models[0].native_formats, [WireFormat::OpenAiResponses]);
         assert!(router.routes("owner-a", "grok-imagine-image").is_empty());
 
         let routes = router.routes("owner-a", "shared");

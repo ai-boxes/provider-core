@@ -123,7 +123,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .header("content-type", "application/json")
         .body(
             json!({
-                "model": "grok-4.5",
+                "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
                 "max_tokens": 128,
                 "messages": [{ "role": "user", "content": "hello" }]
             })
@@ -143,6 +143,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     assert_eq!(captured.len(), 2);
     assert_eq!(captured[0]["model"], "grok-4.5");
     assert_eq!(captured[0]["stream"], true);
+    assert_eq!(captured[1]["model"], "grok-4.20-0309-non-reasoning");
     assert_eq!(captured[1]["input"][0]["role"], "user");
 
     runtime.shutdown();
