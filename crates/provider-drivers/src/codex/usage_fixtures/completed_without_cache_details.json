@@ -1,0 +1,13 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_no_cache_details",
+    "model": "gpt-5-codex",
+    "status": "completed",
+    "usage": {
+      "input_tokens": 512,
+      "output_tokens": 64,
+      "total_tokens": 576
+    }
+  }
+}

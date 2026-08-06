@@ -1,0 +1,16 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_conflict",
+    "model": "gpt-5-codex",
+    "status": "completed",
+    "usage": {
+      "input_tokens": 100,
+      "input_tokens_details": {
+        "cached_tokens": 250
+      },
+      "output_tokens": 32,
+      "total_tokens": 132
+    }
+  }
+}

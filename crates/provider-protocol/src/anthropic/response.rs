@@ -63,11 +63,17 @@ impl AnthropicStreamAdapter {
                 return None;
             }
             match self.upstream.next().await {
-                Some(Ok(chunk)) => {
-                    for data in self.decoder.push(&chunk) {
-                        self.convert_data(data);
+                Some(Ok(chunk)) => match self.decoder.push(&chunk) {
+                    Ok(frames) => {
+                        for data in frames {
+                            self.convert_data(data);
+                        }
                     }
-                }
+                    Err(_) => {
+                        self.upstream_finished = true;
+                        return Some(Err(crate::sse::frame_too_large_error()));
+                    }
+                },
                 Some(Err(error)) => {
                     self.upstream_finished = true;
                     return Some(Err(error));

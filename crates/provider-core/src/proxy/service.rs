@@ -53,6 +53,19 @@ impl ProxyService {
         user_id: &str,
         request: ProxyRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        self.execute_tracked_stream(user_id, request, None).await
+    }
+
+    /// Execute a request, reporting usage facts through `tracking`.
+    ///
+    /// Tracking is passed straight down to the route: the attempt boundary is
+    /// decided where upstream calls are actually made, not here.
+    pub async fn execute_tracked_stream(
+        &self,
+        user_id: &str,
+        request: ProxyRequest,
+        tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
+    ) -> Result<ProviderStream, ProviderError> {
         let route = self.resolve_route(user_id, &request)?;
         let mut request = request;
         request.model = route.upstream_model;
@@ -60,7 +73,7 @@ impl ProxyService {
             .protocol
             .prepare(request, route.route.native_format())?;
         let (request, response) = prepared.into_parts();
-        let stream = route.route.execute_stream(request).await?;
+        let stream = route.route.execute_stream(request, tracking).await?;
         Ok(response.translate_stream(stream))
     }
 
@@ -181,6 +194,9 @@ impl ProviderRoute for SingleProviderRoute {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        // A bare `Provider` has no account or established usage contract, so
+        // there is nothing to attribute an attempt to.
+        _tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         self.provider.execute_stream(request).await
     }

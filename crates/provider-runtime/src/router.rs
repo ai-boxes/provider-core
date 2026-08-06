@@ -312,9 +312,10 @@ impl ProviderRoute for RuntimeAccountRoute {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         self.runtime
-            .execute_stream_for(&self.account_id, request)
+            .execute_stream_for(&self.account_id, request, tracking)
             .await
     }
 
@@ -478,12 +479,15 @@ mod tests {
         for route in routes {
             let stream = route
                 .route
-                .execute_stream(ProviderRequest {
-                    format: WireFormat::OpenAiResponses,
-                    model: route.upstream_model,
-                    payload: bytes::Bytes::new(),
-                    metadata: RequestMetadata::default(),
-                })
+                .execute_stream(
+                    ProviderRequest {
+                        format: WireFormat::OpenAiResponses,
+                        model: route.upstream_model,
+                        payload: bytes::Bytes::new(),
+                        metadata: RequestMetadata::default(),
+                    },
+                    None,
+                )
                 .await
                 .expect("route stream");
             outputs.extend(

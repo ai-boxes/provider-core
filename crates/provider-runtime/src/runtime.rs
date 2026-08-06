@@ -15,13 +15,34 @@ use provider_core::{
     ProviderModel, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
     ProviderQuotaObservation, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind,
     RefreshOutcome, RefreshTrigger, WireFormat,
+    usage::{AttemptTracking, RequestTracking},
 };
+use provider_protocol::observe_responses_usage;
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore, mpsc},
     task::JoinSet,
 };
 use tokio_util::{sync::CancellationToken, time::DelayQueue};
+
+/// Attach usage observation to a stream, when the wire format is one we can read.
+///
+/// Only the OpenAI Responses observer exists so far, and only providers with an
+/// established usage contract report a profile — today just Codex, which is a
+/// Responses provider. The format check keeps a future provider on a different
+/// wire format from being silently mis-parsed: it gets an honest gap instead.
+fn observe_usage(
+    stream: ProviderStream,
+    attempt: Arc<dyn AttemptTracking>,
+    format: WireFormat,
+) -> ProviderStream {
+    if matches!(format, WireFormat::OpenAiResponses) {
+        return observe_responses_usage(stream, attempt);
+    }
+    attempt.observation_lost();
+    attempt.finished(None);
+    stream
+}
 
 const DEFAULT_REFRESH_CONCURRENCY: usize = 4;
 const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(30);
@@ -154,9 +175,10 @@ impl ProviderRuntime {
         &self,
         account_id: &AccountId,
         request: ProviderRequest,
+        tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.request_account(account_id).await?;
-        self.execute_entry(entry, request).await
+        self.execute_entry(entry, request, tracking).await
     }
 
     pub async fn count_tokens_for(
@@ -252,21 +274,67 @@ impl ProviderRuntime {
         &self,
         entry: Arc<AccountEntry>,
         request: ProviderRequest,
+        tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
 
-        match entry.account.execute_stream(first_request).await {
+        match self.execute_attempt(&entry, first_request, tracking).await {
             Err(error) if error.upstream_status() == Some(401) => {
                 let account_id = entry.account.account_id().clone();
                 let refresh = self
                     .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
                     .await;
                 self.report_refresh_result(account_id, &refresh);
+                // A failed refresh is not a model call, so it must not invent a
+                // second attempt.
                 refresh.map_err(refresh_provider_error)?;
-                entry.account.execute_stream(request).await
+                self.execute_attempt(&entry, request, tracking).await
             }
             result => result,
+        }
+    }
+
+    /// One real upstream call, and therefore exactly one tracked attempt.
+    ///
+    /// This is why tracking reaches into the runtime at all: the refresh retry
+    /// above makes a second upstream call, and only the code that decides to make
+    /// it can report it as a second attempt.
+    async fn execute_attempt(
+        &self,
+        entry: &AccountEntry,
+        request: ProviderRequest,
+        tracking: Option<&Arc<dyn RequestTracking>>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let format = request.format;
+        let attempt =
+            tracking
+                .zip(entry.account.usage_profile())
+                .and_then(|(tracking, profile)| {
+                    tracking.begin_attempt(
+                        profile,
+                        entry.account.account_id().as_str(),
+                        Some(request.model.as_str()),
+                    )
+                });
+
+        // A cancellation inside this await drops the attempt without a terminal
+        // call, which records an unprovable cancellation rather than guessing
+        // whether the request reached the upstream.
+        let result = entry.account.execute_stream(request).await;
+        let Some(attempt) = attempt else {
+            return result;
+        };
+
+        match result {
+            Ok(stream) => {
+                attempt.stream_opened();
+                Ok(observe_usage(stream, attempt, format))
+            }
+            Err(error) => {
+                attempt.failed(error.upstream_status().is_some());
+                Err(error)
+            }
         }
     }
 
@@ -352,7 +420,9 @@ impl Provider for ProviderRuntime {
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.selected_account().await?;
-        self.execute_entry(entry, request).await
+        // The bare `Provider` entry point picks any available account and carries
+        // no request identity, so there is nothing to attribute an attempt to.
+        self.execute_entry(entry, request, None).await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {

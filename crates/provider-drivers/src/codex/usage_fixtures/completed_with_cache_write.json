@@ -1,0 +1,17 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_unexpected_cache_write",
+    "model": "some-openai-compatible-model",
+    "status": "completed",
+    "usage": {
+      "input_tokens": 2048,
+      "input_tokens_details": {
+        "cached_tokens": 1024,
+        "cache_write_tokens": 512
+      },
+      "output_tokens": 64,
+      "total_tokens": 2112
+    }
+  }
+}

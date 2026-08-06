@@ -7,5 +7,7 @@ mod bridge;
 mod claude;
 mod openai_chat;
 mod sse;
+mod usage_observer;
 
 pub use bridge::DefaultProtocolBridge;
+pub use usage_observer::observe_responses_usage;

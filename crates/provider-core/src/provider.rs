@@ -86,9 +86,15 @@ pub trait ProviderRoute: Send + Sync {
 
     fn native_format(&self) -> WireFormat;
 
+    /// Execute the request, opening one tracked attempt per real upstream call.
+    ///
+    /// `tracking` is threaded down here rather than handled by the caller because
+    /// a refresh-and-retry happens inside this call: only the code that decides
+    /// to make a second upstream call can report it as a second attempt.
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError>;
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;

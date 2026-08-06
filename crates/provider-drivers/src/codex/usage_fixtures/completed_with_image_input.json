@@ -1,0 +1,20 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_image_input",
+    "model": "gpt-5-codex",
+    "status": "completed",
+    "usage": {
+      "input_tokens": 3200,
+      "input_tokens_details": {
+        "cached_tokens": 0,
+        "image_tokens": 1800
+      },
+      "output_tokens": 96,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 3296
+    }
+  }
+}

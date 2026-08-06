@@ -1,0 +1,8 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_no_usage",
+    "model": "gpt-5-codex",
+    "status": "completed"
+  }
+}

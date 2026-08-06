@@ -14,6 +14,7 @@ use provider_core::{
     ProviderQuotaError, ProviderQuotaFetch, ProviderQuotaObservation, ProviderQuotaSource,
     ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
     RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
+    usage::{CacheEligibility, PricingMode, ProviderUsageProfile},
 };
 
 use super::{
@@ -309,6 +310,18 @@ impl ProviderAccount for CodexAccount {
 
     fn account_id(&self) -> &AccountId {
         &self.account_id
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        // Codex is the one provider whose Responses usage shape has been pinned
+        // against real `response.completed` events, so it is the only one that
+        // reports a contract. Cache eligibility is fixed here because Codex
+        // always caches its prompt prefix; per-request eligibility arrives with
+        // the providers that let a request opt out.
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::Codex,
+            contract: super::codex_usage_contract(CacheEligibility::Eligible, PricingMode::Default),
+        })
     }
 
     fn runtime_state(&self) -> AccountRuntimeState {

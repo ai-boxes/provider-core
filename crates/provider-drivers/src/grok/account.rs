@@ -14,6 +14,7 @@ use provider_core::{
     ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaSource,
     ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
     RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, TokenCounter, WireFormat,
+    usage::{CacheEligibility, PricingMode, ProviderUsageProfile},
 };
 
 use super::{
@@ -502,6 +503,16 @@ impl ProviderAccount for GrokAccount {
 
     fn account_id(&self) -> &AccountId {
         &self.account_id
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        // Grok answers in the Responses shape, so the same extractor applies; what
+        // this contract asserts about those numbers, and how much of it is measured
+        // rather than inferred, is set out in `super::usage`.
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::Grok,
+            contract: super::grok_usage_contract(CacheEligibility::Eligible, PricingMode::Default),
+        })
     }
 
     fn runtime_state(&self) -> AccountRuntimeState {

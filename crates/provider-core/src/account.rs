@@ -393,6 +393,15 @@ pub trait ProviderAccount: Send + Sync {
         None
     }
 
+    /// How this provider's responses report usage.
+    ///
+    /// `None` means the wire contract has not been established from real
+    /// responses yet, so usage is not tracked for it. Guessing a contract would
+    /// produce confident numbers with no evidence behind them.
+    fn usage_profile(&self) -> Option<crate::usage::ProviderUsageProfile> {
+        None
+    }
+
     async fn execute_stream(
         &self,
         request: ProviderRequest,

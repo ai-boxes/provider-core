@@ -1,0 +1,19 @@
+{
+  "type": "response.completed",
+  "response": {
+    "id": "resp_fixture_cache_hit",
+    "model": "gpt-5-codex",
+    "status": "completed",
+    "usage": {
+      "input_tokens": 12480,
+      "input_tokens_details": {
+        "cached_tokens": 11776
+      },
+      "output_tokens": 320,
+      "output_tokens_details": {
+        "reasoning_tokens": 192
+      },
+      "total_tokens": 12800
+    }
+  }
+}
