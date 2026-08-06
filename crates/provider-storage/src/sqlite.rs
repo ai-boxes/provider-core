@@ -57,9 +57,15 @@ impl SqliteAccountRepository {
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub async fn in_memory() -> Result<Self, AccountRepositoryError> {
+        // `foreign_keys` must match `connect`: cascade deletes are part of the
+        // schema's meaning, so a test database without them would not be
+        // exercising the real one.
+        let options = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await
             .map_err(|error| repository_error("failed to open test SQLite database", error))?;
         MIGRATOR
@@ -67,6 +73,13 @@ impl SqliteAccountRepository {
             .await
             .map_err(|error| repository_error("failed to run test SQLite migrations", error))?;
         Ok(Self { pool })
+    }
+
+    /// Observed usage facts live in the same database, so they share this pool
+    /// rather than opening a second one.
+    #[must_use]
+    pub fn usage_repository(&self) -> crate::SqliteUsageRepository {
+        crate::usage::SqliteUsageRepository::new(self.pool.clone())
     }
 }
 

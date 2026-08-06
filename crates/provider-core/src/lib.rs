@@ -10,6 +10,7 @@ pub mod provider;
 pub mod proxy;
 pub mod quota;
 pub mod token_count;
+pub mod usage;
 
 pub use account::{
     AccountAuthState, AccountAuthStateError, AccountId, AccountIdError, AccountRepository,
@@ -42,3 +43,10 @@ pub use quota::{
     QuotaPeriodKind, QuotaScalar, QuotaUnit, merge_quota_groups,
 };
 pub use token_count::{TokenCountError, TokenCounter};
+pub use usage::{
+    BillableComponentCode, BillableObservation, BillableUnit, CacheCapability, CacheEligibility,
+    CacheHit, CacheReportingExpectation, NormalizationWarning, PricingContextBasis, PricingMode,
+    ProviderUsageObservation, RawUsageFields, TokenInclusionRules, TokenMetric, TokenUnknownReason,
+    TotalSource, UsageContractSnapshot, counts_in_reporting_coverage, hit_from_cache_read,
+    normalize_usage,
+};

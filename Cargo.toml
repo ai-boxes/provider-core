@@ -7,6 +7,7 @@ members = [
     "crates/provider-protocol",
     "crates/provider-runtime",
     "crates/provider-storage",
+    "crates/provider-usage",
     "crates/provider-server",
 ]
 default-members = ["crates/provider-server"]
@@ -34,10 +35,14 @@ provider-management = { path = "crates/provider-management" }
 provider-protocol = { path = "crates/provider-protocol" }
 provider-runtime = { path = "crates/provider-runtime" }
 provider-storage = { path = "crates/provider-storage" }
+provider-usage = { path = "crates/provider-usage" }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "stream", "form"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# `raw_value` keeps a JSON number's original digits reachable, so a catalog price
+# can be parsed to an exact integer instead of going through `f64` first. Unlike
+# `arbitrary_precision` it is purely additive and changes no existing behaviour.
+serde_json = { version = "1.0.150", features = ["raw_value"] }
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 thiserror = "2.0.18"

@@ -1,0 +1,284 @@
+//! Reading usage facts back out.
+//!
+//! Separate from [`crate::UsageRepository`] because the read side has different
+//! obligations than the write side, and two of them are load-bearing:
+//!
+//! 1. **Owner scoping is structural.** Every query takes a [`UsageScope`], so
+//!    there is no way to ask a question that spans users. A read that could
+//!    forget the filter would be an access-control bug waiting to happen.
+//! 2. **Nothing is silently totalled.** A complete estimate, the known part of a
+//!    partial one, and an unavailable one are three separate outputs. Adding them
+//!    together would present an incomplete number as a complete one.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+
+use crate::{
+    attempt::{LogicalStatus, TrackingState},
+    money::UsdAtoms,
+    repository::UsageRepositoryError,
+};
+
+/// Longest range a single query may cover.
+///
+/// Tied to the retention window rather than picked separately: a wider range
+/// would return silently truncated data that looks like a complete answer.
+pub const MAX_QUERY_RANGE: Duration = crate::retention::DEFAULT_RETENTION;
+
+/// A half-open UTC range, `[from, to)`, in unix milliseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimeRange {
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+impl TimeRange {
+    /// Reject a range that is empty, inverted, or wider than retention promises.
+    pub fn new(from_ms: i64, to_ms: i64) -> Result<Self, TimeRangeError> {
+        if to_ms <= from_ms {
+            return Err(TimeRangeError::Empty);
+        }
+        let span = i64::try_from(MAX_QUERY_RANGE.as_millis()).unwrap_or(i64::MAX);
+        if to_ms.saturating_sub(from_ms) > span {
+            return Err(TimeRangeError::TooWide);
+        }
+        Ok(Self { from_ms, to_ms })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeRangeError {
+    Empty,
+    TooWide,
+}
+
+/// Which usage a number describes. The two answer different questions and must
+/// never be presented as one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttributionBasis {
+    /// What the user's request consumed: the final attempt only. A retry that was
+    /// replaced is not something the user received.
+    UserFinalAttempt,
+    /// What this key caused upstream: every attempt that reached the provider,
+    /// retries included. This is the number that explains provider-side load.
+    KeyTriggeredConfirmedDispatch,
+}
+
+/// The scope of one query. Constructed per request, always with an owner.
+#[derive(Clone, Debug)]
+pub struct UsageScope {
+    pub owner_user_id: String,
+    /// Narrow to a single API key, when asked.
+    pub api_key_id: Option<String>,
+    pub range: TimeRange,
+    pub basis: AttributionBasis,
+}
+
+/// Bucket width for a series.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeriesBucket {
+    Hour,
+    Day,
+}
+
+impl SeriesBucket {
+    #[must_use]
+    pub const fn width_ms(self) -> i64 {
+        match self {
+            Self::Hour => 60 * 60 * 1000,
+            Self::Day => 24 * 60 * 60 * 1000,
+        }
+    }
+}
+
+/// Token sums over a scope.
+///
+/// Only known numbers are summed. `attempts_with_unknown_input` says how many
+/// attempts contributed nothing to `effective_input` because the provider did not
+/// report it — the count that stops a sum from being read as complete.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TokenTotals {
+    pub uncached_input: u64,
+    pub cache_read_input: u64,
+    pub cache_write_input: u64,
+    pub effective_input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub attempts_with_unknown_input: u64,
+}
+
+/// Cache behaviour over a scope, following the contract's three dimensions.
+///
+/// `hits + misses` counts only attempts that actually reported a cache read;
+/// `expected_but_unreported` is the rest of the denominator, and is not a miss.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheTotals {
+    /// Attempts where the contract supports caching, the request was eligible,
+    /// and a report was expected. Only these can have a meaningful hit rate.
+    pub coverage_denominator: u64,
+    pub hits: u64,
+    pub misses: u64,
+    /// In the denominator, but the provider reported no cache read.
+    pub expected_but_unreported: u64,
+    /// Outside the denominator: unsupported, ineligible, or not expected.
+    pub excluded: u64,
+}
+
+/// Cost over a scope, split by how trustworthy each part is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CostTotals {
+    /// Sum over attempts whose estimate covered every observed component.
+    pub complete_atoms: UsdAtoms,
+    pub complete_attempts: u64,
+    /// Sum of the *known* part of partial estimates, kept apart from
+    /// `complete_atoms` so a partial number is never read as a complete one.
+    pub partial_known_atoms: UsdAtoms,
+    pub partial_attempts: u64,
+    /// Attempts with no amount at all. Never rendered as `$0`.
+    pub unavailable_attempts: u64,
+}
+
+/// Everything an overview shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UsageOverview {
+    /// When this snapshot was read. Explains concurrent differences; it is not a
+    /// token that can be replayed for a consistent historical read.
+    pub as_of_ms: i64,
+    pub logical_requests: u64,
+    pub attempts: u64,
+    pub tokens: TokenTotals,
+    pub cache: CacheTotals,
+    pub cost: CostTotals,
+    /// Known bookkeeping losses overlapping the range. Their facts are missing
+    /// from every number above, and saying so is the only honest option.
+    pub tracking_gaps: u64,
+}
+
+/// One bucket of a series.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsageBucket {
+    pub bucket_start_ms: i64,
+    pub logical_requests: u64,
+    pub attempts: u64,
+    pub tokens: TokenTotals,
+    pub cost: CostTotals,
+}
+
+/// One row of the request list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestSummary {
+    pub request_id: String,
+    pub api_key_id: Option<String>,
+    pub client_model_raw: Option<String>,
+    pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub status: LogicalStatus,
+    pub tracking: TrackingState,
+    pub attempts: u64,
+    pub tokens: TokenTotals,
+    pub cost: CostTotals,
+}
+
+/// A stable position in the request list, ordered by `(completed_at DESC, id DESC)`.
+///
+/// Keyset rather than an offset, so a row arriving during paging cannot make the
+/// reader skip or repeat one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestCursor {
+    pub completed_at_ms: i64,
+    pub request_id: String,
+}
+
+/// A page of requests, plus where to continue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestPage {
+    pub requests: Vec<RequestSummary>,
+    /// `None` when the page reached the end of the range.
+    pub next: Option<RequestCursor>,
+}
+
+/// Largest page a caller may ask for. Also caps how many keys a summary returns:
+/// a bound that a real key list never reaches, but that keeps one query's cost
+/// predictable.
+pub const MAX_PAGE_SIZE: u32 = 200;
+
+/// One API key's totals over a scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeySummary {
+    /// `None` for requests recorded without a key, which the API keeps distinct
+    /// from a key literally named "none".
+    pub api_key_id: Option<String>,
+    pub logical_requests: u64,
+    pub attempts: u64,
+    pub tokens: TokenTotals,
+    pub cost: CostTotals,
+}
+
+#[async_trait]
+pub trait UsageQuery: Send + Sync {
+    /// Totals over the scope.
+    async fn overview(&self, scope: &UsageScope) -> Result<UsageOverview, UsageRepositoryError>;
+
+    /// The same totals per UTC bucket. Empty buckets are omitted rather than
+    /// returned as zeroes: nothing happened is not the same as nothing recorded.
+    async fn series(
+        &self,
+        scope: &UsageScope,
+        bucket: SeriesBucket,
+    ) -> Result<Vec<UsageBucket>, UsageRepositoryError>;
+
+    /// Totals per API key, busiest first.
+    ///
+    /// Capped at [`MAX_PAGE_SIZE`] keys; the cap is reported by the caller rather
+    /// than silently hiding the rest.
+    async fn key_summaries(
+        &self,
+        scope: &UsageScope,
+    ) -> Result<Vec<KeySummary>, UsageRepositoryError>;
+
+    /// One page of requests, newest first.
+    async fn requests(
+        &self,
+        scope: &UsageScope,
+        after: Option<&RequestCursor>,
+        limit: u32,
+    ) -> Result<RequestPage, UsageRepositoryError>;
+
+    /// One request's attempts, or `None` when it does not exist *for this owner* —
+    /// the two are deliberately indistinguishable to the caller.
+    async fn request_attempts(
+        &self,
+        scope: &UsageScope,
+        request_id: &str,
+    ) -> Result<Option<Vec<crate::repository::AttemptFacts>>, UsageRepositoryError>;
+}
+
+/// Recombine a cost sum that SQL had to split to stay exact.
+///
+/// `SUM(cost_atoms)` overflows a 64-bit accumulator at about `$92,233`, which a
+/// busy month can pass. Summing `atoms / 10^6` and `atoms % 10^6` separately keeps
+/// both accumulators far from the limit, and this puts the exact total back
+/// together with no rounding anywhere.
+#[must_use]
+pub const fn recombine_atoms(high: i64, low: i64) -> UsdAtoms {
+    UsdAtoms::from_atoms(high as i128 * ATOM_SPLIT + low as i128)
+}
+
+/// The divisor SQL splits a cost sum by. Must match [`recombine_atoms`].
+pub const ATOM_SPLIT: i128 = 1_000_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_must_be_non_empty_and_within_retention() {
+        assert!(TimeRange::new(0, 1).is_ok());
+        assert_eq!(TimeRange::new(5, 5), Err(TimeRangeError::Empty));
+        assert_eq!(TimeRange::new(5, 4), Err(TimeRangeError::Empty));
+        let span = i64::try_from(MAX_QUERY_RANGE.as_millis()).expect("span fits");
+        assert!(TimeRange::new(0, span).is_ok());
+        assert_eq!(TimeRange::new(0, span + 1), Err(TimeRangeError::TooWide));
+    }
+}

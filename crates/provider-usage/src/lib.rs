@@ -1,0 +1,65 @@
+//! Observed-usage facts: lifecycle status, price resolution and catalog cost.
+//!
+//! The shared vocabulary this builds on ([`provider_core::usage::TokenMetric`],
+//! [`provider_core::usage::UsageContractSnapshot`] and friends) lives in
+//! `provider-core` so drivers and the protocol layer can produce observations
+//! without depending on this crate. What lives here is everything downstream of
+//! an observation: attempt/logical status, money, price resolution and cost.
+//!
+//! Money is exact fixed-point throughout, and an absent price or quantity always
+//! degrades a cost to `partial`/`unavailable` — it is never rendered as zero.
+
+mod attempt;
+mod catalog;
+mod cost;
+mod lifecycle;
+mod money;
+mod price;
+mod query;
+mod refresh;
+mod repository;
+mod retention;
+#[cfg(test)]
+mod tests_support;
+mod tracking;
+mod writer;
+
+pub use attempt::{
+    AttemptSequence, DispatchEvidence, LogicalStatus, TrackingGapReason, TrackingState,
+};
+pub use catalog::{
+    CATALOG_FORMAT_VERSION, CATALOG_MAPPING_REVISION, CATALOG_PARSER_VERSION, CatalogParseError,
+    CatalogPrices, CatalogSnapshot, MAX_CATALOG_BYTES, catalog_provider_id, parse_unit_price,
+};
+pub use cost::{
+    CALCULATOR_VERSION, CostReason, CostStatus, ObservedCatalogCost, compute_observed_catalog_cost,
+};
+pub use lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal};
+pub use money::{AMOUNT_SCALE, PRICE_SCALE, UnitPrice, UsdAtoms, component_cost_atoms};
+pub use price::{ComponentPrices, InlinePriceRecord, PriceResolution};
+pub use query::{
+    ATOM_SPLIT, AttributionBasis, CacheTotals, CostTotals, KeySummary, MAX_PAGE_SIZE,
+    MAX_QUERY_RANGE, RequestCursor, RequestPage, RequestSummary, SeriesBucket, TimeRange,
+    TimeRangeError, TokenTotals, UsageBucket, UsageOverview, UsageQuery, UsageScope,
+    recombine_atoms,
+};
+pub use refresh::{
+    CatalogFetch, CatalogFetchError, CatalogRefresher, CatalogSource, DEFAULT_REFRESH_PERIOD,
+    MODELS_DEV_URL, RefreshOutcome, content_revision, reason,
+};
+pub use repository::{
+    AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome, StoredCatalog,
+    StoredLogicalRequest, UsageRepository, UsageRepositoryError,
+};
+pub use retention::{
+    DEFAULT_RETENTION, DEFAULT_RETENTION_BATCH, DEFAULT_RETENTION_PERIOD, RetentionReport,
+    RetentionWorker,
+};
+pub use tracking::{
+    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, NoCatalog, PriceResolver, UsageTracking,
+    system_clock_ms,
+};
+pub use writer::{
+    DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, SubmitOutcome, UsageFact, UsageWrite, UsageWriter,
+    gap_bucket,
+};
