@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -6,12 +8,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::{StreamExt, stream};
 use provider_auth::{ApiKeyAuthenticator, AuthService, AuthenticatedApiKey};
 use provider_core::{
-    ProviderError, ProviderErrorKind, ProxyRequest, ProxyRequestError, ProxyService,
-    RequestMetadata, WireFormat,
+    ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
+    ProxyService, RequestMetadata, WireFormat,
 };
 use provider_management::ProviderManager;
+use provider_usage::{
+    DeliveryOutcome, ExecutionOutcome, LogicalRequestStart, LogicalTracker, UsageTracking,
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -24,16 +30,31 @@ const CLAUDE_CODE_SESSION_SUFFIX: &str = "_session_";
 struct AppState {
     service: ProxyService,
     api_keys: ApiKeyAuthenticator,
+    /// `None` disables usage tracking entirely, which is how every path stays
+    /// working when there is no database to record into.
+    usage: Option<Arc<UsageTracking>>,
 }
 
 pub fn router(service: ProxyService, api_keys: ApiKeyAuthenticator) -> Router {
+    router_with_usage(service, api_keys, None)
+}
+
+pub fn router_with_usage(
+    service: ProxyService,
+    api_keys: ApiKeyAuthenticator,
+    usage: Option<Arc<UsageTracking>>,
+) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
-        .with_state(AppState { service, api_keys })
+        .with_state(AppState {
+            service,
+            api_keys,
+            usage,
+        })
 }
 
 pub fn router_with_management(
@@ -42,10 +63,26 @@ pub fn router_with_management(
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
 ) -> Router {
+    router_with_management_and_usage(service, manager, auth, api_keys, None)
+}
+
+pub fn router_with_management_and_usage(
+    service: ProxyService,
+    manager: ProviderManager,
+    auth: AuthService,
+    api_keys: ApiKeyAuthenticator,
+    usage: Option<crate::usage_http::UsageServices>,
+) -> Router {
     let auth_state =
         crate::auth_http::AuthHttpState::new(auth.clone(), api_keys.clone(), manager.clone());
-    let management = crate::auth_http::protect(crate::management_http::router(manager), auth);
-    router(service, api_keys)
+    let mut management = crate::management_http::router(manager);
+    if let Some(usage) = &usage {
+        // Behind the same session guard as the rest of management: usage is read
+        // by a logged-in person, never with a proxy API key.
+        management = management.merge(crate::usage_http::router(usage.clone()));
+    }
+    let management = crate::auth_http::protect(management, auth);
+    router_with_usage(service, api_keys, usage.map(|usage| usage.tracking))
         .merge(crate::auth_http::router(auth_state))
         .merge(management)
 }
@@ -148,14 +185,17 @@ async fn responses(
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
-    proxy_stream(
-        &state.service,
-        key.owner_user_id.as_str(),
-        WireFormat::OpenAiResponses,
-        &headers,
-        body,
-    )
-    .await
+    let (payload, logical) =
+        parse_tracked_payload(&state, &key, WireFormat::OpenAiResponses, &body).await?;
+    let request =
+        match proxy_request_from_payload(WireFormat::OpenAiResponses, &headers, body, payload) {
+            Ok(request) => request,
+            Err(error) => {
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                return Err(error);
+            }
+        };
+    proxy_prepared_stream(&state, &key, request, logical).await
 }
 
 async fn messages(
@@ -164,8 +204,22 @@ async fn messages(
     body: Bytes,
 ) -> Result<Response, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
-    let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
-    proxy_prepared_stream(&state.service, key.owner_user_id.as_str(), request).await
+    let (payload, logical) =
+        parse_tracked_payload(&state, &key, WireFormat::ClaudeMessages, &body).await?;
+    let request = match proxy_request_for_key_from_payload(
+        WireFormat::ClaudeMessages,
+        &headers,
+        body,
+        payload,
+        &key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(error);
+        }
+    };
+    proxy_prepared_stream(&state, &key, request, logical).await
 }
 
 async fn count_tokens(
@@ -184,43 +238,189 @@ async fn count_tokens(
     Ok(Json(json!({ "input_tokens": count })))
 }
 
-async fn proxy_stream(
-    service: &ProxyService,
-    user_id: &str,
-    protocol: WireFormat,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<Response, HttpError> {
-    let request = proxy_request(protocol, headers, body)?;
-    proxy_prepared_stream(service, user_id, request).await
-}
-
 async fn proxy_prepared_stream(
-    service: &ProxyService,
-    user_id: &str,
+    state: &AppState,
+    key: &AuthenticatedApiKey,
     request: ProxyRequest,
+    logical: Option<Arc<LogicalTracker>>,
 ) -> Result<Response, HttpError> {
     let protocol = request.format;
-    let stream = service
-        .execute_stream(user_id, request)
-        .await
-        .map_err(|error| HttpError::from_provider(protocol, error))?;
+    let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
 
+    let stream = match state
+        .service
+        .execute_tracked_stream(key.owner_user_id.as_str(), request, tracking.as_ref())
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(HttpError::from_provider(protocol, error));
+        }
+    };
+
+    let body = match logical {
+        Some(logical) => Body::from_stream(observe_delivery(stream, logical)),
+        None => Body::from_stream(stream),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
+        .body(body)
         .map_err(|_| HttpError::internal(protocol))
 }
 
+/// Parse the JSON envelope after authentication and create the logical request
+/// regardless of whether parsing succeeded. Authentication is the tracking
+/// boundary: a malformed request from a known key is still one user request.
+async fn parse_tracked_payload(
+    state: &AppState,
+    key: &AuthenticatedApiKey,
+    protocol: WireFormat,
+    body: &Bytes,
+) -> Result<(Value, Option<Arc<LogicalTracker>>), HttpError> {
+    match parse_payload(protocol, body) {
+        Ok(payload) => {
+            let client_model_raw = payload
+                .as_object()
+                .and_then(|payload| payload.get("model"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let routing_model = client_model_raw.as_deref().map(|model| {
+                if protocol == WireFormat::ClaudeMessages {
+                    resolve_claude_model_id(model)
+                } else {
+                    model.to_owned()
+                }
+            });
+            let logical = begin_tracking(state, key, client_model_raw, routing_model).await;
+            Ok((payload, logical))
+        }
+        Err(error) => {
+            let logical = begin_tracking(state, key, None, None).await;
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            Err(error)
+        }
+    }
+}
+
+fn finish_before_bytes(logical: Option<&Arc<LogicalTracker>>, execution: ExecutionOutcome) {
+    if let Some(logical) = logical {
+        logical.record_execution(execution);
+        logical.record_delivery(DeliveryOutcome::ErrorBeforeBytes);
+        logical.finish();
+    }
+}
+
+/// Record the start of a logical request, if usage is being tracked.
+///
+/// The write inside is the only tracking write on the request path, and it is
+/// fail-open: it cannot fail this function, so a broken database costs a gap in
+/// the statistics and nothing else.
+async fn begin_tracking(
+    state: &AppState,
+    key: &AuthenticatedApiKey,
+    client_model_raw: Option<String>,
+    routing_model: Option<String>,
+) -> Option<Arc<LogicalTracker>> {
+    let usage = state.usage.as_ref()?;
+    Some(
+        usage
+            .begin_request(LogicalRequestStart {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                owner_user_id: key.owner_user_id.to_string(),
+                api_key_id: Some(key.key_id.to_string()),
+                client_model_raw,
+                routing_model,
+                started_at_ms: provider_usage::system_clock_ms(),
+            })
+            .await,
+    )
+}
+
+/// Wrap the response body so the logical request learns how delivery ended.
+///
+/// This is the only place that can tell a clean end from a client that hung up,
+/// because both happen after the handler has already returned the response.
+fn observe_delivery(stream: ProviderStream, logical: Arc<LogicalTracker>) -> ProviderStream {
+    struct Delivery {
+        inner: Option<ProviderStream>,
+        logical: Arc<LogicalTracker>,
+        sent_bytes: bool,
+    }
+
+    impl Drop for Delivery {
+        fn drop(&mut self) {
+            // Closing the inner observer first lets it commit the attempt and
+            // final_attempt_id before the logical terminal snapshots them.
+            drop(self.inner.take());
+            self.logical.record_delivery(DeliveryOutcome::ClientDrop);
+            self.logical.finish();
+        }
+    }
+
+    Box::pin(stream::unfold(
+        Delivery {
+            inner: Some(stream),
+            logical,
+            sent_bytes: false,
+        },
+        |mut state| async move {
+            let item = match state.inner.as_mut() {
+                Some(inner) => inner.next().await,
+                None => return None,
+            };
+            match item {
+                Some(Ok(chunk)) => {
+                    state.sent_bytes = true;
+                    Some((Ok(chunk), state))
+                }
+                Some(Err(error)) => {
+                    // The body error is terminal to the downstream. Drop the
+                    // usage observer now so the attempt closes before logical.
+                    drop(state.inner.take());
+                    state
+                        .logical
+                        .record_execution(ExecutionOutcome::TranslatorOrStreamError);
+                    state.logical.record_delivery(if state.sent_bytes {
+                        DeliveryOutcome::ErrorAfterBytes
+                    } else {
+                        DeliveryOutcome::ErrorBeforeBytes
+                    });
+                    state.logical.finish();
+                    Some((Err(error), state))
+                }
+                None => {
+                    state.logical.record_delivery(DeliveryOutcome::CleanEof);
+                    None
+                }
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
 fn proxy_request(
     protocol: WireFormat,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<ProxyRequest, HttpError> {
-    let mut payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
+    let payload = parse_payload(protocol, &body)?;
+    proxy_request_from_payload(protocol, headers, body, payload)
+}
+
+fn parse_payload(protocol: WireFormat, body: &[u8]) -> Result<Value, HttpError> {
+    serde_json::from_slice(body)
+        .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))
+}
+
+fn proxy_request_from_payload(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+    mut payload: Value,
+) -> Result<ProxyRequest, HttpError> {
     let model = payload
         .as_object()
         .and_then(|payload| payload.get("model"))
@@ -251,7 +451,18 @@ fn proxy_request_for_key(
     body: Bytes,
     key: &AuthenticatedApiKey,
 ) -> Result<ProxyRequest, HttpError> {
-    let mut request = proxy_request(protocol, headers, body)?;
+    let payload = parse_payload(protocol, &body)?;
+    proxy_request_for_key_from_payload(protocol, headers, body, payload, key)
+}
+
+fn proxy_request_for_key_from_payload(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+    payload: Value,
+    key: &AuthenticatedApiKey,
+) -> Result<ProxyRequest, HttpError> {
+    let mut request = proxy_request_from_payload(protocol, headers, body, payload)?;
     if protocol == WireFormat::ClaudeMessages {
         let mut payload: Value = serde_json::from_slice(&request.payload)
             .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;

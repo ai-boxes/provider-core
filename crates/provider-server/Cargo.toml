@@ -9,8 +9,10 @@ name = "provider-core"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 provider-auth.workspace = true
 provider-core.workspace = true
 provider-drivers.workspace = true
@@ -18,18 +20,18 @@ provider-management.workspace = true
 provider-protocol.workspace = true
 provider-runtime.workspace = true
 provider-storage.workspace = true
+provider-usage.workspace = true
+reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
-futures-util.workspace = true
 provider-drivers = { workspace = true, features = ["test-util"] }
-reqwest.workspace = true
 provider-storage = { workspace = true, features = ["test-util"] }
 
 [lints]

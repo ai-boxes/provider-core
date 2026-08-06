@@ -9,15 +9,30 @@ use provider_drivers::{
 use provider_management::{ModelCatalogService, ProviderManager};
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
-use provider_storage::SqliteAccountRepository;
+use provider_storage::{InstanceGuard, SqliteAccountRepository};
+use provider_usage::{
+    CatalogPrices, CatalogRefresher, DEFAULT_REFRESH_PERIOD, DEFAULT_RETENTION,
+    DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, RetentionWorker, UsageRepository, UsageTracking,
+    UsageWriter, system_clock_ms,
+};
 use tokio::net::TcpListener;
 
 use crate::{
-    config::{DATABASE_PATH, LISTEN_ADDRESS},
-    router_with_management,
+    UsageServices,
+    catalog_source::HttpCatalogSource,
+    config::{CATALOG_SYNC_ENV, DATABASE_PATH, LISTEN_ADDRESS, catalog_sync_enabled},
+    router_with_management_and_usage,
 };
 
+/// How long shutdown waits for queued usage facts before giving up on them.
+const USAGE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub async fn run() -> Result<(), Box<dyn Error>> {
+    // Before anything touches the database. Startup recovery assumes any request
+    // still marked in-flight was left by a dead run, which only holds while this
+    // process is the only one using it. Held until the process exits.
+    let _instance = InstanceGuard::acquire(DATABASE_PATH)?;
+
     let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
     let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
@@ -47,16 +62,77 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
     let auth = AuthService::new(repository.clone());
     let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
+
+    // Usage facts share the accounts database. Anything a previous run left in
+    // flight has no knowable terminal, so it is closed as incomplete with a gap
+    // before this run records anything new.
+    let usage_repository = Arc::new(repository.usage_repository());
+    let recovered = usage_repository
+        .recover_in_flight_requests(unix_timestamp() * 1000)
+        .await?;
+    if recovered > 0 {
+        eprintln!("closed {recovered} usage request(s) left in flight by a previous run");
+    }
+    let writer = Arc::new(UsageWriter::spawn(
+        usage_repository.clone(),
+        DEFAULT_WRITE_QUEUE,
+    ));
+    // Price from whatever catalog is already stored before any fetch, so a
+    // restart does not lose cost estimates while it waits for the network.
+    let prices = Arc::new(CatalogPrices::new());
+    let refresher = Arc::new(CatalogRefresher::new(
+        usage_repository.clone(),
+        Arc::new(HttpCatalogSource::models_dev()?),
+        prices.clone(),
+        system_clock_ms,
+    ));
+    match refresher.install_stored().await {
+        Some(revision) => println!("price catalog {} loaded from storage", &revision[..12]),
+        None => println!("no stored price catalog yet; costs stay unavailable until one loads"),
+    }
+    if catalog_sync_enabled() {
+        tokio::spawn(Arc::clone(&refresher).run(DEFAULT_REFRESH_PERIOD));
+    } else {
+        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
+    }
+
+    // Raw facts expire on their own so the database does not grow without bound.
+    // In-flight requests are never touched, and each cycle deletes in small
+    // batches rather than one long transaction.
+    let retention = Arc::new(RetentionWorker::new(
+        usage_repository.clone(),
+        system_clock_ms,
+    ));
+    println!(
+        "usage retention keeps {} days of raw facts",
+        DEFAULT_RETENTION.as_secs() / 86_400
+    );
+    tokio::spawn(retention.run(DEFAULT_RETENTION_PERIOD));
+
+    let usage = UsageServices {
+        tracking: Arc::new(UsageTracking::new(
+            usage_repository.clone(),
+            writer.clone(),
+            prices.clone(),
+        )),
+        query: usage_repository.clone(),
+        repository: usage_repository,
+        catalog: prices,
+        writer: writer.clone(),
+    };
+
     let manager = ProviderManager::new(repository, runtime.clone());
     let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
 
     println!("provider-core listening on http://{LISTEN_ADDRESS}");
     let result = axum::serve(
         listener,
-        router_with_management(service, manager, auth, api_keys),
+        router_with_management_and_usage(service, manager, auth, api_keys, Some(usage)),
     )
     .await;
     runtime.shutdown();
+    // Best-effort: a slow database must not hold up shutdown.
+    writer.drain(USAGE_DRAIN).await;
     result?;
     Ok(())
 }
