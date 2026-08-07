@@ -92,21 +92,17 @@ pub struct TokenTotals {
     pub attempts_with_unknown_input: u64,
 }
 
-/// Cache behaviour over a scope, following the contract's three dimensions.
+/// Cache token totals over a scope.
 ///
-/// `hits + misses` counts only attempts that actually reported a cache read;
-/// `expected_but_unreported` is the rest of the denominator, and is not a miss.
+/// The denominator includes only attempts that reported both effective input
+/// and cache-read tokens. Missing cache detail is unknown, never a zero-token
+/// miss. This makes the displayed rate a token ratio rather than the share of
+/// requests that happened to contain any cache hit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheTotals {
-    /// Attempts where the contract supports caching, the request was eligible,
-    /// and a report was expected. Only these can have a meaningful hit rate.
-    pub coverage_denominator: u64,
-    pub hits: u64,
-    pub misses: u64,
-    /// In the denominator, but the provider reported no cache read.
-    pub expected_but_unreported: u64,
-    /// Outside the denominator: unsupported, ineligible, or not expected.
-    pub excluded: u64,
+    pub reported_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub attempts_with_unknown_cache: u64,
 }
 
 /// Cost over a scope, split by how trustworthy each part is.

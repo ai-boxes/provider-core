@@ -80,41 +80,21 @@ const TOTALS_COLUMNS: &str = r#"
     COALESCE(SUM(CASE WHEN a.cost_status = 'unavailable' THEN 1 ELSE 0 END), 0) AS unavailable_attempts
 "#;
 
-/// Cache columns, following the contract's three dimensions.
+/// Cache-token columns used to calculate the window hit rate.
 ///
-/// Coverage includes an attempt when a report was expected, *or* when a cache
-/// read value was actually observed. The latter matters for providers whose
-/// contract still says reporting is unknown but which do report on some calls:
-/// a known number is a hit or a miss, never an exclusion.
+/// Both sides of the ratio come from the same attempts. An absent cache count
+/// remains unknown and does not silently become a miss.
 const CACHE_COLUMNS: &str = r#"
-    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND (
-                    a.cache_reporting_expectation = 'expected'
-                    OR a.cache_read_input_tokens IS NOT NULL
-                  )
-        THEN 1 ELSE 0 END), 0) AS coverage_denominator,
-    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND (
-                    a.cache_reporting_expectation = 'expected'
-                    OR a.cache_read_input_tokens IS NOT NULL
-                  )
-              AND a.cache_read_input_tokens > 0
-        THEN 1 ELSE 0 END), 0) AS cache_hits,
-    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND (
-                    a.cache_reporting_expectation = 'expected'
-                    OR a.cache_read_input_tokens IS NOT NULL
-                  )
-              AND a.cache_read_input_tokens = 0
-        THEN 1 ELSE 0 END), 0) AS cache_misses,
-    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-              AND a.cache_read_input_tokens IS NULL
-        THEN 1 ELSE 0 END), 0) AS cache_unreported
+    COALESCE(SUM(CASE WHEN a.effective_input_tokens IS NOT NULL
+                           AND a.cache_read_input_tokens IS NOT NULL
+        THEN a.effective_input_tokens ELSE 0 END), 0) AS cache_reported_input,
+    COALESCE(SUM(CASE WHEN a.effective_input_tokens IS NOT NULL
+                           AND a.cache_read_input_tokens IS NOT NULL
+        THEN a.cache_read_input_tokens ELSE 0 END), 0) AS cache_read_input,
+    COALESCE(SUM(CASE WHEN a.id IS NOT NULL
+                           AND (a.effective_input_tokens IS NULL
+                                OR a.cache_read_input_tokens IS NULL)
+        THEN 1 ELSE 0 END), 0) AS cache_unknown_attempts
 "#;
 
 #[async_trait]
@@ -396,17 +376,17 @@ fn token_totals(row: &SqliteRow) -> Result<TokenTotals, UsageRepositoryError> {
 }
 
 fn cache_totals(row: &SqliteRow) -> Result<CacheTotals, UsageRepositoryError> {
-    let denominator = count(row, "coverage_denominator")?;
-    let attempts = count(row, "attempts")?;
-    let excluded = attempts
-        .checked_sub(denominator)
-        .ok_or_else(|| UsageRepositoryError::new("cache coverage exceeds the attempt count"))?;
+    let reported_input_tokens = count(row, "cache_reported_input")?;
+    let cache_read_input_tokens = count(row, "cache_read_input")?;
+    if cache_read_input_tokens > reported_input_tokens {
+        return Err(UsageRepositoryError::new(
+            "cache-read tokens exceed reported input tokens",
+        ));
+    }
     Ok(CacheTotals {
-        coverage_denominator: denominator,
-        hits: count(row, "cache_hits")?,
-        misses: count(row, "cache_misses")?,
-        expected_but_unreported: count(row, "cache_unreported")?,
-        excluded,
+        reported_input_tokens,
+        cache_read_input_tokens,
+        attempts_with_unknown_cache: count(row, "cache_unknown_attempts")?,
     })
 }
 
@@ -531,6 +511,7 @@ mod tests {
                 uncached_input_per_million: Some(UnitPrice::from_scaled(10i128.pow(PRICE_SCALE))),
                 ..ComponentPrices::default()
             },
+            context_tier: None,
             selected_tier: None,
             unmodeled_billable_component: false,
             unmodeled_pricing_rule: false,
@@ -790,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_coverage_separates_a_miss_from_an_unreported_read() {
+    async fn cache_rate_uses_tokens_and_excludes_unreported_cache_detail() {
         let repository = repository().await;
         let hit = Written::new("hit", "user-1", T0 + HOUR);
 
@@ -809,14 +790,9 @@ mod tests {
             .await
             .expect("overview")
             .cache;
-        assert_eq!(cache.coverage_denominator, 3);
-        assert_eq!(cache.hits, 1);
-        assert_eq!(cache.misses, 1, "a reported zero is a miss");
-        assert_eq!(
-            cache.expected_but_unreported, 1,
-            "an unreported read is not a miss"
-        );
-        assert_eq!(cache.excluded, 0);
+        assert_eq!(cache.reported_input_tokens, 240);
+        assert_eq!(cache.cache_read_input_tokens, 100);
+        assert_eq!(cache.attempts_with_unknown_cache, 1);
     }
 
     #[tokio::test]
@@ -832,14 +808,9 @@ mod tests {
             .await
             .expect("overview")
             .cache;
-        assert_eq!(cache.coverage_denominator, 1);
-        assert_eq!(
-            cache.hits, 1,
-            "a reported cache read is a hit even when expectation is unknown"
-        );
-        assert_eq!(cache.misses, 0);
-        assert_eq!(cache.expected_but_unreported, 0);
-        assert_eq!(cache.excluded, 0);
+        assert_eq!(cache.reported_input_tokens, 120);
+        assert_eq!(cache.cache_read_input_tokens, 100);
+        assert_eq!(cache.attempts_with_unknown_cache, 0);
     }
 
     #[tokio::test]
@@ -855,11 +826,9 @@ mod tests {
             .await
             .expect("overview")
             .cache;
-        assert_eq!(cache.coverage_denominator, 0);
-        assert_eq!(cache.hits, 0, "an excluded attempt cannot be a hit");
-        assert_eq!(cache.misses, 0, "an excluded attempt cannot be a miss");
-        assert_eq!(cache.expected_but_unreported, 0);
-        assert_eq!(cache.excluded, 1);
+        assert_eq!(cache.reported_input_tokens, 0);
+        assert_eq!(cache.cache_read_input_tokens, 0);
+        assert_eq!(cache.attempts_with_unknown_cache, 1);
     }
 
     #[tokio::test]

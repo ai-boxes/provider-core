@@ -1554,6 +1554,7 @@ mod tests {
                 output_per_million: Some(UnitPrice::from_scaled(10 * PER_MILLION)),
                 ..ComponentPrices::default()
             },
+            context_tier: None,
             selected_tier: Some("context_over_200k".to_owned()),
             unmodeled_billable_component: true,
             unmodeled_pricing_rule: true,
@@ -1748,6 +1749,7 @@ mod tests {
                 uncached_input_per_million: Some(awkward),
                 ..ComponentPrices::default()
             },
+            context_tier: None,
             selected_tier: None,
             unmodeled_billable_component: false,
             unmodeled_pricing_rule: false,

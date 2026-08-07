@@ -22,9 +22,10 @@ use axum::{
 };
 use provider_auth::AuthenticatedSession;
 use provider_usage::{
-    AttemptFacts, AttributionBasis, CacheTotals, CatalogPrices, CostStatus, CostTotals,
-    RequestCursor, RequestSummary, TimeRange, TimeRangeError, TokenTotals, UsageOverview,
-    UsageQuery, UsageRepository, UsageScope, UsageWriter, system_clock_ms,
+    AttemptFacts, AttributionBasis, CacheTotals, CatalogPrices, ComponentPrices, CostStatus,
+    CostTotals, RequestCursor, RequestSummary, TimeRange, TimeRangeError, TokenTotals, UnitPrice,
+    UsageOverview, UsageQuery, UsageRepository, UsageScope, UsageWriter, component_cost_atoms,
+    system_clock_ms,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -172,10 +173,22 @@ async fn request_detail(
         .await
         .map_err(|_| ApiError::internal())?
         .ok_or_else(ApiError::not_found)?;
+    let final_attempt_id = services
+        .repository
+        .load_logical_request(&request_id)
+        .await
+        .map_err(|_| ApiError::internal())?
+        .and_then(|request| request.final_attempt_id);
 
     Ok(data(json!({
         "request_id": request_id,
-        "attempts": attempts.iter().map(attempt_json).collect::<Vec<_>>(),
+        "attempts": attempts
+            .iter()
+            .map(|attempt| attempt_json(
+                attempt,
+                is_attributed_attempt(scope.basis, final_attempt_id.as_deref(), attempt),
+            ))
+            .collect::<Vec<_>>(),
     })))
 }
 
@@ -248,12 +261,9 @@ fn tokens_json(tokens: &TokenTotals) -> Value {
 
 fn cache_json(cache: &CacheTotals) -> Value {
     json!({
-        "coverage_denominator": cache.coverage_denominator,
-        "hits": cache.hits,
-        "misses": cache.misses,
-        // In the denominator but unreported. Counting these as misses would
-        // understate the hit rate.
-        "expected_but_unreported": cache.expected_but_unreported,
+        "reported_input_tokens": cache.reported_input_tokens,
+        "cache_read_input_tokens": cache.cache_read_input_tokens,
+        "attempts_with_unknown_cache": cache.attempts_with_unknown_cache,
     })
 }
 
@@ -299,10 +309,12 @@ fn normalized_filter(
         .transpose()
 }
 
-fn attempt_json(attempt: &AttemptFacts) -> Value {
+fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
     let observation = &attempt.observation;
+    let prices = selected_prices(attempt);
     json!({
         "attempt_id": attempt.attempt_id,
+        "attributed": attributed,
         "sequence": attempt.sequence.0,
         "provider": attempt.provider.as_str(),
         "configured_model": attempt.configured_model,
@@ -331,6 +343,20 @@ fn attempt_json(attempt: &AttemptFacts) -> Value {
                 .then(|| attempt.cost.total_known.to_decimal_string()),
             "reasons": attempt.cost.reasons.iter().map(name).collect::<Vec<_>>(),
             "calculator_version": attempt.cost.calculator_version,
+            "components": json!({
+                "input_usd": component_cost_json(
+                    observation.uncached_input_tokens,
+                    prices.and_then(|prices| prices.uncached_input_per_million),
+                ),
+                "output_usd": component_cost_json(
+                    observation.output_tokens,
+                    prices.and_then(|prices| prices.output_per_million),
+                ),
+                "cache_read_usd": component_cost_json(
+                    observation.cache_read_input_tokens,
+                    prices.and_then(|prices| prices.cache_read_per_million),
+                ),
+            }),
         }),
         "price": json!({
             // The tag of the resolution, without inlining the whole price record.
@@ -342,8 +368,61 @@ fn attempt_json(attempt: &AttemptFacts) -> Value {
                 .map(|record| record.catalog_revision.clone()),
             "catalog_model_id": attempt.price.resolved()
                 .map(|record| record.catalog_model_id.clone()),
+            "input_per_million_usd": price_json(
+                prices.and_then(|prices| prices.uncached_input_per_million),
+            ),
+            "output_per_million_usd": price_json(
+                prices.and_then(|prices| prices.output_per_million),
+            ),
+            "cache_read_per_million_usd": price_json(
+                prices.and_then(|prices| prices.cache_read_per_million),
+            ),
         }),
     })
+}
+
+fn is_attributed_attempt(
+    basis: AttributionBasis,
+    final_attempt_id: Option<&str>,
+    attempt: &AttemptFacts,
+) -> bool {
+    match basis {
+        AttributionBasis::UserFinalAttempt => final_attempt_id == Some(attempt.attempt_id.as_str()),
+        AttributionBasis::KeyTriggeredConfirmedDispatch => {
+            attempt.dispatch_evidence.is_confirmed_dispatch()
+        }
+    }
+}
+
+fn selected_prices(attempt: &AttemptFacts) -> Option<ComponentPrices> {
+    let record = attempt.price.resolved()?;
+    Some(match record.context_tier {
+        Some(tier)
+            if attempt.observation.pricing_context_tokens.known_value()
+                > Some(tier.threshold_tokens) =>
+        {
+            tier.prices
+        }
+        Some(_) | None => record.prices,
+    })
+}
+
+fn component_cost_json(
+    tokens: provider_core::usage::TokenMetric,
+    price: Option<UnitPrice>,
+) -> Value {
+    match (tokens.known_value(), price) {
+        (Some(tokens), Some(price)) => component_cost_atoms(tokens, price)
+            .map(|cost| Value::String(cost.to_decimal_string()))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+fn price_json(price: Option<UnitPrice>) -> Value {
+    price
+        .map(|price| Value::String(price.to_decimal_string()))
+        .unwrap_or(Value::Null)
 }
 
 /// Serialize a domain value for the API.
@@ -390,6 +469,176 @@ fn decode_cursor(raw: &str) -> Result<RequestCursor, ApiError> {
 
 fn data(value: Value) -> Json<Value> {
     Json(json!({ "data": value }))
+}
+
+#[cfg(test)]
+mod tests {
+    use provider_core::{
+        ProviderKind,
+        usage::{
+            CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
+            PricingMode, ProviderUsageObservation, TokenInclusionRules, TokenMetric, TotalSource,
+            UsageContractSnapshot,
+        },
+    };
+    use provider_usage::{
+        AttemptSequence, ContextPriceTier, DispatchEvidence, InlinePriceRecord, PRICE_SCALE,
+        PriceResolution, TrackingState, compute_observed_catalog_cost,
+    };
+
+    use super::*;
+
+    const PRICE_UNIT: i128 = 10i128.pow(PRICE_SCALE);
+
+    fn reported(value: u64) -> TokenMetric {
+        TokenMetric::ProviderReported { value }
+    }
+
+    fn contract() -> UsageContractSnapshot {
+        UsageContractSnapshot {
+            contract_version: 1,
+            normalization_version: 1,
+            inclusion: TokenInclusionRules {
+                input_includes_cache: false,
+                input_categories_mutually_exclusive: true,
+                reasoning_included_in_output: true,
+                reasoning_applicable: false,
+                audio_applicable: false,
+                cache_write_applicable: false,
+                total_source: TotalSource::Reported,
+            },
+            cache_capability: CacheCapability::Supported,
+            cache_eligibility: CacheEligibility::Eligible,
+            cache_reporting_expectation: CacheReportingExpectation::Expected,
+            pricing_context_basis: PricingContextBasis::EffectiveInput,
+            pricing_mode: PricingMode::Default,
+        }
+    }
+
+    fn attempt(dispatch_evidence: DispatchEvidence, pricing_context_tokens: u64) -> AttemptFacts {
+        let contract = contract();
+        let observation = ProviderUsageObservation {
+            uncached_input_tokens: reported(100),
+            cache_read_input_tokens: reported(50),
+            cache_write_input_tokens: TokenMetric::NotApplicable,
+            effective_input_tokens: reported(150),
+            output_tokens: reported(20),
+            reasoning_tokens: TokenMetric::NotApplicable,
+            input_audio_tokens: TokenMetric::NotApplicable,
+            output_audio_tokens: TokenMetric::NotApplicable,
+            total_tokens: reported(170),
+            pricing_context_tokens: reported(pricing_context_tokens),
+            billable: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let price = PriceResolution::Resolved(Box::new(InlinePriceRecord {
+            format_version: 1,
+            parser_version: 1,
+            catalog_revision: "catalog-test".to_owned(),
+            catalog_provider_id: "test-provider".to_owned(),
+            catalog_model_id: "test-model".to_owned(),
+            mapping_revision: 1,
+            prices: ComponentPrices {
+                uncached_input_per_million: Some(UnitPrice::from_scaled(2 * PRICE_UNIT)),
+                cache_read_per_million: Some(UnitPrice::from_scaled(PRICE_UNIT)),
+                output_per_million: Some(UnitPrice::from_scaled(6 * PRICE_UNIT)),
+                ..ComponentPrices::default()
+            },
+            context_tier: Some(ContextPriceTier {
+                threshold_tokens: 200,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(5 * PRICE_UNIT)),
+                    cache_read_per_million: Some(UnitPrice::from_scaled(PRICE_UNIT)),
+                    output_per_million: Some(UnitPrice::from_scaled(30 * PRICE_UNIT)),
+                    ..ComponentPrices::default()
+                },
+            }),
+            selected_tier: None,
+            unmodeled_billable_component: false,
+            unmodeled_pricing_rule: false,
+        }));
+        let cost = compute_observed_catalog_cost(&observation, &contract, &price);
+
+        AttemptFacts {
+            attempt_id: "attempt-2".to_owned(),
+            logical_request_id: "request-1".to_owned(),
+            sequence: AttemptSequence(2),
+            provider: ProviderKind::OpenAiCompatible,
+            account_id: "account-1".to_owned(),
+            configured_model: Some("test-model".to_owned()),
+            provider_reported_model: Some("test-model".to_owned()),
+            started_at_ms: 1,
+            first_token_at_ms: Some(2),
+            completed_at_ms: 3,
+            dispatch_evidence,
+            tracking: TrackingState::Complete,
+            contract,
+            observation,
+            price,
+            cost,
+        }
+    }
+
+    #[test]
+    fn attribution_matches_the_requested_basis() {
+        let dispatched = attempt(DispatchEvidence::ResponseObserved, 201);
+        assert!(is_attributed_attempt(
+            AttributionBasis::UserFinalAttempt,
+            Some("attempt-2"),
+            &dispatched,
+        ));
+        assert!(!is_attributed_attempt(
+            AttributionBasis::UserFinalAttempt,
+            Some("attempt-1"),
+            &dispatched,
+        ));
+        assert!(is_attributed_attempt(
+            AttributionBasis::KeyTriggeredConfirmedDispatch,
+            None,
+            &dispatched,
+        ));
+
+        let not_invoked = attempt(DispatchEvidence::NotInvoked, 201);
+        assert!(!is_attributed_attempt(
+            AttributionBasis::KeyTriggeredConfirmedDispatch,
+            None,
+            &not_invoked,
+        ));
+    }
+
+    #[test]
+    fn request_detail_uses_context_tier_prices_and_exact_component_costs() {
+        let value = attempt_json(&attempt(DispatchEvidence::ResponseObserved, 201), true);
+
+        assert_eq!(value["attributed"], true);
+        assert_eq!(value["price"]["input_per_million_usd"], "5.00000000");
+        assert_eq!(value["price"]["output_per_million_usd"], "30.00000000");
+        assert_eq!(value["cost"]["components"]["input_usd"], "0.00050000000000");
+        assert_eq!(
+            value["cost"]["components"]["output_usd"],
+            "0.00060000000000"
+        );
+        assert_eq!(
+            value["cost"]["components"]["cache_read_usd"],
+            "0.00005000000000"
+        );
+        assert_eq!(value["cost"]["usd"], "0.00115000000000");
+    }
+
+    #[test]
+    fn context_tier_is_strictly_above_its_threshold() {
+        let attempt = attempt(DispatchEvidence::ResponseObserved, 200);
+        let prices = selected_prices(&attempt).expect("resolved prices");
+
+        assert_eq!(
+            prices.uncached_input_per_million,
+            Some(UnitPrice::from_scaled(2 * PRICE_UNIT))
+        );
+        assert_eq!(
+            prices.output_per_million,
+            Some(UnitPrice::from_scaled(6 * PRICE_UNIT))
+        );
+    }
 }
 
 pub(crate) struct ApiError {

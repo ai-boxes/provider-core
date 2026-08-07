@@ -36,7 +36,7 @@ pub use cost::{
 };
 pub use lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal};
 pub use money::{AMOUNT_SCALE, PRICE_SCALE, UnitPrice, UsdAtoms, component_cost_atoms};
-pub use price::{ComponentPrices, InlinePriceRecord, PriceResolution};
+pub use price::{ComponentPrices, ContextPriceTier, InlinePriceRecord, PriceResolution};
 pub use query::{
     ATOM_SPLIT, AttributionBasis, CacheTotals, CostTotals, MAX_PAGE_SIZE, MAX_QUERY_RANGE,
     ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TimeRange, TimeRangeError,
