@@ -24,6 +24,13 @@ pub struct ComponentPrices {
     pub output_audio_per_million: Option<UnitPrice>,
 }
 
+/// A catalog context tier whose threshold and component prices are explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextPriceTier {
+    pub threshold_tokens: u64,
+    pub prices: ComponentPrices,
+}
+
 /// The price facts inlined onto an attempt. Enough to recompute and explain the
 /// cost on its own; it does not carry the whole catalog.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -36,13 +43,15 @@ pub struct InlinePriceRecord {
     pub catalog_model_id: String,
     pub mapping_revision: u32,
     pub prices: ComponentPrices,
+    /// Optional higher context tier selected from the observed pricing basis.
+    #[serde(default)]
+    pub context_tier: Option<ContextPriceTier>,
     /// Human-readable label of the selected context tier; `None` means base.
     pub selected_tier: Option<String>,
     /// A billable component was observed that the catalog cannot price.
     pub unmodeled_billable_component: bool,
-    /// The catalog entry carries a pricing rule this parser does not model — a
-    /// context tier, today — so `prices` are the base rates and a request that
-    /// crosses the rule's threshold costs more than they say.
+    /// The catalog entry carries a pricing rule this parser does not model, so
+    /// `prices` may not be the complete answer.
     ///
     /// Defaults to `false` so attempts stored before this field existed keep
     /// meaning exactly what they meant when written.

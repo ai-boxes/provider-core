@@ -438,6 +438,7 @@ impl AttemptTracker {
             let mut observation =
                 normalize_usage(state.raw_usage.take().flatten(), &self.spec.contract);
             if model_disagrees(
+                self.spec.provider,
                 self.spec.configured_model.as_deref(),
                 state.provider_reported_model.as_deref(),
             ) && !observation
@@ -622,11 +623,47 @@ impl AttemptTracking for AttemptTracker {
 /// Trimmed on both sides because drivers trim the model before sending it, so
 /// whitespace a client happened to include is not a disagreement. An unnamed
 /// model on either side is an absence, not a disagreement.
-fn model_disagrees(configured: Option<&str>, reported: Option<&str>) -> bool {
+fn model_disagrees(
+    provider: ProviderKind,
+    configured: Option<&str>,
+    reported: Option<&str>,
+) -> bool {
     matches!(
         (configured, reported),
-        (Some(configured), Some(reported)) if configured.trim() != reported.trim()
+        (Some(configured), Some(reported))
+            if !reported_model_matches(provider, configured.trim(), reported.trim())
     )
+}
+
+fn reported_model_matches(provider: ProviderKind, configured: &str, reported: &str) -> bool {
+    configured == reported
+        || (matches!(provider, ProviderKind::Grok)
+            && reported.strip_suffix("-build") == Some(configured))
+}
+
+#[cfg(test)]
+mod reported_model_tests {
+    use super::reported_model_matches;
+    use provider_core::ProviderKind;
+
+    #[test]
+    fn grok_build_suffix_is_the_same_reported_model() {
+        assert!(reported_model_matches(
+            ProviderKind::Grok,
+            "grok-4.5",
+            "grok-4.5-build",
+        ));
+        assert!(!reported_model_matches(
+            ProviderKind::Codex,
+            "gpt-5",
+            "gpt-5-build",
+        ));
+        assert!(!reported_model_matches(
+            ProviderKind::Grok,
+            "grok-4.5",
+            "grok-4.5-mini-build",
+        ));
+    }
 }
 
 const fn rank(evidence: DispatchEvidence) -> u8 {
@@ -699,6 +736,7 @@ mod tests {
                 output_per_million: Some(UnitPrice::from_scaled(10 * per_million)),
                 ..ComponentPrices::default()
             },
+            context_tier: None,
             selected_tier: None,
             unmodeled_billable_component: false,
             unmodeled_pricing_rule: false,

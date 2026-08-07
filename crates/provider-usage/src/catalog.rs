@@ -25,7 +25,7 @@ use serde_json::value::RawValue;
 
 use crate::{
     money::{PRICE_SCALE, UnitPrice},
-    price::{ComponentPrices, InlinePriceRecord, PriceResolution},
+    price::{ComponentPrices, ContextPriceTier, InlinePriceRecord, PriceResolution},
     tracking::PriceResolver,
 };
 
@@ -33,7 +33,7 @@ use crate::{
 pub const CATALOG_FORMAT_VERSION: u16 = 1;
 
 /// This parser's own version, bumped when its interpretation changes.
-pub const CATALOG_PARSER_VERSION: u16 = 1;
+pub const CATALOG_PARSER_VERSION: u16 = 2;
 
 /// The provider-to-catalog mapping's version, bumped when the mapping changes.
 pub const CATALOG_MAPPING_REVISION: u32 = 1;
@@ -70,10 +70,8 @@ pub const fn catalog_provider_id(kind: ProviderKind) -> Option<&'static str> {
 enum CatalogEntry {
     Priced {
         prices: Box<ComponentPrices>,
-        /// The entry also states a context tier. The base rates are still exact
-        /// below the tier's threshold, so they are kept and the attempt is marked
-        /// instead of being left unpriced.
-        tiered: bool,
+        context_tier: Option<ContextPriceTier>,
+        unmodeled_pricing_rule: bool,
     },
     /// The entry exists but carries no `cost` at all.
     NoCost,
@@ -105,10 +103,14 @@ impl CatalogSnapshot {
                 let entry = match model.cost {
                     None => CatalogEntry::NoCost,
                     Some(cost) => match component_prices(&cost) {
-                        Some(prices) => CatalogEntry::Priced {
-                            prices: Box::new(prices),
-                            tiered: cost.states_a_tier(),
-                        },
+                        Some(prices) => {
+                            let (context_tier, unmodeled_pricing_rule) = parse_context_tier(&cost);
+                            CatalogEntry::Priced {
+                                prices: Box::new(prices),
+                                context_tier,
+                                unmodeled_pricing_rule,
+                            }
+                        }
                         None => CatalogEntry::Invalid,
                     },
                 };
@@ -163,7 +165,11 @@ impl CatalogSnapshot {
         match entry {
             CatalogEntry::NoCost => PriceResolution::CostMissing,
             CatalogEntry::Invalid => PriceResolution::CatalogEntryInvalid,
-            CatalogEntry::Priced { prices, tiered } => {
+            CatalogEntry::Priced {
+                prices,
+                context_tier,
+                unmodeled_pricing_rule,
+            } => {
                 PriceResolution::Resolved(Box::new(InlinePriceRecord {
                     format_version: CATALOG_FORMAT_VERSION,
                     parser_version: CATALOG_PARSER_VERSION,
@@ -172,13 +178,14 @@ impl CatalogSnapshot {
                     catalog_model_id: model.to_owned(),
                     mapping_revision: CATALOG_MAPPING_REVISION,
                     prices: **prices,
+                    context_tier: *context_tier,
                     // No tier is ever *selected*: the document states two
                     // thresholds for the same model and they disagree, so picking
                     // one would be a guess. `unmodeled_pricing_rule` is what
                     // carries that forward, and it makes the cost partial.
                     selected_tier: None,
                     unmodeled_billable_component: false,
-                    unmodeled_pricing_rule: *tiered,
+                    unmodeled_pricing_rule: *unmodeled_pricing_rule,
                 }))
             }
         }
@@ -265,14 +272,100 @@ struct RawCost {
 }
 
 impl RawCost {
-    /// Whether this entry prices some requests differently from the base rates.
-    fn states_a_tier(&self) -> bool {
+    fn has_tier_rule(&self) -> bool {
         [self.tiers.as_deref(), self.context_over_200k.as_deref()]
             .into_iter()
             .flatten()
-            // An explicit `null` states nothing.
             .any(|raw| raw.get().trim() != "null")
     }
+}
+
+#[derive(Deserialize)]
+struct RawTierCost {
+    input: Option<Box<RawValue>>,
+    output: Option<Box<RawValue>>,
+    reasoning: Option<Box<RawValue>>,
+    cache_read: Option<Box<RawValue>>,
+    cache_write: Option<Box<RawValue>>,
+    input_audio: Option<Box<RawValue>>,
+    output_audio: Option<Box<RawValue>>,
+    tier: RawTierSelector,
+}
+
+#[derive(Deserialize)]
+struct RawTierSelector {
+    #[serde(rename = "type")]
+    kind: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct RawContextCost {
+    input: Option<Box<RawValue>>,
+    output: Option<Box<RawValue>>,
+    reasoning: Option<Box<RawValue>>,
+    cache_read: Option<Box<RawValue>>,
+    cache_write: Option<Box<RawValue>>,
+    input_audio: Option<Box<RawValue>>,
+    output_audio: Option<Box<RawValue>>,
+}
+
+fn parse_context_tier(cost: &RawCost) -> (Option<ContextPriceTier>, bool) {
+    if !cost.has_tier_rule() {
+        return (None, false);
+    }
+
+    let tier = cost.tiers.as_deref().and_then(|raw| {
+        let tiers: Vec<RawTierCost> = serde_json::from_str(raw.get()).ok()?;
+        let [tier] = tiers.as_slice() else {
+            return None;
+        };
+        if tier.tier.kind != "context" {
+            return None;
+        }
+        Some(ContextPriceTier {
+            threshold_tokens: tier.tier.size,
+            prices: component_prices_from_tier(tier)?,
+        })
+    });
+    let legacy = cost.context_over_200k.as_deref().and_then(|raw| {
+        let value: RawContextCost = serde_json::from_str(raw.get()).ok()?;
+        Some(ContextPriceTier {
+            threshold_tokens: 200_000,
+            prices: component_prices_from_context(&value)?,
+        })
+    });
+
+    match (tier, legacy) {
+        (Some(tier), Some(legacy)) if tier == legacy => (Some(tier), false),
+        (Some(tier), None) if cost.context_over_200k.is_none() => (Some(tier), false),
+        (None, Some(legacy)) if cost.tiers.is_none() => (Some(legacy), false),
+        _ => (None, true),
+    }
+}
+
+fn component_prices_from_tier(cost: &RawTierCost) -> Option<ComponentPrices> {
+    component_prices_from_fields(
+        cost.input.as_deref(),
+        cost.output.as_deref(),
+        cost.reasoning.as_deref(),
+        cost.cache_read.as_deref(),
+        cost.cache_write.as_deref(),
+        cost.input_audio.as_deref(),
+        cost.output_audio.as_deref(),
+    )
+}
+
+fn component_prices_from_context(cost: &RawContextCost) -> Option<ComponentPrices> {
+    component_prices_from_fields(
+        cost.input.as_deref(),
+        cost.output.as_deref(),
+        cost.reasoning.as_deref(),
+        cost.cache_read.as_deref(),
+        cost.cache_write.as_deref(),
+        cost.input_audio.as_deref(),
+        cost.output_audio.as_deref(),
+    )
 }
 
 /// Convert a cost block, or `None` if any present value is unreadable.
@@ -281,16 +374,36 @@ impl RawCost {
 /// the whole entry invalid, because silently ignoring it would under-report cost
 /// while still looking complete.
 fn component_prices(cost: &RawCost) -> Option<ComponentPrices> {
+    component_prices_from_fields(
+        cost.input.as_deref(),
+        cost.output.as_deref(),
+        cost.reasoning.as_deref(),
+        cost.cache_read.as_deref(),
+        cost.cache_write.as_deref(),
+        cost.input_audio.as_deref(),
+        cost.output_audio.as_deref(),
+    )
+}
+
+fn component_prices_from_fields(
+    input: Option<&RawValue>,
+    output: Option<&RawValue>,
+    reasoning: Option<&RawValue>,
+    cache_read: Option<&RawValue>,
+    cache_write: Option<&RawValue>,
+    input_audio: Option<&RawValue>,
+    output_audio: Option<&RawValue>,
+) -> Option<ComponentPrices> {
     Some(ComponentPrices {
         // models.dev `input` is the standard, uncached input rate; `cache_read`
         // is the discounted rate for the cached portion.
-        uncached_input_per_million: optional_price(cost.input.as_deref())?,
-        cache_read_per_million: optional_price(cost.cache_read.as_deref())?,
-        cache_write_per_million: optional_price(cost.cache_write.as_deref())?,
-        output_per_million: optional_price(cost.output.as_deref())?,
-        reasoning_per_million: optional_price(cost.reasoning.as_deref())?,
-        input_audio_per_million: optional_price(cost.input_audio.as_deref())?,
-        output_audio_per_million: optional_price(cost.output_audio.as_deref())?,
+        uncached_input_per_million: optional_price(input)?,
+        cache_read_per_million: optional_price(cache_read)?,
+        cache_write_per_million: optional_price(cache_write)?,
+        output_per_million: optional_price(output)?,
+        reasoning_per_million: optional_price(reasoning)?,
+        input_audio_per_million: optional_price(input_audio)?,
+        output_audio_per_million: optional_price(output_audio)?,
     })
 }
 
@@ -412,6 +525,19 @@ mod tests {
                   "tier": { "type": "context", "size": 272000 } }
               ],
               "context_over_200k": { "input": 10, "output": 45, "cache_read": 1 }
+            }
+          },
+          "consistent-tier": {
+            "id": "consistent-tier",
+            "cost": {
+              "input": 2,
+              "output": 6,
+              "cache_read": 0.3,
+              "tiers": [
+                { "input": 4, "output": 12, "cache_read": 0.6,
+                  "tier": { "type": "context", "size": 200000 } }
+              ],
+              "context_over_200k": { "input": 4, "output": 12, "cache_read": 0.6 }
             }
           }
         }
@@ -540,6 +666,63 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_consistent_context_tier_is_selected_from_observed_tokens() {
+        let resolution = snapshot().resolve(ProviderKind::Codex, Some("consistent-tier"));
+        let record = resolution.resolved().expect("tiered price resolves");
+        assert_eq!(
+            record.context_tier,
+            Some(ContextPriceTier {
+                threshold_tokens: 200_000,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(4 * PER_MILLION)),
+                    cache_read_per_million: Some(UnitPrice::from_scaled(6 * PER_MILLION / 10)),
+                    output_per_million: Some(UnitPrice::from_scaled(12 * PER_MILLION)),
+                    ..ComponentPrices::default()
+                },
+            })
+        );
+        assert!(!record.unmodeled_pricing_rule);
+
+        let contract = codex_like_contract();
+        let below = normalize_usage(
+            Some(RawUsageFields {
+                input: Some(200_000),
+                cache_read: Some(0),
+                output: Some(0),
+                ..RawUsageFields::default()
+            }),
+            &contract,
+        );
+        let above = normalize_usage(
+            Some(RawUsageFields {
+                input: Some(200_001),
+                cache_read: Some(0),
+                output: Some(0),
+                ..RawUsageFields::default()
+            }),
+            &contract,
+        );
+        let below_cost = compute_observed_catalog_cost(&below, &contract, &resolution);
+        let above_cost = compute_observed_catalog_cost(&above, &contract, &resolution);
+        assert_eq!(
+            below_cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        );
+        assert_eq!(
+            above_cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        );
+        assert_eq!(
+            below_cost.total_known.to_decimal_string(),
+            "0.40000000000000"
+        );
+        assert_eq!(
+            above_cost.total_known.to_decimal_string(),
+            "0.80000400000000"
+        );
+    }
+
+    #[test]
     fn a_price_that_cannot_be_held_exactly_is_refused_not_rounded() {
         // Nine fractional digits would have to be truncated, changing every cost
         // computed from it.
@@ -570,8 +753,8 @@ mod tests {
             snapshot.resolve(ProviderKind::Codex, Some("claude-4")),
             PriceResolution::ModelMappingMissing
         );
-        // Five models are listed; `listed-without-cost` and `unreadable-cost`
+        // Six models are listed; `listed-without-cost` and `unreadable-cost`
         // carry no price the parser accepted.
-        assert_eq!(snapshot.priced_model_count(), 3);
+        assert_eq!(snapshot.priced_model_count(), 4);
     }
 }

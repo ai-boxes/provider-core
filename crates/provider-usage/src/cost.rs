@@ -16,7 +16,7 @@ use crate::price::PriceResolution;
 
 /// Version of the cost calculator; stored with each attempt so a historical cost
 /// is reproducible under the same rules.
-pub const CALCULATOR_VERSION: u16 = 1;
+pub const CALCULATOR_VERSION: u16 = 2;
 
 /// Completeness of a catalog cost estimate. Never implies a provider invoice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,7 +160,13 @@ pub fn compute_observed_catalog_cost(
         }
     };
 
-    let prices = &record.prices;
+    let prices = match record.context_tier {
+        Some(tier) => match observation.pricing_context_tokens.known_value() {
+            Some(tokens) if tokens > tier.threshold_tokens => tier.prices,
+            Some(_) | None => record.prices,
+        },
+        None => record.prices,
+    };
     // Reasoning that the contract says is already inside `output_tokens` must not
     // be priced again, even when the catalog carries a separate reasoning price.
     let reasoning_tokens = if contract.inclusion.reasoning_included_in_output {
@@ -221,6 +227,9 @@ pub fn compute_observed_catalog_cost(
         // on. Partial is the only honest status: the amount is real but it is a
         // floor, not the answer.
         push_unique(&mut reasons, CostReason::PricingRuleUnsupported);
+    }
+    if record.context_tier.is_some() && observation.pricing_context_tokens.known_value().is_none() {
+        push_unique(&mut reasons, CostReason::TierBasisUnavailable);
     }
     if observation
         .warnings
@@ -295,6 +304,7 @@ mod tests {
             catalog_model_id: "gpt-x".to_owned(),
             mapping_revision: 1,
             prices,
+            context_tier: None,
             selected_tier: None,
             unmodeled_billable_component: false,
             unmodeled_pricing_rule: false,
