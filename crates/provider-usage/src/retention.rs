@@ -69,7 +69,8 @@ impl RetentionWorker {
     /// The instant before which facts are no longer kept.
     #[must_use]
     pub fn cutoff_ms(&self) -> i64 {
-        let window = i64::try_from(self.retention.as_millis()).unwrap_or(i64::MAX);
+        let window = i64::try_from(self.retention.as_millis())
+            .expect("usage retention window must fit i64 milliseconds");
         (self.now_ms)().saturating_sub(window)
     }
 

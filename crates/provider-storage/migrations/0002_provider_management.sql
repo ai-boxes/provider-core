@@ -4,7 +4,7 @@ CHECK (json_valid(config_json));
 
 ALTER TABLE provider_credentials
 ADD COLUMN credential_kind TEXT NOT NULL DEFAULT 'oauth'
-CHECK (credential_kind IN ('oauth', 'api_key', 'none'));
+CHECK (credential_kind IN ('oauth', 'api_key'));
 
 CREATE TABLE provider_models (
     account_id TEXT NOT NULL,

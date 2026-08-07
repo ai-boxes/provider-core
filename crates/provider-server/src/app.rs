@@ -1,6 +1,6 @@
 use std::{error::Error, sync::Arc};
 
-use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_auth::{ApiKeyAuthenticator, ApiKeyId, AuthService};
 use provider_core::{AccountRepository, ProviderControl, ProxyService};
 use provider_drivers::{
     anthropic_compatible::AnthropicCompatibleDriver, codex::CodexDriver, grok::GrokDriver,
@@ -12,15 +12,15 @@ use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{InstanceGuard, SqliteAccountRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, DEFAULT_REFRESH_PERIOD, DEFAULT_RETENTION,
-    DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, RetentionWorker, UsageRepository, UsageTracking,
-    UsageWriter, system_clock_ms,
+    DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, RetentionWorker, SpendObserver, UsageRepository,
+    UsageTracking, UsageWriter, system_clock_ms,
 };
 use tokio::net::TcpListener;
 
 use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
-    config::{CATALOG_SYNC_ENV, DATABASE_PATH, LISTEN_ADDRESS, catalog_sync_enabled},
+    config::{CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address},
     router_with_management_and_usage,
 };
 
@@ -77,6 +77,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         usage_repository.clone(),
         DEFAULT_WRITE_QUEUE,
     ));
+    let spend_observer: SpendObserver = {
+        let api_keys = api_keys.clone();
+        Arc::new(move |api_key_id, atoms| {
+            if let Ok(api_key_id) = ApiKeyId::new(api_key_id.to_owned()) {
+                api_keys.record_spend(&api_key_id, atoms);
+            }
+        })
+    };
     // Price from whatever catalog is already stored before any fetch, so a
     // restart does not lose cost estimates while it waits for the network.
     let prices = Arc::new(CatalogPrices::new());
@@ -110,10 +118,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     tokio::spawn(retention.run(DEFAULT_RETENTION_PERIOD));
 
     let usage = UsageServices {
-        tracking: Arc::new(UsageTracking::new(
+        tracking: Arc::new(UsageTracking::with_spend_observer(
             usage_repository.clone(),
             writer.clone(),
             prices.clone(),
+            spend_observer,
         )),
         query: usage_repository.clone(),
         repository: usage_repository,
@@ -122,9 +131,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let manager = ProviderManager::new(repository, runtime.clone());
-    let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
+    let listen_address = listen_address();
+    let listener = TcpListener::bind(&listen_address).await?;
 
-    println!("provider-core listening on http://{LISTEN_ADDRESS}");
+    println!("provider-core listening on http://{listen_address}");
     let result = axum::serve(
         listener,
         router_with_management_and_usage(service, manager, auth, api_keys, Some(usage)),

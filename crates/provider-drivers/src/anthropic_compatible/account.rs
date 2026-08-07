@@ -77,6 +77,7 @@ impl ManagedProviderDriver for AnthropicCompatibleDriver {
         let AccountProvisioningInput::Direct {
             id,
             label,
+            group_label,
             config_json,
             api_key,
         } = input
@@ -92,6 +93,7 @@ impl ManagedProviderDriver for AnthropicCompatibleDriver {
             id,
             provider: ProviderKind::AnthropicCompatible,
             label,
+            group_label,
             config_json: config.to_json()?,
             enabled: true,
             credential: NewCredential {
@@ -179,17 +181,15 @@ impl ProviderAccount for AnthropicCompatibleAccount {
                 "Anthropic-compatible account received an unsupported native format",
             ));
         }
-        let mut upstream = self
+        let upstream = self
             .driver
             .http
             .post(format!("{}/messages", self.config.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("x-api-key", self.credentials.api_key.expose_secret())
             .body(request.payload);
-        if let Some(api_key) = self.credentials.api_key.as_ref() {
-            upstream = upstream.header("x-api-key", api_key.expose_secret());
-        }
         let response = upstream.send().await.map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,
@@ -225,16 +225,14 @@ impl ProviderAccount for AnthropicCompatibleAccount {
     }
 
     async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
-        let mut request = self
+        let request = self
             .driver
             .http
             .get(format!("{}/models", self.config.base_url))
             .timeout(Duration::from_secs(10))
             .header(reqwest::header::ACCEPT, "application/json")
-            .header("anthropic-version", ANTHROPIC_VERSION);
-        if let Some(api_key) = self.credentials.api_key.as_ref() {
-            request = request.header("x-api-key", api_key.expose_secret());
-        }
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("x-api-key", self.credentials.api_key.expose_secret());
         let response = request.send().await.map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,

@@ -49,10 +49,15 @@ pub struct LogicalRequestStart {
     pub request_id: String,
     pub owner_user_id: String,
     pub api_key_id: Option<String>,
+    /// API key identity at request time. These are snapshots, not lookups.
+    pub api_key_label: Option<String>,
+    pub api_key_group_label: Option<String>,
     /// The model string the client sent, before any alias resolution.
     pub client_model_raw: Option<String>,
     /// The model the router selected.
     pub routing_model: Option<String>,
+    /// The reasoning level requested by the client, when one was supplied.
+    pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,
 }
 
@@ -101,6 +106,8 @@ pub struct AttemptFacts {
     /// The model the provider said it used, when it said anything.
     pub provider_reported_model: Option<String>,
     pub started_at_ms: i64,
+    /// When the first output token was observed on the upstream stream.
+    pub first_token_at_ms: Option<i64>,
     pub completed_at_ms: i64,
     pub dispatch_evidence: DispatchEvidence,
     pub tracking: TrackingState,

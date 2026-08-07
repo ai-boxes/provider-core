@@ -15,13 +15,15 @@ pub enum AccountProvisioningInput {
     CredentialJson {
         id: AccountId,
         label: String,
+        group_label: String,
         credential_json: SecretString,
     },
     Direct {
         id: AccountId,
         label: String,
+        group_label: String,
         config_json: String,
-        api_key: Option<SecretString>,
+        api_key: SecretString,
     },
 }
 

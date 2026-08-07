@@ -53,6 +53,9 @@ pub trait AttemptTracking: Send + Sync {
     /// The call returned a stream to read, so the provider answered.
     fn stream_opened(&self);
 
+    /// The first output token was observed on the upstream stream.
+    fn first_token_observed(&self);
+
     /// The upstream stream reached its documented successful terminal.
     ///
     /// Without this an ended stream is only known to have ended, which is

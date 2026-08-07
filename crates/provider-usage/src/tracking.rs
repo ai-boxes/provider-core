@@ -27,7 +27,7 @@ use provider_core::{
 
 use crate::{
     attempt::{AttemptSequence, DispatchEvidence, TrackingGapReason, TrackingState},
-    cost::{ObservedCatalogCost, compute_observed_catalog_cost},
+    cost::{CostStatus, ObservedCatalogCost, compute_observed_catalog_cost},
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
     price::PriceResolution,
     repository::{
@@ -41,14 +41,18 @@ use crate::{
 /// thing needed is "now in unix milliseconds", and tests want to pin it.
 pub type ClockMs = fn() -> i64;
 
-/// Reads the system clock, saturating rather than panicking on an absurd value.
+/// Receives known attempt cost before the asynchronous usage writer persists it.
+pub type SpendObserver = Arc<dyn Fn(&str, i128) + Send + Sync>;
+
+/// Reads the system clock as unix milliseconds.
 #[must_use]
 pub fn system_clock_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(i64::MAX)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("unix timestamp must fit i64")
 }
 
 /// Supplies the price for a model from the catalog snapshot held right now.
@@ -74,6 +78,7 @@ pub struct UsageTracking {
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
     prices: Arc<dyn PriceResolver>,
+    spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
 }
 
@@ -84,7 +89,23 @@ impl UsageTracking {
         writer: Arc<UsageWriter>,
         prices: Arc<dyn PriceResolver>,
     ) -> Self {
-        Self::with_clock(repository, writer, prices, system_clock_ms)
+        Self::with_clock_and_spend_observer(repository, writer, prices, system_clock_ms, None)
+    }
+
+    #[must_use]
+    pub fn with_spend_observer(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        prices: Arc<dyn PriceResolver>,
+        spend_observer: SpendObserver,
+    ) -> Self {
+        Self::with_clock_and_spend_observer(
+            repository,
+            writer,
+            prices,
+            system_clock_ms,
+            Some(spend_observer),
+        )
     }
 
     #[must_use]
@@ -94,10 +115,22 @@ impl UsageTracking {
         prices: Arc<dyn PriceResolver>,
         now_ms: ClockMs,
     ) -> Self {
+        Self::with_clock_and_spend_observer(repository, writer, prices, now_ms, None)
+    }
+
+    #[must_use]
+    fn with_clock_and_spend_observer(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        prices: Arc<dyn PriceResolver>,
+        now_ms: ClockMs,
+        spend_observer: Option<SpendObserver>,
+    ) -> Self {
         Self {
             repository,
             writer,
             prices,
+            spend_observer,
             now_ms,
         }
     }
@@ -120,6 +153,7 @@ impl UsageTracking {
             start,
             writer: Arc::clone(&self.writer),
             prices: Arc::clone(&self.prices),
+            spend_observer: self.spend_observer.clone(),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
                 start_gap,
@@ -165,6 +199,7 @@ pub struct LogicalTracker {
     start: LogicalRequestStart,
     writer: Arc<UsageWriter>,
     prices: Arc<dyn PriceResolver>,
+    spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
 }
@@ -209,6 +244,7 @@ impl LogicalTracker {
                 evidence: DispatchEvidence::NotInvoked,
                 raw_usage: None,
                 provider_reported_model: None,
+                first_token_at_ms: None,
                 tracking: TrackingState::Complete,
                 success_terminal: false,
                 closed: false,
@@ -311,6 +347,7 @@ struct AttemptState {
     /// usage, which is unknown rather than zero.
     raw_usage: Option<Option<RawUsageFields>>,
     provider_reported_model: Option<String>,
+    first_token_at_ms: Option<i64>,
     tracking: TrackingState,
     /// Whether the upstream stream reached its documented successful terminal.
     success_terminal: bool,
@@ -347,6 +384,16 @@ impl AttemptTracker {
         let mut state = self.lock();
         if state.raw_usage.is_none() {
             state.raw_usage = Some(raw);
+        }
+    }
+
+    /// Record the first output token only once. The observer calls this while
+    /// the response is still flowing, so the timestamp is measured before the
+    /// terminal usage write rather than reconstructed from completion time.
+    pub fn first_token_observed(&self) {
+        let mut state = self.lock();
+        if state.first_token_at_ms.is_none() {
+            state.first_token_at_ms = Some((self.logical.now_ms)());
         }
     }
 
@@ -424,6 +471,7 @@ impl AttemptTracker {
                 configured_model: self.spec.configured_model.clone(),
                 provider_reported_model: state.provider_reported_model.clone(),
                 started_at_ms: self.started_at_ms,
+                first_token_at_ms: state.first_token_at_ms,
                 completed_at_ms: (self.logical.now_ms)(),
                 dispatch_evidence: state.evidence,
                 tracking: state.tracking,
@@ -437,6 +485,17 @@ impl AttemptTracker {
 
         self.logical
             .note_final_attempt(&self.attempt_id, self.sequence, execution);
+        if matches!(
+            facts.cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        ) && let (Some(observer), Some(api_key_id), atoms) = (
+            self.logical.spend_observer.as_ref(),
+            self.logical.start.api_key_id.as_deref(),
+            facts.cost.total_known.as_atoms(),
+        ) && atoms > 0
+        {
+            observer(api_key_id, atoms);
+        }
         self.logical.writer.submit(UsageWrite {
             owner_user_id: self.logical.start.owner_user_id.clone(),
             at_ms: facts.completed_at_ms,
@@ -511,6 +570,10 @@ impl AttemptTracking for AttemptTracker {
     fn stream_opened(&self) {
         // A stream to read is proof the provider answered.
         self.advance(DispatchEvidence::ResponseObserved);
+    }
+
+    fn first_token_observed(&self) {
+        AttemptTracker::first_token_observed(self);
     }
 
     fn success_terminal_observed(&self) {
@@ -657,8 +720,11 @@ mod tests {
             request_id: request_id.to_owned(),
             owner_user_id: "user-1".to_owned(),
             api_key_id: Some("key-1".to_owned()),
+            api_key_label: None,
+            api_key_group_label: None,
             client_model_raw: Some("gpt-5-codex".to_owned()),
             routing_model: Some("gpt-5-codex".to_owned()),
+            reasoning_effort: None,
             started_at_ms: 1_700_000_000_000,
         }
     }
@@ -733,6 +799,36 @@ mod tests {
             facts.cost.total_known.to_decimal_string(),
             "0.00011000000000"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_cost_does_not_notify_the_quota_ledger() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer_values = Arc::clone(&observed);
+        let observer: SpendObserver = Arc::new(move |_, atoms| {
+            observer_values
+                .lock()
+                .expect("quota observer lock")
+                .push(atoms);
+        });
+        let tracking = UsageTracking::with_clock_and_spend_observer(
+            repository,
+            writer.clone(),
+            Arc::new(NoCatalog),
+            ticking_clock,
+            Some(observer),
+        );
+        let logical = tracking.begin_request(start("req-partial")).await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.record_provider_model("gpt-4o-mini");
+        attempt.record_usage(Some(codex_usage()));
+        attempt.close();
+        logical.finish();
+        assert!(writer.drain(Duration::from_secs(5)).await);
+        assert!(observed.lock().expect("quota observer lock").is_empty());
     }
 
     #[tokio::test]

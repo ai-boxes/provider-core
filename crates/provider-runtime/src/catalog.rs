@@ -299,8 +299,12 @@ impl ProviderControl for ProviderRuntimeCatalog {
 }
 
 impl ProviderRouter for ProviderRuntimeCatalog {
-    fn models(&self, user_id: &str) -> Vec<provider_core::RoutableProviderModel> {
-        self.inner.router.models(user_id)
+    fn models(
+        &self,
+        user_id: &str,
+        account_ids: Option<&std::collections::HashSet<provider_core::AccountId>>,
+    ) -> Vec<provider_core::RoutableProviderModel> {
+        self.inner.router.models(user_id, account_ids)
     }
 
     fn routes(
@@ -309,10 +313,11 @@ impl ProviderRouter for ProviderRuntimeCatalog {
         model: &str,
         native_formats: &[provider_core::WireFormat],
         session_id: Option<&str>,
+        account_ids: Option<&std::collections::HashSet<provider_core::AccountId>>,
     ) -> Vec<ProviderRouteCandidate> {
         self.inner
             .router
-            .routes(user_id, model, native_formats, session_id)
+            .routes(user_id, model, native_formats, session_id, account_ids)
     }
 }
 

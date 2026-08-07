@@ -1,11 +1,11 @@
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashSet, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{ProviderModel, ProviderRequest, WireFormat};
+use crate::{AccountId, ProviderModel, ProviderRequest, WireFormat};
 
 /// Byte stream crossing the provider and protocol boundaries.
 pub type ProviderStream =
@@ -114,7 +114,11 @@ pub struct RoutableProviderModel {
 
 /// In-memory model index used before protocol conversion and provider execution.
 pub trait ProviderRouter: Send + Sync {
-    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel>;
+    fn models(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel>;
 
     fn routes(
         &self,
@@ -122,6 +126,7 @@ pub trait ProviderRouter: Send + Sync {
         model: &str,
         native_formats: &[WireFormat],
         session_id: Option<&str>,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate>;
 }
 

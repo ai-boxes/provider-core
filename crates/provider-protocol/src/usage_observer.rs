@@ -138,6 +138,9 @@ impl UsageObservingStream {
                 // stopped.
                 attempt.success_terminal_observed();
             }
+            if observed.first_token {
+                attempt.first_token_observed();
+            }
         }
         // A later terminal supersedes an earlier one — but a frame that carried
         // no usage does not erase usage already observed.
@@ -171,6 +174,8 @@ struct ObservedFrame {
     fields: Option<RawUsageFields>,
     /// The model the provider says it served, when the frame names one.
     model: Option<String>,
+    /// Whether this frame carries the first non-empty output delta.
+    first_token: bool,
     success_terminal: bool,
 }
 
@@ -183,11 +188,16 @@ struct ObservedFrame {
 /// stream ended the way the protocol says it should — gating on `usage` alone
 /// recorded those responses as merely having stopped.
 fn extract_terminal_facts(frame: &[u8]) -> Option<ObservedFrame> {
-    if !contains_subslice(frame, b"usage") && !contains_subslice(frame, COMPLETED_EVENT.as_bytes())
+    if !contains_subslice(frame, b"usage")
+        && !contains_subslice(frame, COMPLETED_EVENT.as_bytes())
+        && !FIRST_TOKEN_EVENT_TYPES
+            .iter()
+            .any(|event| contains_subslice(frame, event.as_bytes()))
     {
         return None;
     }
     let event: Value = serde_json::from_slice(frame).ok()?;
+    let event_type = event.get("type").and_then(Value::as_str);
     let response = event.get("response");
     let usage = response
         .and_then(|response| response.get("usage"))
@@ -205,19 +215,36 @@ fn extract_terminal_facts(frame: &[u8]) -> Option<ObservedFrame> {
         .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_LEN)
         .map(ToOwned::to_owned);
     let success_terminal = event.get("type").and_then(Value::as_str) == Some(COMPLETED_EVENT);
+    let first_token = event_type
+        .is_some_and(|event_type| FIRST_TOKEN_EVENT_TYPES.contains(&event_type))
+        && event
+            .get("delta")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty());
 
-    if usage.is_none() && model.is_none() && !success_terminal {
+    if usage.is_none() && model.is_none() && !success_terminal && !first_token {
         return None;
     }
     Some(ObservedFrame {
         fields: usage.map(RawUsageFields::from_responses_usage),
         model,
+        first_token,
         success_terminal,
     })
 }
 
 /// The Responses event that marks a stream's successful end.
 const COMPLETED_EVENT: &str = "response.completed";
+
+/// Output events that carry the first user-visible token or tool argument.
+/// Item-start events are intentionally excluded because they can arrive before
+/// any token has been produced.
+const FIRST_TOKEN_EVENT_TYPES: &[&str] = &[
+    "response.output_text.delta",
+    "response.reasoning_text.delta",
+    "response.reasoning_summary_text.delta",
+    "response.function_call_arguments.delta",
+];
 
 /// Longest model name accepted from an upstream response.
 const MAX_MODEL_LEN: usize = 200;
@@ -242,6 +269,7 @@ mod tests {
     struct RecordingAttempt {
         finished: Mutex<Option<Option<RawUsageFields>>>,
         observation_lost: Mutex<bool>,
+        first_token: Mutex<bool>,
         success_terminal: Mutex<bool>,
         model: Mutex<Option<String>>,
     }
@@ -258,10 +286,18 @@ mod tests {
         fn saw_success_terminal(&self) -> bool {
             *self.success_terminal.lock().expect("terminal lock")
         }
+
+        fn saw_first_token(&self) -> bool {
+            *self.first_token.lock().expect("first token lock")
+        }
     }
 
     impl AttemptTracking for RecordingAttempt {
         fn stream_opened(&self) {}
+
+        fn first_token_observed(&self) {
+            *self.first_token.lock().expect("first token lock") = true;
+        }
 
         fn success_terminal_observed(&self) {
             *self.success_terminal.lock().expect("terminal lock") = true;
@@ -308,7 +344,7 @@ mod tests {
     async fn bytes_pass_through_unchanged() {
         let (observed, attempt) = recording_attempt();
         let chunks = vec![
-            "data: {\"type\":\"response.output_text.delta\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
             COMPLETED,
         ];
         let stream = observe_responses_usage(byte_stream(chunks.clone()), attempt);
@@ -320,6 +356,7 @@ mod tests {
             .collect();
         assert_eq!(forwarded, expected, "a tee must not alter the payload");
         assert!(observed.reported().is_some());
+        assert!(observed.saw_first_token());
     }
 
     #[tokio::test]

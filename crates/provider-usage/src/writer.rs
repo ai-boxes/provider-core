@@ -299,6 +299,7 @@ mod tests {
                 configured_model: None,
                 provider_reported_model: None,
                 started_at_ms: 1_700_000_090_000,
+                first_token_at_ms: None,
                 completed_at_ms: AT_MS,
                 dispatch_evidence: DispatchEvidence::ResponseObserved,
                 tracking: TrackingState::Complete,

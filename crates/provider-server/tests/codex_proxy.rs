@@ -136,11 +136,12 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .register_driver(CodexDriver::for_test(&upstream_url, &upstream_url))
         .expect("register Codex driver");
     let manager = ProviderManager::new(repository.clone(), runtime.clone());
-    manager
+    let _created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
             ProviderKind::Codex,
             "Codex".to_owned(),
+            "default".to_owned(),
             SecretString::from(
                 json!({
                     "type": "codex",
@@ -164,8 +165,10 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     let created_key = api_keys
         .create(
             &grant.user.id,
+            "default".to_owned(),
             "test".to_owned(),
             Some(SecretString::from("test-api-key-123".to_owned())),
+            None,
             None,
             now,
         )

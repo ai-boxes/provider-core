@@ -15,13 +15,14 @@ pub use credentials::{
 };
 pub use model::{
     ApiKeyId, ApiKeyIdError, ApiKeySummary, CreatedApiKey, NewApiKey, NewSession, NewUser,
-    SessionId, SessionIdError, StoredApiKey, StoredSession, StoredUser, UserId, UserIdError,
-    UserRole, UserRoleError, UserSummary,
+    SessionId, SessionIdError, StoredApiKey, StoredSession, StoredUser, USD_ATOM_SCALE, UserId,
+    UserIdError, UserRole, UserRoleError, UserSummary, add_atoms, atoms_ge, format_usd_atoms,
+    parse_quota_limit_usd,
 };
 pub use repository::{
     AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, RefreshSessionOutcome,
 };
 pub use service::{
-    ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedApiKey, AuthenticatedSession,
-    SessionGrant,
+    ApiKeyAuthenticator, ApiKeyQuotaLease, AuthError, AuthService, AuthenticatedApiKey,
+    AuthenticatedSession, SessionGrant,
 };

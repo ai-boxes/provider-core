@@ -104,8 +104,11 @@ pub trait AuthRepository: Send + Sync {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
+        group_label: &str,
+        label: &str,
         enabled: bool,
         expires_at: Option<i64>,
+        quota_limit_atoms: Option<Option<String>>,
         updated_at: i64,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError>;
 
@@ -116,6 +119,19 @@ pub trait AuthRepository: Send + Sync {
     ) -> Result<bool, AuthRepositoryError>;
 
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError>;
+
+    /// Account IDs visible to `actor_user_id` that carry the given group label.
+    async fn list_visible_account_ids_by_group_label(
+        &self,
+        actor_user_id: &UserId,
+        group_label: &str,
+    ) -> Result<Vec<String>, AuthRepositoryError>;
+
+    /// Current cumulative known spend for a key, in USD atoms.
+    async fn load_api_key_spent_atoms(
+        &self,
+        api_key_id: &ApiKeyId,
+    ) -> Result<Option<String>, AuthRepositoryError>;
 }
 
 #[derive(Debug, Error)]

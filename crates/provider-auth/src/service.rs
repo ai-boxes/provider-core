@@ -1,17 +1,18 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, Mutex as StdMutex, PoisonError, RwLock},
 };
 
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
     ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
     InitialUserCreateOutcome, NewApiKey, NewSession, NewUser, RefreshSessionOutcome, SessionId,
-    StoredApiKey, UserId, UserRole, UserSummary, digest_secret, hash_password, issue_api_key,
-    issue_session_tokens, rotate_session_tokens, verify_password,
+    StoredApiKey, UserId, UserRole, UserSummary, add_atoms, atoms_ge, digest_secret, hash_password,
+    issue_api_key, issue_session_tokens, parse_quota_limit_usd, rotate_session_tokens,
+    verify_password,
 };
 
 #[derive(Clone)]
@@ -37,6 +38,9 @@ pub struct AuthenticatedSession {
 pub struct AuthenticatedApiKey {
     pub key_id: ApiKeyId,
     pub owner_user_id: UserId,
+    pub label: String,
+    pub group_label: String,
+    pub quota_limit_atoms: Option<String>,
 }
 
 impl AuthService {
@@ -308,22 +312,45 @@ pub struct ApiKeyAuthenticator {
     repository: Arc<dyn AuthRepository>,
     active: Arc<RwLock<HashMap<[u8; 32], ActiveApiKey>>>,
     mutation: Arc<Mutex<()>>,
+    quota_spent: Arc<RwLock<HashMap<ApiKeyId, QuotaSpend>>>,
+    quota_gates: Arc<StdMutex<HashMap<ApiKeyId, Arc<Mutex<()>>>>>,
+}
+
+/// Holds the single in-flight request slot for a quota-limited API key.
+pub struct ApiKeyQuotaLease {
+    _guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Clone)]
 struct ActiveApiKey {
     id: ApiKeyId,
     owner_user_id: UserId,
+    label: String,
+    group_label: String,
+    quota_limit_atoms: Option<String>,
     expires_at: Option<i64>,
+}
+
+#[derive(Clone)]
+enum QuotaSpend {
+    Known(String),
+    Unavailable,
 }
 
 impl ApiKeyAuthenticator {
     pub async fn load(repository: Arc<dyn AuthRepository>) -> Result<Self, AuthError> {
         let keys = repository.load_active_api_keys().await?;
+        let quota_spent = keys
+            .iter()
+            .filter(|key| key.quota_limit_atoms.is_some())
+            .map(|key| (key.id.clone(), quota_spend(&key.spent_atoms)))
+            .collect();
         Ok(Self {
             repository,
             active: Arc::new(RwLock::new(active_key_map(keys))),
             mutation: Arc::new(Mutex::new(())),
+            quota_spent: Arc::new(RwLock::new(quota_spent)),
+            quota_gates: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -337,45 +364,75 @@ impl ApiKeyAuthenticator {
         Ok(AuthenticatedApiKey {
             key_id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
+            label: key.label.clone(),
+            group_label: key.group_label.clone(),
+            quota_limit_atoms: key.quota_limit_atoms.clone(),
         })
     }
 
     pub async fn create(
         &self,
         owner_user_id: &UserId,
+        group_label: String,
         label: String,
         custom: Option<SecretString>,
         expires_at: Option<i64>,
+        quota_limit_usd: Option<String>,
         now: i64,
     ) -> Result<CreatedApiKey, AuthError> {
         let label = normalize_label(label)?;
+        let group_label = normalize_group_label(group_label)?;
         if expires_at.is_some_and(|expires_at| expires_at <= now) {
             return Err(AuthError::InvalidExpiry);
         }
+        let quota_limit_atoms = match quota_limit_usd {
+            None => None,
+            Some(value) => {
+                Some(parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?)
+            }
+        };
         let issued = issue_api_key(custom)?;
         let key = NewApiKey {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
+            group_label: group_label.clone(),
             label,
             key: issued.secret.clone(),
             enabled: true,
             expires_at,
+            quota_limit_atoms: quota_limit_atoms.clone(),
             created_at: now,
         };
         let summary = ApiKeySummary {
             id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
+            group_label: group_label.clone(),
             label: key.label.clone(),
             key: mask_api_key(key.key.expose_secret()),
             enabled: true,
             expires_at,
+            quota_limit_atoms: quota_limit_atoms.clone(),
+            spent_atoms: "0".to_owned(),
             last_used_at: None,
             created_at: now,
             updated_at: now,
         };
         let _mutation = self.mutation.lock().await;
+        let account_ids = self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+            .await?;
+        if account_ids.is_empty() {
+            return Err(AuthError::GroupNotFound);
+        }
         if !self.repository.create_api_key(key.clone()).await? {
             return Err(AuthError::Conflict);
+        }
+        if quota_limit_atoms.is_some() {
+            self.quota_spent
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(summary.id.clone(), QuotaSpend::Known("0".to_owned()));
         }
         self.active
             .write()
@@ -385,6 +442,9 @@ impl ApiKeyAuthenticator {
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
+                    label: key.label,
+                    group_label,
+                    quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
             );
@@ -419,8 +479,11 @@ impl ApiKeyAuthenticator {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
+        label: Option<String>,
+        group_label: Option<String>,
         enabled: Option<bool>,
         expires_at: Option<Option<i64>>,
+        quota_limit_usd: Option<Option<String>>,
         now: i64,
     ) -> Result<ApiKeySummary, AuthError> {
         let _mutation = self.mutation.lock().await;
@@ -435,12 +498,43 @@ impl ApiKeyAuthenticator {
         {
             return Err(AuthError::InvalidExpiry);
         }
+        let label = match label {
+            Some(value) => normalize_label(value)?,
+            None => current.label.clone(),
+        };
+        let group_label = match group_label {
+            Some(value) => normalize_group_label(value)?,
+            None => current.group_label.clone(),
+        };
+        let quota_limit_atoms = match quota_limit_usd {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(value)) => Some(Some(
+                parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?,
+            )),
+        };
         let enabled = enabled.unwrap_or(current.enabled);
         let expires_at = expires_at.unwrap_or(current.expires_at);
+        let account_ids = self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+            .await?;
+        if account_ids.is_empty() {
+            return Err(AuthError::GroupNotFound);
+        }
         let removed = self.remove_active(owner_user_id, key_id);
         let updated = match self
             .repository
-            .update_api_key(owner_user_id, key_id, enabled, expires_at, now)
+            .update_api_key(
+                owner_user_id,
+                key_id,
+                &group_label,
+                &label,
+                enabled,
+                expires_at,
+                quota_limit_atoms,
+                now,
+            )
             .await
         {
             Ok(Some(key)) => key,
@@ -453,6 +547,11 @@ impl ApiKeyAuthenticator {
                 return Err(error.into());
             }
         };
+        if updated.quota_limit_atoms.is_some() {
+            self.remember_spent(&updated.id, &updated.spent_atoms);
+        } else {
+            self.forget_quota_state(&updated.id);
+        }
         if updated.enabled {
             self.active
                 .write()
@@ -462,6 +561,9 @@ impl ApiKeyAuthenticator {
                     ActiveApiKey {
                         id: updated.id.clone(),
                         owner_user_id: updated.owner_user_id.clone(),
+                        label: updated.label.clone(),
+                        group_label: updated.group_label.clone(),
+                        quota_limit_atoms: updated.quota_limit_atoms.clone(),
                         expires_at: updated.expires_at,
                     },
                 );
@@ -473,7 +575,10 @@ impl ApiKeyAuthenticator {
         let _mutation = self.mutation.lock().await;
         let removed = self.remove_active(owner_user_id, key_id);
         match self.repository.delete_api_key(owner_user_id, key_id).await {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                self.forget_quota_state(key_id);
+                Ok(())
+            }
             Ok(false) => {
                 self.restore_active(removed);
                 Err(AuthError::NotFound)
@@ -483,6 +588,109 @@ impl ApiKeyAuthenticator {
                 Err(error.into())
             }
         }
+    }
+
+    /// Reject when the key's lifetime observed spend has already reached its USD ceiling.
+    pub async fn ensure_quota_available(&self, key: &AuthenticatedApiKey) -> Result<(), AuthError> {
+        let Some(limit) = key.quota_limit_atoms.as_deref() else {
+            return Ok(());
+        };
+        let persisted = self
+            .repository
+            .load_api_key_spent_atoms(&key.key_id)
+            .await?
+            .ok_or(AuthError::QuotaLedgerUnavailable)?;
+        let persisted = match quota_spend(&persisted) {
+            QuotaSpend::Known(value) => value,
+            QuotaSpend::Unavailable => return Err(AuthError::QuotaLedgerUnavailable),
+        };
+        let memory = self
+            .quota_spent
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key.key_id)
+            .cloned();
+        let spent = match memory {
+            Some(QuotaSpend::Unavailable) => return Err(AuthError::QuotaLedgerUnavailable),
+            Some(QuotaSpend::Known(memory))
+                if atoms_ge(&memory, &persisted)
+                    .map_err(|_| AuthError::QuotaLedgerUnavailable)? =>
+            {
+                memory
+            }
+            _ => {
+                self.remember_spent(&key.key_id, &persisted);
+                persisted
+            }
+        };
+        if atoms_ge(&spent, limit).map_err(|_| AuthError::QuotaLedgerUnavailable)? {
+            return Err(AuthError::QuotaExceeded);
+        }
+        Ok(())
+    }
+
+    /// Acquire the only in-flight slot for a quota-limited key and check its
+    /// current spend while that slot is held.
+    pub async fn acquire_quota(
+        &self,
+        key: &AuthenticatedApiKey,
+    ) -> Result<ApiKeyQuotaLease, AuthError> {
+        if key.quota_limit_atoms.is_none() {
+            return Ok(ApiKeyQuotaLease { _guard: None });
+        }
+        let gate = {
+            let mut gates = self
+                .quota_gates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                gates
+                    .entry(key.key_id.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let guard = gate
+            .try_lock_owned()
+            .map_err(|_| AuthError::QuotaInFlight)?;
+        if let Err(error) = self.ensure_quota_available(key).await {
+            drop(guard);
+            return Err(error);
+        }
+        Ok(ApiKeyQuotaLease {
+            _guard: Some(guard),
+        })
+    }
+
+    /// Record known cost immediately for admission checks. The durable writer
+    /// records the same amount transactionally; keeping the high-water mark in
+    /// memory closes the gap between response completion and database commit.
+    pub fn record_spend(&self, api_key_id: &ApiKeyId, atoms: i128) {
+        if atoms <= 0 {
+            return;
+        }
+        let mut spent = self
+            .quota_spent
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = match spent.get(api_key_id) {
+            Some(QuotaSpend::Unavailable) => return,
+            Some(QuotaSpend::Known(value)) => value.as_str(),
+            None => return,
+        };
+        let next = add_atoms(current, &atoms.to_string())
+            .map_or(QuotaSpend::Unavailable, QuotaSpend::Known);
+        spent.insert(api_key_id.clone(), next);
+    }
+
+    pub async fn account_ids_for_key(
+        &self,
+        owner_user_id: &UserId,
+        group_label: &str,
+    ) -> Result<Vec<String>, AuthError> {
+        Ok(self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, group_label)
+            .await?)
     }
 
     fn remove_active(
@@ -505,6 +713,52 @@ impl ApiKeyAuthenticator {
                 .insert(digest, key);
         }
     }
+
+    fn remember_spent(&self, api_key_id: &ApiKeyId, spent_atoms: &str) {
+        let mut spent = self
+            .quota_spent
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let incoming = quota_spend(spent_atoms);
+        match (spent.get(api_key_id), incoming) {
+            (_, QuotaSpend::Unavailable) | (Some(QuotaSpend::Unavailable), _) => {
+                spent.insert(api_key_id.clone(), QuotaSpend::Unavailable);
+            }
+            (Some(QuotaSpend::Known(current)), QuotaSpend::Known(next)) => {
+                match atoms_ge(&next, current) {
+                    Ok(true) => {
+                        spent.insert(api_key_id.clone(), QuotaSpend::Known(next));
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        spent.insert(api_key_id.clone(), QuotaSpend::Unavailable);
+                    }
+                }
+            }
+            (None, QuotaSpend::Known(next)) => {
+                spent.insert(api_key_id.clone(), QuotaSpend::Known(next));
+            }
+        }
+    }
+
+    fn forget_quota_state(&self, api_key_id: &ApiKeyId) {
+        self.quota_spent
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(api_key_id);
+        self.quota_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(api_key_id);
+    }
+}
+
+fn quota_spend(value: &str) -> QuotaSpend {
+    if value.is_empty() || value.len() > 64 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        QuotaSpend::Unavailable
+    } else {
+        QuotaSpend::Known(value.to_owned())
+    }
 }
 
 fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
@@ -515,6 +769,9 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
+                    label: key.label,
+                    group_label: key.group_label,
+                    quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
             )
@@ -526,14 +783,25 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
     ApiKeySummary {
         id: key.id.clone(),
         owner_user_id: key.owner_user_id.clone(),
+        group_label: key.group_label.clone(),
         label: key.label.clone(),
         key: mask_api_key(key.key.expose_secret()),
         enabled: key.enabled,
         expires_at: key.expires_at,
+        quota_limit_atoms: key.quota_limit_atoms.clone(),
+        spent_atoms: key.spent_atoms.clone(),
         last_used_at: key.last_used_at,
         created_at: key.created_at,
         updated_at: key.updated_at,
     }
+}
+
+fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
+    let group_label = group_label.trim().to_owned();
+    if group_label.is_empty() || group_label.chars().count() > 64 {
+        return Err(AuthError::InvalidGroup);
+    }
+    Ok(group_label)
 }
 
 fn mask_api_key(key: &str) -> String {
@@ -626,6 +894,18 @@ pub enum AuthError {
     InvalidLabel,
     #[error("expiry must be in the future")]
     InvalidExpiry,
+    #[error("quota limit must be a positive USD amount when set")]
+    InvalidQuotaLimit,
+    #[error("API key USD quota has been exhausted")]
+    QuotaExceeded,
+    #[error("API key already has a request in flight")]
+    QuotaInFlight,
+    #[error("API key quota ledger is unavailable")]
+    QuotaLedgerUnavailable,
+    #[error("provider group label was not found on any visible account")]
+    GroupNotFound,
+    #[error("provider group label is invalid")]
+    InvalidGroup,
     #[error("password processing task failed")]
     PasswordTask,
     #[error(transparent)]

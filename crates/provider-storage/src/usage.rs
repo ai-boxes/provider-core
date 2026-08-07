@@ -11,6 +11,7 @@
 //! plain provider-reported value — so a fully reported attempt stores `{}`.
 
 use async_trait::async_trait;
+use provider_auth::add_atoms;
 use provider_core::{
     ProviderKind,
     usage::{
@@ -59,18 +60,22 @@ impl UsageRepository for SqliteUsageRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO usage_logical_requests (
-                request_id, owner_user_id, api_key_id, client_model_raw, routing_model,
-                started_at_ms, logical_status, tracking_state, state_version
+                request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
+                client_model_raw, routing_model,
+                reasoning_effort, started_at_ms, logical_status, tracking_state, state_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'in_progress', 'complete', 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', 'complete', 0)
             ON CONFLICT (request_id) DO NOTHING
             "#,
         )
         .bind(&start.request_id)
         .bind(&start.owner_user_id)
         .bind(start.api_key_id.as_deref())
+        .bind(start.api_key_label.as_deref())
+        .bind(start.api_key_group_label.as_deref())
         .bind(start.client_model_raw.as_deref())
         .bind(start.routing_model.as_deref())
+        .bind(start.reasoning_effort.as_deref())
         .bind(start.started_at_ms)
         .execute(&self.pool)
         .await
@@ -198,9 +203,16 @@ impl UsageRepository for SqliteUsageRepository {
             ));
         }
 
+        // The attempt row and the lifetime API-key spend must commit together.
+        // IMMEDIATE takes SQLite's write lock before reading spent_atoms, so two
+        // concurrent completions cannot both calculate from the same old value.
         let mut transaction = self
             .pool
-            .begin()
+            .acquire()
+            .await
+            .map_err(|error| usage_error("failed to acquire usage write connection", error))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *transaction)
             .await
             .map_err(|error| usage_error("failed to start usage attempt transaction", error))?;
 
@@ -212,7 +224,7 @@ impl UsageRepository for SqliteUsageRepository {
             INSERT INTO usage_attempts (
                 id, logical_request_id, sequence,
                 provider, account_id, configured_model, provider_reported_model,
-                started_at_ms, completed_at_ms, dispatch_evidence,
+                started_at_ms, first_token_at_ms, completed_at_ms, dispatch_evidence,
                 tracking_state, tracking_gap_reason,
                 contract_version, normalization_version, inclusion_json,
                 cache_capability, cache_eligibility, cache_reporting_expectation,
@@ -228,7 +240,7 @@ impl UsageRepository for SqliteUsageRepository {
             VALUES (
                 ?, ?, ?,
                 ?, ?, ?, ?,
-                ?, ?, ?,
+                ?, ?, ?, ?,
                 ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
@@ -252,6 +264,7 @@ impl UsageRepository for SqliteUsageRepository {
         .bind(facts.configured_model.as_deref())
         .bind(facts.provider_reported_model.as_deref())
         .bind(facts.started_at_ms)
+        .bind(facts.first_token_at_ms)
         .bind(facts.completed_at_ms)
         .bind(dispatch_evidence_str(facts.dispatch_evidence))
         .bind(tracking_state)
@@ -309,10 +322,62 @@ impl UsageRepository for SqliteUsageRepository {
                 .await
                 .map_err(|error| usage_error("failed to record billable observation", error))?;
             }
+
+            // Lifetime key spend survives usage retention. Only complete costs
+            // count, and only for newly inserted attempts so redelivery is free.
+            if matches!(
+                cost.status,
+                CostStatus::CompleteForObservedCatalogComponents
+            ) && let Some(atoms) = cost.atoms.filter(|atoms| *atoms > 0)
+            {
+                let api_key_id: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT api_key_id
+                    FROM usage_logical_requests
+                    WHERE request_id = ?
+                    "#,
+                )
+                .bind(&facts.logical_request_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| usage_error("failed to load request API key for spend", error))?
+                .flatten();
+
+                if let Some(api_key_id) = api_key_id {
+                    let spent: Option<String> = sqlx::query_scalar(
+                        r#"
+                        SELECT spent_atoms
+                        FROM api_keys
+                        WHERE id = ?
+                        "#,
+                    )
+                    .bind(&api_key_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|error| usage_error("failed to load API key spend", error))?;
+
+                    if let Some(spent) = spent {
+                        let next = add_atoms(&spent, &atoms.to_string())
+                            .map_err(|_| UsageRepositoryError::new("API key spend overflowed"))?;
+                        sqlx::query(
+                            r#"
+                            UPDATE api_keys
+                            SET spent_atoms = ?
+                            WHERE id = ?
+                            "#,
+                        )
+                        .bind(next)
+                        .bind(api_key_id)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|error| usage_error("failed to update API key spend", error))?;
+                    }
+                }
+            }
         }
 
-        transaction
-            .commit()
+        sqlx::query("COMMIT")
+            .execute(&mut *transaction)
             .await
             .map_err(|error| usage_error("failed to commit usage attempt", error))?;
         Ok(())
@@ -379,8 +444,9 @@ impl UsageRepository for SqliteUsageRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                request_id, owner_user_id, api_key_id, client_model_raw, routing_model,
-                started_at_ms, completed_at_ms, logical_status, execution_outcome,
+                request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
+                client_model_raw, routing_model,
+                reasoning_effort, started_at_ms, completed_at_ms, logical_status, execution_outcome,
                 delivery_outcome, final_attempt_id, tracking_state, tracking_gap_reason,
                 state_version
             FROM usage_logical_requests
@@ -1243,8 +1309,11 @@ fn stored_logical_request(row: SqliteRow) -> Result<StoredLogicalRequest, UsageR
             request_id: row.get("request_id"),
             owner_user_id: row.get("owner_user_id"),
             api_key_id: row.get("api_key_id"),
+            api_key_label: row.get("api_key_label"),
+            api_key_group_label: row.get("api_key_group_label"),
             client_model_raw: row.get("client_model_raw"),
             routing_model: row.get("routing_model"),
+            reasoning_effort: row.get("reasoning_effort"),
             started_at_ms: row.get("started_at_ms"),
         },
         status: logical_status_from(&status)?,
@@ -1373,6 +1442,7 @@ pub(crate) fn attempt_facts(row: SqliteRow) -> Result<AttemptFacts, UsageReposit
         configured_model: row.get("configured_model"),
         provider_reported_model: row.get("provider_reported_model"),
         started_at_ms: row.get("started_at_ms"),
+        first_token_at_ms: row.get("first_token_at_ms"),
         completed_at_ms: row.get("completed_at_ms"),
         dispatch_evidence: dispatch_evidence_from(&evidence)?,
         tracking: tracking_from(&tracking_state, gap_reason.as_deref())?,
@@ -1412,8 +1482,11 @@ mod tests {
             request_id: request_id.to_owned(),
             owner_user_id: "user-1".to_owned(),
             api_key_id: Some("key-1".to_owned()),
+            api_key_label: None,
+            api_key_group_label: None,
             client_model_raw: Some("gpt-5-codex".to_owned()),
             routing_model: Some("gpt-5-codex".to_owned()),
+            reasoning_effort: None,
             started_at_ms: 1_700_000_000_000,
         }
     }
@@ -1497,6 +1570,7 @@ mod tests {
             configured_model: Some("gpt-5-codex".to_owned()),
             provider_reported_model: Some("gpt-5-codex".to_owned()),
             started_at_ms: 1_700_000_000_100,
+            first_token_at_ms: None,
             completed_at_ms: 1_700_000_001_500,
             dispatch_evidence: DispatchEvidence::ResponseObserved,
             tracking: TrackingState::Complete,
@@ -1561,6 +1635,66 @@ mod tests {
             loaded[0].observation.reasoning_tokens,
             TokenMetric::ProviderReported { value: 0 }
         );
+    }
+
+    #[tokio::test]
+    async fn only_complete_cost_consumes_api_key_quota() {
+        let repository = repository().await;
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES ('user-1', 'quota-user', 'hash', 'user', 1, 1, 1)
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert quota user");
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (
+                id, owner_user_id, group_label, label, key, enabled,
+                quota_limit_atoms, spent_atoms, created_at, updated_at
+            )
+            VALUES ('key-1', 'user-1', 'default', 'quota', 'sk-quota', 1,
+                    '9999999999999999', '0', 1, 1)
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert quota API key");
+
+        repository
+            .begin_logical_request(&start("req-partial"))
+            .await
+            .expect("begin partial request");
+        repository
+            .record_attempt(&attempt("req-partial", "att-partial", 1))
+            .await
+            .expect("record partial attempt");
+        let spent: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load spend after partial cost");
+        assert_eq!(spent, "0");
+
+        repository
+            .begin_logical_request(&start("req-complete"))
+            .await
+            .expect("begin complete request");
+        let mut complete = attempt("req-complete", "att-complete", 1);
+        complete.cost.status = CostStatus::CompleteForObservedCatalogComponents;
+        complete.cost.reasons.clear();
+        repository
+            .record_attempt(&complete)
+            .await
+            .expect("record complete attempt");
+        let spent: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load spend after complete cost");
+        assert_eq!(spent, "2512500000000");
     }
 
     #[tokio::test]

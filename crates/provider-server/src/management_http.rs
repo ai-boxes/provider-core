@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
@@ -12,10 +15,12 @@ use provider_core::{
     AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind, ProviderModelOverride,
     ProviderVisibility, StoredProviderModel,
 };
+use provider_drivers::compatible_api_key_credential;
 use provider_management::{
     CreatedProviderAccount, DirectProviderAccountInput, ModelCatalogSnapshot, OAuthSessionSnapshot,
-    OAuthSessionStatus, ProviderManager, ProviderManagerError,
+    OAuthSessionStatus, ProviderCredentialReplacement, ProviderManager, ProviderManagerError,
 };
+use provider_usage::{ProviderHealthSummary, TimeRange, TimeRangeError, system_clock_ms};
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,11 +28,13 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 struct ManagementState {
     manager: ProviderManager,
+    usage: Option<crate::UsageServices>,
 }
 
-pub(crate) fn router(manager: ProviderManager) -> Router {
+pub(crate) fn router(manager: ProviderManager, usage: Option<crate::UsageServices>) -> Router {
     Router::new()
         .route("/api/v1/providers", get(list_accounts).post(create_account))
+        .route("/api/v1/providers/health", get(list_provider_health))
         .route(
             "/api/v1/providers/{account_id}",
             get(get_account)
@@ -56,7 +63,7 @@ pub(crate) fn router(manager: ProviderManager) -> Router {
             "/api/v1/oauth/sessions/{session_id}",
             get(get_oauth_session).delete(cancel_oauth_session),
         )
-        .with_state(ManagementState { manager })
+        .with_state(ManagementState { manager, usage })
 }
 
 async fn list_accounts(
@@ -77,6 +84,46 @@ async fn list_accounts(
         values.push(account_with_quota_json(account, quota));
     }
     Ok(data(Value::Array(values)))
+}
+
+async fn list_provider_health(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    axum::extract::Query(params): axum::extract::Query<ProviderHealthParams>,
+) -> Result<Json<Value>, ApiError> {
+    let usage = state.usage.as_ref().ok_or_else(ApiError::internal)?;
+    let accounts = state
+        .manager
+        .list_accounts(session.user.id.as_str())
+        .await?;
+    let range = params.range()?;
+    let account_ids = accounts
+        .iter()
+        .map(|account| account.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let summaries = usage
+        .query
+        .provider_health(&account_ids, range)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let summaries = summaries
+        .into_iter()
+        .map(|summary| (summary.account_id.clone(), summary))
+        .collect::<HashMap<_, _>>();
+
+    let values = accounts
+        .iter()
+        .map(|account| {
+            let summary = summaries.get(account.id.as_str());
+            provider_health_json(account.id.as_str(), summary, range)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(data(json!({
+        "from_ms": range.from_ms,
+        "to_ms": range.to_ms,
+        "accounts": values,
+    })))
 }
 
 async fn get_account(
@@ -100,6 +147,7 @@ async fn create_account(
         CreateAccountRequest::CredentialJson {
             provider,
             label,
+            group_label,
             credential_json,
             visibility,
         } => {
@@ -109,6 +157,7 @@ async fn create_account(
                     session.user.id.as_str(),
                     provider,
                     label,
+                    group_label,
                     SecretString::from(json_document(credential_json)),
                     visibility.unwrap_or_default(),
                     unix_timestamp(),
@@ -118,6 +167,7 @@ async fn create_account(
         CreateAccountRequest::Direct {
             provider,
             label,
+            group_label,
             base_url,
             api_key,
             visibility,
@@ -129,8 +179,9 @@ async fn create_account(
                     DirectProviderAccountInput {
                         kind: provider,
                         label,
+                        group_label,
                         config_json: json!({ "base_url": base_url }).to_string(),
-                        api_key: api_key.map(SecretString::from),
+                        api_key: SecretString::from(api_key),
                         visibility: visibility.unwrap_or_default(),
                     },
                     unix_timestamp(),
@@ -147,9 +198,21 @@ async fn update_account(
     Path(account_id): Path<String>,
     Json(request): Json<UpdateAccountRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if request.label.is_none() && request.base_url.is_none() && request.visibility.is_none() {
+    let UpdateAccountRequest {
+        label,
+        group_label,
+        base_url,
+        visibility,
+        api_key,
+    } = request;
+    if label.is_none()
+        && group_label.is_none()
+        && base_url.is_none()
+        && visibility.is_none()
+        && api_key.is_none()
+    {
         return Err(ApiError::invalid_request(
-            "account update requires label, base_url, or visibility",
+            "account update requires label, group_label, base_url, visibility, or api_key",
         ));
     }
     let account_id = parse_account_id(&account_id)?;
@@ -157,29 +220,85 @@ async fn update_account(
         .manager
         .get_account(session.user.id.as_str(), &account_id)
         .await?;
-    let label = request.label.unwrap_or_else(|| current.label.clone());
-    let config_json = if let Some(base_url) = request.base_url {
-        let mut config: Value =
-            serde_json::from_str(&current.config_json).map_err(|_| ApiError::internal())?;
-        let config = config.as_object_mut().ok_or_else(ApiError::internal)?;
-        config.insert("base_url".to_owned(), Value::String(base_url));
-        Value::Object(config.clone()).to_string()
-    } else {
-        current.config_json
-    };
-    let account = state
-        .manager
-        .update_account(
-            session.user.id.as_str(),
-            &account_id,
-            ProviderAccountUpdate {
-                label,
-                config_json,
-                visibility: request.visibility.unwrap_or(current.visibility),
-                updated_at: unix_timestamp(),
-            },
+    if api_key.is_some()
+        && !matches!(
+            current.provider,
+            ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible
         )
-        .await?;
+    {
+        return Err(ApiError::invalid_request(
+            "api_key updates are only supported for compatible providers",
+        ));
+    }
+    let replacement = api_key
+        .map(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                return Err(ApiError::invalid_request("api_key must not be empty"));
+            }
+            let (kind, format_version, credential_json) =
+                compatible_api_key_credential(SecretString::from(value))
+                    .map_err(|error| ApiError::invalid_request(error.message().to_owned()))?;
+            Ok(ProviderCredentialReplacement {
+                kind,
+                format_version,
+                credential_json,
+                expires_at: None,
+                last_refreshed_at: None,
+                updated_at: unix_timestamp(),
+            })
+        })
+        .transpose()?;
+    let metadata_requested =
+        label.is_some() || group_label.is_some() || base_url.is_some() || visibility.is_some();
+    let metadata = if metadata_requested {
+        let label = label.unwrap_or_else(|| current.label.clone());
+        let group_label = group_label.unwrap_or_else(|| current.group_label.clone());
+        let config_json = if let Some(base_url) = base_url {
+            let mut config: Value =
+                serde_json::from_str(&current.config_json).map_err(|_| ApiError::internal())?;
+            let config = config.as_object_mut().ok_or_else(ApiError::internal)?;
+            config.insert("base_url".to_owned(), Value::String(base_url));
+            Value::Object(config.clone()).to_string()
+        } else {
+            current.config_json.clone()
+        };
+        Some(ProviderAccountUpdate {
+            label,
+            group_label,
+            config_json,
+            visibility: visibility.unwrap_or(current.visibility),
+            updated_at: unix_timestamp(),
+        })
+    } else {
+        None
+    };
+    let account = match (metadata, replacement) {
+        (Some(metadata), Some(replacement)) => {
+            state
+                .manager
+                .update_account_with_credential(
+                    session.user.id.as_str(),
+                    &account_id,
+                    metadata,
+                    replacement,
+                )
+                .await?
+        }
+        (Some(metadata), None) => {
+            state
+                .manager
+                .update_account(session.user.id.as_str(), &account_id, metadata)
+                .await?
+        }
+        (None, Some(replacement)) => {
+            state
+                .manager
+                .update_credential(session.user.id.as_str(), &account_id, replacement)
+                .await?
+        }
+        (None, None) => return Err(ApiError::invalid_request("account update is empty")),
+    };
     Ok(data(account_json(&account)))
 }
 
@@ -317,6 +436,7 @@ async fn start_oauth_session(
             session.user.id.as_str(),
             request.provider,
             request.label,
+            request.group_label,
             request.visibility.unwrap_or_default(),
         )
         .await?;
@@ -348,33 +468,57 @@ async fn cancel_oauth_session(
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 enum CreateAccountRequest {
     CredentialJson {
         provider: ProviderKind,
         label: String,
+        group_label: String,
         credential_json: Value,
         visibility: Option<ProviderVisibility>,
     },
     Direct {
         provider: ProviderKind,
         label: String,
+        group_label: String,
         base_url: String,
-        api_key: Option<String>,
+        api_key: String,
         visibility: Option<ProviderVisibility>,
     },
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateAccountRequest {
     label: Option<String>,
+    group_label: Option<String>,
     base_url: Option<String>,
     visibility: Option<ProviderVisibility>,
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct SetEnabledRequest {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ProviderHealthParams {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+impl ProviderHealthParams {
+    fn range(&self) -> Result<TimeRange, ApiError> {
+        let to_ms = self.to_ms.unwrap_or_else(system_clock_ms);
+        let from_ms = self.from_ms.unwrap_or(to_ms - 24 * 60 * 60 * 1000);
+        TimeRange::new(from_ms, to_ms).map_err(|error| match error {
+            TimeRangeError::Empty => ApiError::invalid_request("to_ms must be after from_ms"),
+            TimeRangeError::TooWide => {
+                ApiError::invalid_request("range is wider than usage is retained for")
+            }
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -385,9 +529,11 @@ struct UpdateModelRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartOAuthRequest {
     provider: ProviderKind,
     label: String,
+    group_label: String,
     visibility: Option<ProviderVisibility>,
 }
 
@@ -405,7 +551,9 @@ fn account_json(account: &ProviderAccountSummary) -> Value {
         "visibility": account.visibility.as_str(),
         "provider": account.provider.as_str(),
         "label": account.label,
-        "config": serde_json::from_str::<Value>(&account.config_json).unwrap_or(Value::Null),
+        "group_label": account.group_label,
+        "config": serde_json::from_str::<Value>(&account.config_json)
+            .expect("stored provider config must be valid JSON"),
         "credential_kind": account.credential_kind.as_str(),
         "enabled": account.enabled,
         "auth_state": account.auth_state.as_str(),
@@ -420,13 +568,27 @@ fn account_with_quota_json(
     quota: provider_core::ProviderQuotaView,
 ) -> Value {
     let mut value = account_json(account);
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "quota".to_owned(),
-            serde_json::to_value(quota).unwrap_or(Value::Null),
-        );
-    }
     value
+        .as_object_mut()
+        .expect("provider account response must be an object")
+        .insert(
+            "quota".to_owned(),
+            serde_json::to_value(quota).expect("provider quota must serialize"),
+        );
+    value
+}
+
+fn provider_health_json(
+    account_id: &str,
+    summary: Option<&ProviderHealthSummary>,
+    _range: TimeRange,
+) -> Value {
+    json!({
+        "account_id": account_id,
+        "requests": summary.map_or(0, |summary| summary.requests),
+        "successes": summary.map_or(0, |summary| summary.successes),
+        "failures": summary.map_or(0, |summary| summary.failures),
+    })
 }
 
 fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiError> {
@@ -450,7 +612,8 @@ fn model_json(model: &StoredProviderModel) -> Value {
         "enabled": model.enabled,
         "available": model.available,
         "routable": model.routable,
-        "metadata": serde_json::from_str::<Value>(&model.metadata_json).unwrap_or(Value::Null),
+        "metadata": serde_json::from_str::<Value>(&model.metadata_json)
+            .expect("stored provider model metadata must be valid JSON"),
         "last_seen_at": model.last_seen_at,
         "created_at": model.created_at,
         "updated_at": model.updated_at
@@ -471,6 +634,7 @@ fn oauth_session_json(session: &OAuthSessionSnapshot) -> Value {
         "provider": session.provider.as_str(),
         "account_id": session.account_id.as_str(),
         "label": session.label,
+        "group_label": session.group_label,
         "status": status,
         "challenge": {
             "verification_uri": session.challenge.verification_uri,
@@ -501,9 +665,10 @@ fn data(value: Value) -> Json<Value> {
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+        .expect("system clock must be after unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("unix timestamp must fit i64")
 }
 
 struct ApiError {
@@ -513,11 +678,11 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn invalid_request(message: &'static str) -> Self {
+    fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
-            message: message.to_owned(),
+            message: message.into(),
         }
     }
 
@@ -738,6 +903,7 @@ mod tests {
                 owner_grant.user.id.as_str(),
                 ProviderKind::Grok,
                 "shared Grok".to_owned(),
+                "default".to_owned(),
                 credential_json,
                 provider_core::ProviderVisibility::Shared,
                 now,
@@ -855,7 +1021,7 @@ mod tests {
         let api_keys = ApiKeyAuthenticator::load(repository.clone())
             .await
             .expect("API key index");
-        let manager = ProviderManager::new(repository, runtime.clone());
+        let manager = ProviderManager::new(repository.clone(), runtime.clone());
         let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -881,6 +1047,7 @@ mod tests {
                     "method": "direct",
                     "provider": "codex",
                     "label": "unsupported direct Codex",
+                    "group_label": "default",
                     "base_url": base_url,
                     "api_key": "not-an-oauth-credential"
                 })
@@ -900,6 +1067,7 @@ mod tests {
                     "method": "credential_json",
                     "provider": "openai_compatible",
                     "label": "unsupported compatible credential",
+                    "group_label": "default",
                     "credential_json": {"type": "codex"}
                 })
                 .to_string(),
@@ -918,6 +1086,7 @@ mod tests {
                     "method": "credential_json",
                     "provider": "codex",
                     "label": "Codex OAuth",
+                    "group_label": "default",
                     "credential_json": {
                         "type": "codex",
                         "auth_kind": "oauth",
@@ -965,6 +1134,7 @@ mod tests {
                     "method": "direct",
                     "provider": "openai_compatible",
                     "label": "with key",
+                    "group_label": "default",
                     "base_url": base_url,
                     "api_key": "do-not-return"
                 })
@@ -988,7 +1158,50 @@ mod tests {
         );
         assert_eq!(with_key_body["data"]["account"]["visibility"], "private");
 
-        let without_key = client
+        let empty_update_key = client
+            .patch(format!("{endpoint}/{private_account_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"api_key":"  "}"#)
+            .send()
+            .await
+            .expect("reject empty compatible API key update");
+        assert_eq!(empty_update_key.status(), StatusCode::BAD_REQUEST);
+
+        let updated_compatible = client
+            .patch(format!("{endpoint}/{private_account_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "label": "updated compatible",
+                    "group_label": "default",
+                    "api_key": "replacement-provider-key"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("update compatible provider API key");
+        assert_eq!(updated_compatible.status(), StatusCode::OK);
+        let updated_compatible = updated_compatible
+            .text()
+            .await
+            .expect("updated compatible response");
+        assert!(!updated_compatible.contains("replacement-provider-key"));
+        let updated_compatible: Value =
+            serde_json::from_str(&updated_compatible).expect("updated compatible JSON");
+        assert_eq!(updated_compatible["data"]["label"], "updated compatible");
+
+        let refreshed_compatible = client
+            .post(format!("{endpoint}/{private_account_id}/models/refresh"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("refresh compatible models with replacement API key");
+        assert_eq!(refreshed_compatible.status(), StatusCode::OK);
+
+        let empty_key = client
             .post(&endpoint)
             .bearer_auth(&access_token)
             .header(header::CONTENT_TYPE, "application/json")
@@ -996,21 +1209,46 @@ mod tests {
                 serde_json::json!({
                     "method": "direct",
                     "provider": "openai_compatible",
-                    "label": "without key",
+                    "label": "empty key",
+                    "group_label": "default",
                     "base_url": base_url,
-                    "api_key": "",
+                    "api_key": ""
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("reject empty compatible API key");
+        assert_eq!(empty_key.status(), StatusCode::BAD_REQUEST);
+
+        let shared_account = client
+            .post(&endpoint)
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "method": "direct",
+                    "provider": "openai_compatible",
+                    "label": "shared account",
+                    "group_label": "default",
+                    "base_url": base_url,
+                    "api_key": "shared-provider-key",
                     "visibility": "shared"
                 })
                 .to_string(),
             )
             .send()
             .await
-            .expect("create keyless account");
-        assert_eq!(without_key.status(), StatusCode::CREATED);
-        let without_key_body: Value =
-            serde_json::from_slice(&without_key.bytes().await.expect("keyless response body"))
-                .expect("keyless response JSON");
-        let shared_account_id = without_key_body["data"]["account"]["id"]
+            .expect("create shared account");
+        assert_eq!(shared_account.status(), StatusCode::CREATED);
+        let shared_account_body: Value = serde_json::from_slice(
+            &shared_account
+                .bytes()
+                .await
+                .expect("shared account response body"),
+        )
+        .expect("shared account response JSON");
+        let shared_account_id = shared_account_body["data"]["account"]["id"]
             .as_str()
             .expect("shared account ID")
             .to_owned();
@@ -1024,8 +1262,9 @@ mod tests {
                     "method": "direct",
                     "provider": "openai_compatible",
                     "label": "member private",
+                    "group_label": "default",
                     "base_url": base_url,
-                    "api_key": ""
+                    "api_key": "member-provider-key"
                 })
                 .to_string(),
             )
@@ -1128,7 +1367,7 @@ mod tests {
             .post(format!("http://{address}/api/v1/oauth/sessions"))
             .bearer_auth(&member_access_token)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"provider":"grok","label":"member oauth","visibility":"shared"}"#)
+            .body(r#"{"provider":"grok","label":"member oauth","group_label":"default","visibility":"shared"}"#)
             .send()
             .await
             .expect("start member OAuth");
@@ -1176,7 +1415,13 @@ mod tests {
         runtime.shutdown();
         assert_eq!(
             authorization.lock().expect("authorization lock").as_slice(),
-            ["Bearer codex-access", "Bearer do-not-return", "", ""]
+            [
+                "Bearer codex-access",
+                "Bearer do-not-return",
+                "Bearer replacement-provider-key",
+                "Bearer shared-provider-key",
+                "Bearer member-provider-key",
+            ]
         );
     }
 

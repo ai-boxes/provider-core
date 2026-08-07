@@ -23,9 +23,8 @@ use axum::{
 use provider_auth::AuthenticatedSession;
 use provider_usage::{
     AttemptFacts, AttributionBasis, CacheTotals, CatalogPrices, CostStatus, CostTotals,
-    MAX_PAGE_SIZE, RequestCursor, RequestSummary, SeriesBucket, TimeRange, TimeRangeError,
-    TokenTotals, UsageOverview, UsageQuery, UsageRepository, UsageScope, UsageWriter,
-    system_clock_ms,
+    RequestCursor, RequestSummary, TimeRange, TimeRangeError, TokenTotals, UsageOverview,
+    UsageQuery, UsageRepository, UsageScope, UsageWriter, system_clock_ms,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,8 +47,7 @@ const DEFAULT_PAGE_SIZE: u32 = 50;
 pub(crate) fn router(services: UsageServices) -> Router {
     Router::new()
         .route("/api/v1/usage/overview", get(overview))
-        .route("/api/v1/usage/series", get(series))
-        .route("/api/v1/usage/keys", get(keys))
+        .route("/api/v1/usage/filters", get(filters))
         .route("/api/v1/usage/requests", get(requests))
         .route("/api/v1/usage/requests/{request_id}", get(request_detail))
         .route("/api/v1/usage/health", get(health))
@@ -57,13 +55,14 @@ pub(crate) fn router(services: UsageServices) -> Router {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RangeParams {
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     basis: Option<String>,
     api_key_id: Option<String>,
-    bucket: Option<String>,
-    limit: Option<u32>,
+    model: Option<String>,
+    group: Option<String>,
     cursor: Option<String>,
 }
 
@@ -81,7 +80,9 @@ impl RangeParams {
         })?;
         Ok(UsageScope {
             owner_user_id: session.user.id.as_str().to_owned(),
-            api_key_id: self.api_key_id.clone(),
+            api_key_id: normalized_filter(self.api_key_id.clone(), "api_key_id must not be empty")?,
+            client_model: normalized_filter(self.model.clone(), "model must not be empty")?,
+            group_label: normalized_filter(self.group.clone(), "group must not be empty")?,
             range,
             basis: self.basis()?,
         })
@@ -97,14 +98,6 @@ impl RangeParams {
             Some(_) => Err(ApiError::invalid_request(
                 "basis must be user_final_attempt or key_triggered_confirmed_dispatch",
             )),
-        }
-    }
-
-    fn bucket(&self) -> Result<SeriesBucket, ApiError> {
-        match self.bucket.as_deref() {
-            None | Some("hour") => Ok(SeriesBucket::Hour),
-            Some("day") => Ok(SeriesBucket::Day),
-            Some(_) => Err(ApiError::invalid_request("bucket must be hour or day")),
         }
     }
 }
@@ -123,62 +116,23 @@ async fn overview(
     Ok(data(overview_json(&scope, &overview)))
 }
 
-async fn series(
+async fn filters(
     State(services): State<UsageServices>,
     Extension(session): Extension<AuthenticatedSession>,
     Query(params): Query<RangeParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let scope = params.scope(&session)?;
-    let bucket = params.bucket()?;
-    let buckets = services
+    let mut scope = params.scope(&session)?;
+    scope.client_model = None;
+    scope.group_label = None;
+    let options = services
         .query
-        .series(&scope, bucket)
+        .filter_options(&scope)
         .await
         .map_err(|_| ApiError::internal())?;
 
     Ok(data(json!({
-        "attribution_basis": basis_name(scope.basis),
-        "bucket": match bucket { SeriesBucket::Hour => "hour", SeriesBucket::Day => "day" },
-        "from_ms": scope.range.from_ms,
-        "to_ms": scope.range.to_ms,
-        // Buckets with nothing recorded are absent rather than zero: "nothing
-        // happened" and "nothing was recorded" are different claims.
-        "buckets": buckets.iter().map(|bucket| json!({
-            "bucket_start_ms": bucket.bucket_start_ms,
-            "logical_requests": bucket.logical_requests,
-            "attempts": bucket.attempts,
-            "tokens": tokens_json(&bucket.tokens),
-            "cost": cost_json(&bucket.cost),
-        })).collect::<Vec<_>>(),
-    })))
-}
-
-async fn keys(
-    State(services): State<UsageServices>,
-    Extension(session): Extension<AuthenticatedSession>,
-    Query(params): Query<RangeParams>,
-) -> Result<Json<Value>, ApiError> {
-    let scope = params.scope(&session)?;
-    let summaries = services
-        .query
-        .key_summaries(&scope)
-        .await
-        .map_err(|_| ApiError::internal())?;
-
-    Ok(data(json!({
-        "attribution_basis": basis_name(scope.basis),
-        "from_ms": scope.range.from_ms,
-        "to_ms": scope.range.to_ms,
-        "keys": summaries.iter().map(|summary| json!({
-            // Null for usage recorded without a key, kept distinct from a key id.
-            "api_key_id": summary.api_key_id,
-            "logical_requests": summary.logical_requests,
-            "attempts": summary.attempts,
-            "tokens": tokens_json(&summary.tokens),
-            "cost": cost_json(&summary.cost),
-        })).collect::<Vec<_>>(),
-        // Says so rather than letting a truncated list look complete.
-        "truncated": summaries.len() as u32 >= MAX_PAGE_SIZE,
+        "models": options.client_models,
+        "groups": options.group_labels,
     })))
 }
 
@@ -189,15 +143,15 @@ async fn requests(
 ) -> Result<Json<Value>, ApiError> {
     let scope = params.scope(&session)?;
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-    let limit = params.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
     let page = services
         .query
-        .requests(&scope, cursor.as_ref(), limit)
+        .requests(&scope, cursor.as_ref(), DEFAULT_PAGE_SIZE)
         .await
         .map_err(|_| ApiError::internal())?;
 
     Ok(data(json!({
         "attribution_basis": basis_name(scope.basis),
+        "page_size": DEFAULT_PAGE_SIZE,
         "requests": page.requests.iter().map(request_json).collect::<Vec<_>>(),
         "next_cursor": page.next.as_ref().map(encode_cursor),
     })))
@@ -300,7 +254,6 @@ fn cache_json(cache: &CacheTotals) -> Value {
         // In the denominator but unreported. Counting these as misses would
         // understate the hit rate.
         "expected_but_unreported": cache.expected_but_unreported,
-        "excluded": cache.excluded,
     })
 }
 
@@ -309,9 +262,6 @@ fn cost_json(cost: &CostTotals) -> Value {
         "basis": "observed_catalog",
         "complete_usd": cost.complete_atoms.to_decimal_string(),
         "complete_attempts": cost.complete_attempts,
-        // Deliberately a separate number. Adding it to `complete_usd` would
-        // present an incomplete estimate as a complete one.
-        "partial_known_usd": cost.partial_known_atoms.to_decimal_string(),
         "partial_attempts": cost.partial_attempts,
         // No amount at all — never rendered as 0.
         "unavailable_attempts": cost.unavailable_attempts,
@@ -322,15 +272,31 @@ fn request_json(request: &RequestSummary) -> Value {
     json!({
         "request_id": request.request_id,
         "api_key_id": request.api_key_id,
+        "api_key_label": request.api_key_label,
+        "api_key_group_label": request.api_key_group_label,
         "client_model": request.client_model_raw,
+        "reasoning_effort": request.reasoning_effort,
         "started_at_ms": request.started_at_ms,
         "completed_at_ms": request.completed_at_ms,
-        "status": name(&request.status),
-        "tracking": encode(&request.tracking),
-        "attempts": request.attempts,
+        "first_token_at_ms": request.first_token_at_ms,
         "tokens": tokens_json(&request.tokens),
         "cost": cost_json(&request.cost),
     })
+}
+
+fn normalized_filter(
+    value: Option<String>,
+    empty_message: &'static str,
+) -> Result<Option<String>, ApiError> {
+    value
+        .map(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                return Err(ApiError::invalid_request(empty_message));
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn attempt_json(attempt: &AttemptFacts) -> Value {
@@ -342,6 +308,7 @@ fn attempt_json(attempt: &AttemptFacts) -> Value {
         "configured_model": attempt.configured_model,
         "provider_reported_model": attempt.provider_reported_model,
         "started_at_ms": attempt.started_at_ms,
+        "first_token_at_ms": attempt.first_token_at_ms,
         "completed_at_ms": attempt.completed_at_ms,
         "dispatch_evidence": name(&attempt.dispatch_evidence),
         "tracking": encode(&attempt.tracking),
@@ -370,7 +337,7 @@ fn attempt_json(attempt: &AttemptFacts) -> Value {
             "resolution": encode(&attempt.price)
                 .get("kind")
                 .cloned()
-                .unwrap_or(Value::Null),
+                .expect("price resolution serialization must contain kind"),
             "catalog_revision": attempt.price.resolved()
                 .map(|record| record.catalog_revision.clone()),
             "catalog_model_id": attempt.price.resolved()
@@ -386,14 +353,15 @@ fn attempt_json(attempt: &AttemptFacts) -> Value {
 /// hand-written one that could drift — a `Debug` string would render
 /// `InProgress` as `inprogress`.
 fn encode<T: serde::Serialize>(value: &T) -> Value {
-    serde_json::to_value(value).unwrap_or(Value::Null)
+    serde_json::to_value(value).expect("usage domain value must serialize")
 }
 
 /// The snake_case name of a fieldless enum value.
 fn name<T: serde::Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(Value::String(name)) => name,
-        _ => String::from("unknown"),
+        Ok(_) => panic!("usage fieldless enum must serialize as a string"),
+        Err(error) => panic!("usage fieldless enum must serialize: {error}"),
     }
 }
 
@@ -409,6 +377,9 @@ fn decode_cursor(raw: &str) -> Result<RequestCursor, ApiError> {
     let (completed_at_ms, request_id) = raw
         .split_once(':')
         .ok_or_else(|| ApiError::invalid_request("cursor is malformed"))?;
+    if request_id.is_empty() {
+        return Err(ApiError::invalid_request("cursor is malformed"));
+    }
     Ok(RequestCursor {
         completed_at_ms: completed_at_ms
             .parse()

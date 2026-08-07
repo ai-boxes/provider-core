@@ -212,7 +212,9 @@ async fn list_keys(
     Extension(session): Extension<AuthenticatedSession>,
 ) -> Result<Json<Value>, AuthApiError> {
     let keys = state.api_keys.list(&session.user.id).await?;
-    Ok(data(Value::Array(keys.iter().map(api_key_json).collect())))
+    Ok(data(Value::Array(
+        keys.iter().map(api_key_json).collect::<Result<_, _>>()?,
+    )))
 }
 
 async fn generate_key(
@@ -234,13 +236,15 @@ async fn create_key(
         .api_keys
         .create(
             &session.user.id,
+            request.group_label,
             request.label,
             request.key.map(SecretString::from),
             request.expires_at,
+            request.quota_limit_usd,
             unix_timestamp(),
         )
         .await?;
-    Ok((StatusCode::CREATED, data(created_api_key_json(&key))))
+    Ok((StatusCode::CREATED, data(created_api_key_json(&key)?)))
 }
 
 async fn get_key(
@@ -252,7 +256,7 @@ async fn get_key(
         .api_keys
         .get(&session.user.id, &parse_api_key_id(&key_id)?)
         .await?;
-    Ok(data(stored_api_key_json(&key)))
+    Ok(data(stored_api_key_json(&key)?))
 }
 
 async fn update_key(
@@ -262,7 +266,12 @@ async fn update_key(
     request: Result<Json<UpdateApiKeyRequest>, JsonRejection>,
 ) -> Result<Json<Value>, AuthApiError> {
     let request = json_request(request)?;
-    if request.enabled.is_none() && request.expires_at.is_none() {
+    if request.enabled.is_none()
+        && request.label.is_none()
+        && request.group_label.is_none()
+        && request.expires_at.is_none()
+        && request.quota_limit_usd.is_none()
+    {
         return Err(AuthApiError::invalid_request(
             "at least one API key field must be provided",
         ));
@@ -272,12 +281,15 @@ async fn update_key(
         .update(
             &session.user.id,
             &parse_api_key_id(&key_id)?,
+            request.label,
+            request.group_label,
             request.enabled,
             request.expires_at.map(|value| value.0),
+            request.quota_limit_usd.map(|value| value.0),
             unix_timestamp(),
         )
         .await?;
-    Ok(data(api_key_json(&key)))
+    Ok(data(api_key_json(&key)?))
 }
 
 async fn delete_key(
@@ -326,18 +338,29 @@ struct RefreshRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateApiKeyRequest {
     label: String,
+    group_label: String,
     key: Option<String>,
     expires_at: Option<i64>,
+    /// Positive USD decimal string, or omitted for unlimited.
+    quota_limit_usd: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateApiKeyRequest {
+    label: Option<String>,
+    group_label: Option<String>,
     enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_expiry")]
     expires_at: Option<NullableExpiry>,
+    #[serde(default, deserialize_with = "deserialize_optional_quota")]
+    quota_limit_usd: Option<NullableQuota>,
 }
+
+struct NullableQuota(Option<String>);
 
 struct NullableExpiry(Option<i64>);
 
@@ -346,6 +369,13 @@ where
     D: Deserializer<'de>,
 {
     Option::<i64>::deserialize(deserializer).map(|value| Some(NullableExpiry(value)))
+}
+
+fn deserialize_optional_quota<'de, D>(deserializer: D) -> Result<Option<NullableQuota>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| Some(NullableQuota(value)))
 }
 
 fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, AuthApiError> {
@@ -397,38 +427,60 @@ fn user_json(user: &UserSummary) -> Value {
     })
 }
 
-fn created_api_key_json(created: &CreatedApiKey) -> Value {
-    let mut value = api_key_json(&created.summary);
+fn created_api_key_json(created: &CreatedApiKey) -> Result<Value, AuthApiError> {
+    let mut value = api_key_json(&created.summary)?;
     value["key"] = Value::String(created.key.expose_secret().to_owned());
-    value
+    Ok(value)
 }
 
-fn api_key_json(key: &ApiKeySummary) -> Value {
-    json!({
+fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
+    let quota_limit_usd = key
+        .quota_limit_atoms
+        .as_deref()
+        .map(provider_auth::format_usd_atoms)
+        .transpose()
+        .map_err(|()| AuthApiError::internal())?;
+    let spent_usd =
+        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
+    Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
+        "group_label": key.group_label,
         "label": key.label,
         "key": key.key,
         "enabled": key.enabled,
         "expires_at": key.expires_at,
+        "quota_limit_usd": quota_limit_usd,
+        "spent_usd": spent_usd,
         "last_used_at": key.last_used_at,
         "created_at": key.created_at,
         "updated_at": key.updated_at
-    })
+    }))
 }
 
-fn stored_api_key_json(key: &StoredApiKey) -> Value {
-    json!({
+fn stored_api_key_json(key: &StoredApiKey) -> Result<Value, AuthApiError> {
+    let quota_limit_usd = key
+        .quota_limit_atoms
+        .as_deref()
+        .map(provider_auth::format_usd_atoms)
+        .transpose()
+        .map_err(|()| AuthApiError::internal())?;
+    let spent_usd =
+        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
+    Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
+        "group_label": key.group_label,
         "label": key.label,
         "key": key.key.expose_secret(),
         "enabled": key.enabled,
         "expires_at": key.expires_at,
+        "quota_limit_usd": quota_limit_usd,
+        "spent_usd": spent_usd,
         "last_used_at": key.last_used_at,
         "created_at": key.created_at,
         "updated_at": key.updated_at
-    })
+    }))
 }
 
 fn data(value: Value) -> Json<Value> {
@@ -455,6 +507,22 @@ impl AuthApiError {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
             message,
+        }
+    }
+
+    fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error_type: "authorization_error",
+            message: "forbidden",
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_type: "not_found_error",
+            message: "resource was not found",
         }
     }
 
@@ -488,26 +556,29 @@ impl From<AuthError> for AuthApiError {
             | AuthError::InvalidRefreshToken
             | AuthError::InvalidApiKey
             | AuthError::Credential(CredentialError::SessionExpired) => Self::unauthorized(),
-            AuthError::Forbidden => Self {
-                status: StatusCode::FORBIDDEN,
-                error_type: "forbidden_error",
-                message: "operation is not allowed",
-            },
-            AuthError::NotFound => Self {
-                status: StatusCode::NOT_FOUND,
-                error_type: "not_found_error",
-                message: "resource was not found",
-            },
+            AuthError::Forbidden => Self::forbidden(),
+            AuthError::NotFound => Self::not_found(),
+            AuthError::GroupNotFound => {
+                Self::invalid_request("no visible provider accounts use this group label")
+            }
             AuthError::InvalidUsername
             | AuthError::InvalidLabel
             | AuthError::InvalidExpiry
+            | AuthError::InvalidQuotaLimit
+            | AuthError::InvalidGroup
             | AuthError::Credential(CredentialError::PasswordTooShort)
             | AuthError::Credential(CredentialError::PasswordTooLong)
             | AuthError::Credential(CredentialError::ApiKeyTooShort)
             | AuthError::Credential(CredentialError::ApiKeyTooLong) => {
                 Self::invalid_request("request validation failed")
             }
+            AuthError::QuotaExceeded | AuthError::QuotaInFlight => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_type: "insufficient_quota",
+                message: "API key USD quota has been exhausted",
+            },
             AuthError::PasswordTask
+            | AuthError::QuotaLedgerUnavailable
             | AuthError::Repository(_)
             | AuthError::Credential(CredentialError::RandomSource)
             | AuthError::Credential(CredentialError::PasswordHash)
@@ -532,12 +603,46 @@ impl IntoResponse for AuthApiError {
 mod tests {
     use std::sync::Arc;
 
+    use provider_core::{
+        AccountId, CredentialKind, NewCredential, NewProviderAccount, ProviderKind,
+        ProviderManagementRepository, ProviderVisibility,
+    };
     use provider_management::ProviderManager;
     use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
     use tokio::net::TcpListener;
 
     use super::*;
+
+    async fn seed_account_with_group(
+        repository: Arc<SqliteAccountRepository>,
+        owner: &UserId,
+        account_id: &str,
+        group_label: &str,
+    ) {
+        repository
+            .create_provider_account(
+                NewProviderAccount {
+                    id: AccountId::new(account_id).expect("account ID"),
+                    provider: ProviderKind::OpenAiCompatible,
+                    label: "seed".to_owned(),
+                    group_label: group_label.to_owned(),
+                    config_json: "{}".to_owned(),
+                    enabled: true,
+                    credential: NewCredential {
+                        kind: CredentialKind::ApiKey,
+                        format_version: 1,
+                        credential_json: SecretString::from("seed-secret".to_owned()),
+                        expires_at: None,
+                        last_refreshed_at: None,
+                    },
+                },
+                owner.as_str(),
+                ProviderVisibility::Private,
+            )
+            .await
+            .expect("seed provider account");
+    }
 
     #[tokio::test]
     async fn auth_lifecycle_manages_retrievable_api_keys() {
@@ -551,7 +656,7 @@ mod tests {
             .await
             .expect("API key index");
         let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
-        let manager = ProviderManager::new(repository, runtime.clone());
+        let manager = ProviderManager::new(repository.clone(), runtime.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind auth server");
@@ -648,17 +753,36 @@ mod tests {
             0
         );
 
+        let owner_id = setup_body["data"]["user"]["id"]
+            .as_str()
+            .expect("setup user ID")
+            .to_owned();
+        seed_account_with_group(
+            repository.clone(),
+            &UserId::new(owner_id.clone()).expect("user ID"),
+            "acct-auth-1",
+            "shared-codex",
+        )
+        .await;
         let custom_key = "custom-key-12345";
         let created_key = post_json(
             &client,
             format!("{base_url}/api/v1/keys"),
-            json!({ "label": "local", "key": custom_key }),
+            json!({
+                "label": "local",
+                "key": custom_key,
+                "group_label": "shared-codex",
+                "quota_limit_usd": "12.5"
+            }),
             Some(&access_token),
         )
         .await;
         assert_eq!(created_key.status(), StatusCode::CREATED);
         let created_key = response_json(created_key).await;
         assert_eq!(created_key["data"]["key"], custom_key);
+        assert_eq!(created_key["data"]["group_label"], "shared-codex");
+        assert_eq!(created_key["data"]["quota_limit_usd"], "12.50000000000000");
+        assert_eq!(created_key["data"]["spent_usd"], "0.00000000000000");
         let key_id = created_key["data"]["id"]
             .as_str()
             .expect("API key ID")
@@ -723,6 +847,69 @@ mod tests {
             .expect("foreign API key update");
         assert_eq!(foreign_update.status(), StatusCode::NOT_FOUND);
 
+        seed_account_with_group(
+            repository.clone(),
+            &UserId::new(owner_id.clone()).expect("user ID"),
+            "acct-auth-2",
+            "shared-claude",
+        )
+        .await;
+        let renamed = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "label": "renamed-local",
+                    "group_label": "shared-claude",
+                    "quota_limit_usd": "20"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("update API key label and group");
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed = response_json(renamed).await;
+        assert_eq!(renamed["data"]["label"], "renamed-local");
+        assert_eq!(renamed["data"]["group_label"], "shared-claude");
+        assert_eq!(renamed["data"]["quota_limit_usd"], "20.00000000000000");
+
+        let unlimited = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"quota_limit_usd":null}"#)
+            .send()
+            .await
+            .expect("clear API key quota");
+        assert_eq!(unlimited.status(), StatusCode::OK);
+        let unlimited = response_json(unlimited).await;
+        assert_eq!(unlimited["data"]["quota_limit_usd"], Value::Null);
+        assert_eq!(unlimited["data"]["spent_usd"], "0.00000000000000");
+
+        for quota_limit_usd in ["", "0", "-1", "1.000000000000001"] {
+            let invalid_quota = client
+                .put(format!("{base_url}/api/v1/keys/{key_id}"))
+                .bearer_auth(&access_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json!({ "quota_limit_usd": quota_limit_usd }).to_string())
+                .send()
+                .await
+                .expect("reject invalid API key quota");
+            assert_eq!(invalid_quota.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let unknown_field = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"quota_limit":10,"enabled":true}"#)
+            .send()
+            .await
+            .expect("reject unknown API key field");
+        assert_eq!(unknown_field.status(), StatusCode::BAD_REQUEST);
+
         let expires_at = unix_timestamp() + 3600;
         let updated_expiry = client
             .put(format!("{base_url}/api/v1/keys/{key_id}"))
@@ -758,6 +945,16 @@ mod tests {
             .expect("disable API key");
         assert_eq!(disabled.status(), StatusCode::OK);
         assert_eq!(response_json(disabled).await["data"]["enabled"], false);
+
+        let invalid_group = client
+            .put(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"enabled":false,"group_label":"missing"}"#)
+            .send()
+            .await
+            .expect("reject missing provider group for disabled API key");
+        assert_eq!(invalid_group.status(), StatusCode::BAD_REQUEST);
 
         let old_enabled_route = client
             .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
@@ -869,7 +1066,7 @@ mod tests {
             .await
             .expect("API key index");
         let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
-        let manager = ProviderManager::new(repository, runtime.clone());
+        let manager = ProviderManager::new(repository.clone(), runtime.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind auth server");

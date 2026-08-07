@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 
 use crate::{
-    ProtocolBridge, Provider, ProviderAccountAccess, ProviderError, ProviderErrorKind,
+    AccountId, ProtocolBridge, Provider, ProviderAccountAccess, ProviderError, ProviderErrorKind,
     ProviderModel, ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter,
     ProviderStream, ProxyRequest, RoutableProviderModel, WireFormat,
 };
@@ -34,9 +34,14 @@ impl ProxyService {
     }
 
     #[must_use]
-    pub fn models(&self, user_id: &str, source_format: WireFormat) -> Vec<ProviderModel> {
+    pub fn models(
+        &self,
+        user_id: &str,
+        source_format: WireFormat,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<ProviderModel> {
         self.router
-            .models(user_id)
+            .models(user_id, account_ids)
             .into_iter()
             .filter(|model| {
                 model
@@ -52,8 +57,10 @@ impl ProxyService {
         &self,
         user_id: &str,
         request: ProxyRequest,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Result<ProviderStream, ProviderError> {
-        self.execute_tracked_stream(user_id, request, None).await
+        self.execute_tracked_stream(user_id, request, None, account_ids)
+            .await
     }
 
     /// Execute a request, reporting usage facts through `tracking`.
@@ -65,8 +72,9 @@ impl ProxyService {
         user_id: &str,
         request: ProxyRequest,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Result<ProviderStream, ProviderError> {
-        let route = self.resolve_route(user_id, &request)?;
+        let route = self.resolve_route(user_id, &request, account_ids)?;
         let mut request = request;
         request.model = route.upstream_model;
         let prepared = self
@@ -81,8 +89,9 @@ impl ProxyService {
         &self,
         user_id: &str,
         request: ProxyRequest,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Result<u64, ProviderError> {
-        let route = self.resolve_route(user_id, &request)?;
+        let route = self.resolve_route(user_id, &request, account_ids)?;
         let mut request = request;
         request.model = route.upstream_model;
         let prepared = self
@@ -96,6 +105,7 @@ impl ProxyService {
         &self,
         user_id: &str,
         request: &ProxyRequest,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Result<ProviderRouteCandidate, ProviderError> {
         let native_formats = [
             WireFormat::OpenAiResponses,
@@ -111,6 +121,7 @@ impl ProxyService {
                 &request.model,
                 &native_formats,
                 request.metadata.session_id.as_deref(),
+                account_ids,
             )
             .into_iter()
             .next()
@@ -143,7 +154,11 @@ impl SingleProviderRouter {
 }
 
 impl ProviderRouter for SingleProviderRouter {
-    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel> {
+    fn models(
+        &self,
+        user_id: &str,
+        _account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel> {
         if self.access.allows(user_id) {
             self.provider
                 .models()
@@ -165,6 +180,7 @@ impl ProviderRouter for SingleProviderRouter {
         model: &str,
         native_formats: &[WireFormat],
         _session_id: Option<&str>,
+        _account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate> {
         if !self.access.allows(user_id) || !native_formats.contains(&self.provider.native_format())
         {

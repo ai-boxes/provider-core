@@ -38,10 +38,9 @@ pub use lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal};
 pub use money::{AMOUNT_SCALE, PRICE_SCALE, UnitPrice, UsdAtoms, component_cost_atoms};
 pub use price::{ComponentPrices, InlinePriceRecord, PriceResolution};
 pub use query::{
-    ATOM_SPLIT, AttributionBasis, CacheTotals, CostTotals, KeySummary, MAX_PAGE_SIZE,
-    MAX_QUERY_RANGE, RequestCursor, RequestPage, RequestSummary, SeriesBucket, TimeRange,
-    TimeRangeError, TokenTotals, UsageBucket, UsageOverview, UsageQuery, UsageScope,
-    recombine_atoms,
+    ATOM_SPLIT, AttributionBasis, CacheTotals, CostTotals, MAX_PAGE_SIZE, MAX_QUERY_RANGE,
+    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TimeRange, TimeRangeError,
+    TokenTotals, UsageFilterOptions, UsageOverview, UsageQuery, UsageScope, recombine_atoms,
 };
 pub use refresh::{
     CatalogFetch, CatalogFetchError, CatalogRefresher, CatalogSource, DEFAULT_REFRESH_PERIOD,
@@ -56,8 +55,8 @@ pub use retention::{
     RetentionWorker,
 };
 pub use tracking::{
-    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, NoCatalog, PriceResolver, UsageTracking,
-    system_clock_ms,
+    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, NoCatalog, PriceResolver, SpendObserver,
+    UsageTracking, system_clock_ms,
 };
 pub use writer::{
     DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, SubmitOutcome, UsageFact, UsageWrite, UsageWriter,

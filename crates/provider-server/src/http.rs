@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -9,9 +10,11 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-use provider_auth::{ApiKeyAuthenticator, AuthService, AuthenticatedApiKey};
+use provider_auth::{
+    ApiKeyAuthenticator, ApiKeyQuotaLease, AuthError, AuthService, AuthenticatedApiKey,
+};
 use provider_core::{
-    ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
+    AccountId, ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
     ProxyService, RequestMetadata, WireFormat,
 };
 use provider_management::ProviderManager;
@@ -75,7 +78,7 @@ pub fn router_with_management_and_usage(
 ) -> Router {
     let auth_state =
         crate::auth_http::AuthHttpState::new(auth.clone(), api_keys.clone(), manager.clone());
-    let mut management = crate::management_http::router(manager);
+    let mut management = crate::management_http::router(manager, usage.clone());
     if let Some(usage) = &usage {
         // Behind the same session guard as the rest of management: usage is read
         // by a logged-in person, never with a proxy API key.
@@ -97,7 +100,10 @@ async fn models(
 ) -> Result<Json<Value>, HttpError> {
     let protocol = models_protocol(&headers);
     let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
-    let models = state.service.models(key.owner_user_id.as_str(), protocol);
+    let account_ids = load_key_account_filter(&state.api_keys, &key, protocol).await?;
+    let models = state
+        .service
+        .models(key.owner_user_id.as_str(), protocol, Some(&account_ids));
     Ok(Json(match protocol {
         WireFormat::ClaudeMessages => claude_models_response(models),
         WireFormat::OpenAiResponses | WireFormat::OpenAiChatCompletions => json!({
@@ -229,9 +235,11 @@ async fn count_tokens(
 ) -> Result<Json<Value>, HttpError> {
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
     let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
+    let account_ids =
+        load_key_account_filter(&state.api_keys, &key, WireFormat::ClaudeMessages).await?;
     let count = state
         .service
-        .count_tokens(key.owner_user_id.as_str(), request)
+        .count_tokens(key.owner_user_id.as_str(), request, Some(&account_ids))
         .await
         .map_err(|error| HttpError::from_provider(WireFormat::ClaudeMessages, error))?;
 
@@ -246,10 +254,29 @@ async fn proxy_prepared_stream(
 ) -> Result<Response, HttpError> {
     let protocol = request.format;
     let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
+    let quota_lease = match ensure_key_quota(&state.api_keys, key, protocol).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(error);
+        }
+    };
+    let account_ids = match load_key_account_filter(&state.api_keys, key, protocol).await {
+        Ok(account_ids) => account_ids,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(error);
+        }
+    };
 
     let stream = match state
         .service
-        .execute_tracked_stream(key.owner_user_id.as_str(), request, tracking.as_ref())
+        .execute_tracked_stream(
+            key.owner_user_id.as_str(),
+            request,
+            tracking.as_ref(),
+            Some(&account_ids),
+        )
         .await
     {
         Ok(stream) => stream,
@@ -259,10 +286,7 @@ async fn proxy_prepared_stream(
         }
     };
 
-    let body = match logical {
-        Some(logical) => Body::from_stream(observe_delivery(stream, logical)),
-        None => Body::from_stream(stream),
-    };
+    let body = Body::from_stream(observe_delivery(stream, logical, quota_lease));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -294,11 +318,19 @@ async fn parse_tracked_payload(
                     model.to_owned()
                 }
             });
-            let logical = begin_tracking(state, key, client_model_raw, routing_model).await;
+            let reasoning_effort = request_reasoning_effort(&payload);
+            let logical = begin_tracking(
+                state,
+                key,
+                client_model_raw,
+                routing_model,
+                reasoning_effort,
+            )
+            .await;
             Ok((payload, logical))
         }
         Err(error) => {
-            let logical = begin_tracking(state, key, None, None).await;
+            let logical = begin_tracking(state, key, None, None, None).await;
             finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
             Err(error)
         }
@@ -323,6 +355,7 @@ async fn begin_tracking(
     key: &AuthenticatedApiKey,
     client_model_raw: Option<String>,
     routing_model: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Option<Arc<LogicalTracker>> {
     let usage = state.usage.as_ref()?;
     Some(
@@ -331,22 +364,45 @@ async fn begin_tracking(
                 request_id: uuid::Uuid::new_v4().to_string(),
                 owner_user_id: key.owner_user_id.to_string(),
                 api_key_id: Some(key.key_id.to_string()),
+                api_key_label: Some(key.label.clone()),
+                api_key_group_label: Some(key.group_label.clone()),
                 client_model_raw,
                 routing_model,
+                reasoning_effort,
                 started_at_ms: provider_usage::system_clock_ms(),
             })
             .await,
     )
 }
 
+/// Capture the client-declared reasoning level without interpreting provider
+/// output tokens as a request setting. Responses uses `reasoning.effort`, while
+/// Chat Completions clients commonly use the flat `reasoning_effort` spelling.
+fn request_reasoning_effort(payload: &Value) -> Option<String> {
+    let value = payload
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .or_else(|| payload.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)?;
+    Some(value.to_owned())
+}
+
 /// Wrap the response body so the logical request learns how delivery ended.
 ///
 /// This is the only place that can tell a clean end from a client that hung up,
 /// because both happen after the handler has already returned the response.
-fn observe_delivery(stream: ProviderStream, logical: Arc<LogicalTracker>) -> ProviderStream {
+fn observe_delivery(
+    stream: ProviderStream,
+    logical: Option<Arc<LogicalTracker>>,
+    quota_lease: ApiKeyQuotaLease,
+) -> ProviderStream {
     struct Delivery {
         inner: Option<ProviderStream>,
-        logical: Arc<LogicalTracker>,
+        logical: Option<Arc<LogicalTracker>>,
+        _quota_lease: ApiKeyQuotaLease,
         sent_bytes: bool,
     }
 
@@ -355,8 +411,10 @@ fn observe_delivery(stream: ProviderStream, logical: Arc<LogicalTracker>) -> Pro
             // Closing the inner observer first lets it commit the attempt and
             // final_attempt_id before the logical terminal snapshots them.
             drop(self.inner.take());
-            self.logical.record_delivery(DeliveryOutcome::ClientDrop);
-            self.logical.finish();
+            if let Some(logical) = self.logical.as_ref() {
+                logical.record_delivery(DeliveryOutcome::ClientDrop);
+                logical.finish();
+            }
         }
     }
 
@@ -364,6 +422,7 @@ fn observe_delivery(stream: ProviderStream, logical: Arc<LogicalTracker>) -> Pro
         Delivery {
             inner: Some(stream),
             logical,
+            _quota_lease: quota_lease,
             sent_bytes: false,
         },
         |mut state| async move {
@@ -380,19 +439,21 @@ fn observe_delivery(stream: ProviderStream, logical: Arc<LogicalTracker>) -> Pro
                     // The body error is terminal to the downstream. Drop the
                     // usage observer now so the attempt closes before logical.
                     drop(state.inner.take());
-                    state
-                        .logical
-                        .record_execution(ExecutionOutcome::TranslatorOrStreamError);
-                    state.logical.record_delivery(if state.sent_bytes {
-                        DeliveryOutcome::ErrorAfterBytes
-                    } else {
-                        DeliveryOutcome::ErrorBeforeBytes
-                    });
-                    state.logical.finish();
+                    if let Some(logical) = state.logical.as_ref() {
+                        logical.record_execution(ExecutionOutcome::TranslatorOrStreamError);
+                        logical.record_delivery(if state.sent_bytes {
+                            DeliveryOutcome::ErrorAfterBytes
+                        } else {
+                            DeliveryOutcome::ErrorBeforeBytes
+                        });
+                        logical.finish();
+                    }
                     Some((Err(error), state))
                 }
                 None => {
-                    state.logical.record_delivery(DeliveryOutcome::CleanEof);
+                    if let Some(logical) = state.logical.as_ref() {
+                        logical.record_delivery(DeliveryOutcome::CleanEof);
+                    }
                     None
                 }
             }
@@ -553,7 +614,11 @@ fn claude_code_cache_key(key: &AuthenticatedApiKey, model: &str, session_id: &st
         model,
         session_id,
     ] {
-        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(
+            u64::try_from(value.len())
+                .expect("request metadata length must fit u64")
+                .to_be_bytes(),
+        );
         digest.update(value.as_bytes());
     }
     let digest = digest.finalize();
@@ -595,6 +660,42 @@ fn valid_metadata_value(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+async fn load_key_account_filter(
+    api_keys: &ApiKeyAuthenticator,
+    key: &AuthenticatedApiKey,
+    protocol: WireFormat,
+) -> Result<HashSet<AccountId>, HttpError> {
+    let account_ids = api_keys
+        .account_ids_for_key(&key.owner_user_id, &key.group_label)
+        .await
+        .map_err(|_| HttpError::internal(protocol))?;
+    let mut set = HashSet::new();
+    for account_id in account_ids {
+        let id = AccountId::new(account_id).map_err(|_| HttpError::internal(protocol))?;
+        set.insert(id);
+    }
+    Ok(set)
+}
+
+async fn ensure_key_quota(
+    api_keys: &ApiKeyAuthenticator,
+    key: &AuthenticatedApiKey,
+    protocol: WireFormat,
+) -> Result<ApiKeyQuotaLease, HttpError> {
+    match api_keys.acquire_quota(key).await {
+        Ok(lease) => Ok(lease),
+        Err(AuthError::QuotaExceeded) => Err(HttpError::rate_limited(
+            protocol,
+            "API key USD quota has been exhausted",
+        )),
+        Err(AuthError::QuotaInFlight) => Err(HttpError::rate_limited(
+            protocol,
+            "API key already has a request in flight",
+        )),
+        Err(_) => Err(HttpError::internal(protocol)),
+    }
 }
 
 fn authenticate_api_key(
@@ -639,9 +740,10 @@ fn bearer_value(value: &str) -> Option<&str> {
 fn unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+        .expect("system clock must be after unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("unix timestamp must fit i64")
 }
 
 struct HttpError {
@@ -674,6 +776,15 @@ impl HttpError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
             "internal server error",
+        )
+    }
+
+    fn rate_limited(protocol: WireFormat, message: &str) -> Self {
+        Self::new(
+            protocol,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            message,
         )
     }
 
@@ -725,7 +836,9 @@ mod tests {
     use futures_util::stream;
     use provider_auth::{ApiKeyId, AuthService, UserId};
     use provider_core::{
-        Provider, ProviderModel, ProviderRequest, ProviderStream, RequestMetadata,
+        AccountId, CredentialKind, NewCredential, NewProviderAccount, Provider, ProviderKind,
+        ProviderManagementRepository, ProviderModel, ProviderRequest, ProviderStream,
+        ProviderVisibility, RequestMetadata,
     };
     use provider_protocol::DefaultProtocolBridge;
     use provider_storage::SqliteAccountRepository;
@@ -733,6 +846,36 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    async fn seed_group_label(
+        repository: Arc<SqliteAccountRepository>,
+        owner: &UserId,
+        account_id: &str,
+        group_label: &str,
+    ) {
+        repository
+            .create_provider_account(
+                NewProviderAccount {
+                    id: AccountId::new(account_id).expect("account ID"),
+                    provider: ProviderKind::OpenAiCompatible,
+                    label: "seed".to_owned(),
+                    group_label: group_label.to_owned(),
+                    config_json: "{}".to_owned(),
+                    enabled: true,
+                    credential: NewCredential {
+                        kind: CredentialKind::ApiKey,
+                        format_version: 1,
+                        credential_json: SecretString::from("seed-secret".to_owned()),
+                        expires_at: None,
+                        last_refreshed_at: None,
+                    },
+                },
+                owner.as_str(),
+                ProviderVisibility::Private,
+            )
+            .await
+            .expect("seed provider account");
+    }
 
     async fn response_json(response: reqwest::Response) -> Value {
         let body = response.bytes().await.expect("response body");
@@ -793,16 +936,20 @@ mod tests {
             )
             .await
             .expect("initial setup");
+        let now = unix_timestamp();
+        seed_group_label(repository.clone(), &grant.user.id, "acct-http-1", "default").await;
         let api_keys = ApiKeyAuthenticator::load(repository)
             .await
             .expect("API key index");
         let created_key = api_keys
             .create(
                 &grant.user.id,
+                "default".to_owned(),
                 "test".to_owned(),
                 Some(SecretString::from("test-api-key-123".to_owned())),
                 None,
-                unix_timestamp(),
+                None,
+                now,
             )
             .await
             .expect("create API key");
@@ -943,7 +1090,10 @@ mod tests {
             .update(
                 &grant.user.id,
                 &created_key.summary.id,
+                None,
+                None,
                 Some(false),
+                None,
                 None,
                 unix_timestamp(),
             )
@@ -965,10 +1115,16 @@ mod tests {
         let first_key = AuthenticatedApiKey {
             key_id: ApiKeyId::new("key-a").expect("API key ID"),
             owner_user_id: UserId::new("user-a").expect("user ID"),
+            label: "first".to_owned(),
+            group_label: "default".to_owned(),
+            quota_limit_atoms: None,
         };
         let second_key = AuthenticatedApiKey {
             key_id: ApiKeyId::new("key-b").expect("API key ID"),
             owner_user_id: UserId::new("user-a").expect("user ID"),
+            label: "second".to_owned(),
+            group_label: "default".to_owned(),
+            quota_limit_atoms: None,
         };
         let first = claude_code_cache_key(&first_key, "grok-4.5", "session-1");
 

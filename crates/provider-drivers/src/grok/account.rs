@@ -198,6 +198,7 @@ impl ManagedProviderDriver for GrokDriver {
         let AccountProvisioningInput::CredentialJson {
             id,
             label,
+            group_label,
             credential_json,
         } = input
         else {
@@ -234,6 +235,7 @@ impl ManagedProviderDriver for GrokDriver {
             id,
             provider: ProviderKind::Grok,
             label,
+            group_label,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: NewCredential {

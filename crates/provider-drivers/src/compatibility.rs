@@ -28,28 +28,26 @@ impl CompatibleConfig {
 
 #[derive(Clone)]
 pub(crate) struct CompatibleCredentials {
-    pub api_key: Option<SecretString>,
+    pub api_key: SecretString,
 }
 
 impl CompatibleCredentials {
     pub(crate) fn from_input(
-        api_key: Option<SecretString>,
+        api_key: SecretString,
     ) -> Result<(CredentialKind, SecretString), ProviderConfigurationError> {
-        let api_key = api_key
-            .map(|value| value.expose_secret().trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let kind = if api_key.is_some() {
-            CredentialKind::ApiKey
-        } else {
-            CredentialKind::None
-        };
+        let api_key = api_key.expose_secret().trim().to_owned();
+        if api_key.is_empty() {
+            return Err(ProviderConfigurationError::new(
+                "compatible provider api_key must not be empty",
+            ));
+        }
         let credential_json = serde_json::to_string(&CredentialDocument {
-            auth_kind: kind.as_str(),
-            api_key: api_key.as_deref(),
+            auth_kind: CredentialKind::ApiKey.as_str(),
+            api_key: &api_key,
         })
         .map(SecretString::from)
         .map_err(|_| ProviderConfigurationError::new("failed to serialize provider credential"))?;
-        Ok((kind, credential_json))
+        Ok((CredentialKind::ApiKey, credential_json))
     }
 
     pub(crate) fn parse(
@@ -66,23 +64,20 @@ impl CompatibleCredentials {
                 "{provider} credential type does not match credential_kind"
             )));
         }
-        let api_key = document
-            .api_key
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(SecretString::from);
-        match kind {
-            CredentialKind::ApiKey if api_key.is_none() => Err(ProviderConfigurationError::new(
-                format!("{provider} credential is missing api_key"),
-            )),
-            CredentialKind::None if api_key.is_some() => Err(ProviderConfigurationError::new(
-                format!("{provider} credential_kind none must not contain api_key"),
-            )),
-            CredentialKind::Oauth => Err(ProviderConfigurationError::new(format!(
-                "{provider} does not support OAuth credentials"
-            ))),
-            _ => Ok(Self { api_key }),
+        if kind != CredentialKind::ApiKey {
+            return Err(ProviderConfigurationError::new(format!(
+                "{provider} requires API key credentials"
+            )));
         }
+        let api_key = document.api_key.trim().to_owned();
+        if api_key.is_empty() {
+            return Err(ProviderConfigurationError::new(format!(
+                "{provider} credential is missing api_key"
+            )));
+        }
+        Ok(Self {
+            api_key: SecretString::from(api_key),
+        })
     }
 }
 
@@ -118,12 +113,12 @@ fn normalize_base_url(
 #[derive(Serialize)]
 struct CredentialDocument<'a> {
     auth_kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_key: Option<&'a str>,
+    api_key: &'a str,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CredentialDocumentOwned {
     auth_kind: String,
-    api_key: Option<String>,
+    api_key: String,
 }

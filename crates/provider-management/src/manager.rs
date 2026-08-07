@@ -31,8 +31,9 @@ pub struct CreatedProviderAccount {
 pub struct DirectProviderAccountInput {
     pub kind: ProviderKind,
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
-    pub api_key: Option<SecretString>,
+    pub api_key: SecretString,
     pub visibility: ProviderVisibility,
 }
 
@@ -61,6 +62,7 @@ pub struct OAuthSessionSnapshot {
     pub provider: ProviderKind,
     pub account_id: AccountId,
     pub label: String,
+    pub group_label: String,
     pub status: OAuthSessionStatus,
     pub challenge: ProviderOAuthChallenge,
     pub error: Option<String>,
@@ -125,12 +127,14 @@ impl ProviderManager {
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
+        let group_label = normalize_group_label(input.group_label)?;
         self.create_account(
             owner_user_id,
             input.kind,
             AccountProvisioningInput::Direct {
                 id,
                 label: input.label,
+                group_label,
                 config_json: input.config_json,
                 api_key: input.api_key,
             },
@@ -145,17 +149,20 @@ impl ProviderManager {
         owner_user_id: &str,
         kind: ProviderKind,
         label: String,
+        group_label: String,
         credential_json: SecretString,
         visibility: ProviderVisibility,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
+        let group_label = normalize_group_label(group_label)?;
         self.create_account(
             owner_user_id,
             kind,
             AccountProvisioningInput::CredentialJson {
                 id,
                 label,
+                group_label,
                 credential_json,
             },
             visibility,
@@ -169,6 +176,7 @@ impl ProviderManager {
         owner_user_id: &str,
         kind: ProviderKind,
         label: String,
+        group_label: String,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
         let label = label.trim().to_owned();
@@ -177,6 +185,7 @@ impl ProviderManager {
                 "provider account label must not be empty",
             ));
         }
+        let group_label = normalize_group_label(group_label)?;
         let started = self
             .control
             .start_oauth(kind)
@@ -192,6 +201,7 @@ impl ProviderManager {
             provider: kind,
             account_id: account_id.clone(),
             label: label.clone(),
+            group_label: group_label.clone(),
             status: OAuthSessionStatus::Pending,
             challenge: started.challenge,
             error: None,
@@ -215,6 +225,7 @@ impl ProviderManager {
                         AccountProvisioningInput::CredentialJson {
                             id: account_id,
                             label,
+                            group_label,
                             credential_json,
                         },
                         visibility,
@@ -372,12 +383,13 @@ impl ProviderManager {
         &self,
         actor_user_id: &str,
         account_id: &AccountId,
-        update: ProviderAccountUpdate,
+        mut update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
         self.load_owned_account(actor_user_id, account_id).await?;
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
         let current = self.load_owned_account(actor_user_id, account_id).await?;
+        update.group_label = normalize_group_label(update.group_label)?;
         let update = self
             .control
             .prepare_account_update(current.provider, update)?;
@@ -398,6 +410,55 @@ impl ProviderManager {
         if rebuild_required {
             self.reconcile(stored.clone()).await?;
         }
+        Ok(account_summary(&stored))
+    }
+
+    pub async fn update_account_with_credential(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        mut update: ProviderAccountUpdate,
+        replacement: ProviderCredentialReplacement,
+    ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
+        update.group_label = normalize_group_label(update.group_label)?;
+        let update = self
+            .control
+            .prepare_account_update(current.provider, update)?;
+        let access_changed = current.visibility != update.visibility;
+        let outcome = self
+            .repository
+            .update_provider_account_and_credential(
+                account_id,
+                update,
+                CredentialUpdate {
+                    expected_revision: current.credential.revision,
+                    kind: replacement.kind,
+                    format_version: replacement.format_version,
+                    credential_json: replacement.credential_json,
+                    expires_at: replacement.expires_at,
+                    last_refreshed_at: replacement.last_refreshed_at,
+                    updated_at: replacement.updated_at,
+                },
+            )
+            .await?
+            .ok_or(ProviderManagerError::NotFound)?;
+        if outcome == CredentialWriteOutcome::Conflict {
+            return Err(ProviderManagerError::Conflict);
+        }
+        let stored = self.load_account(account_id).await?;
+        self.invalidate_quota(account_id);
+        if access_changed {
+            self.control
+                .update_account_access(account_id, stored.access());
+        }
+        // Credential replacement must rebuild the runtime account even when the
+        // provider configuration itself did not change; otherwise compatible
+        // providers keep sending the old API key until the next process restart.
+        self.reconcile(stored.clone()).await?;
         Ok(account_summary(&stored))
     }
 
@@ -902,6 +963,16 @@ fn quota_cache_view(
     }
 }
 
+fn normalize_group_label(group_label: String) -> Result<String, ProviderManagerError> {
+    let group_label = group_label.trim().to_owned();
+    if group_label.is_empty() || group_label.chars().count() > 64 {
+        return Err(ProviderManagerError::InvalidInput(
+            "provider group label must contain 1 to 64 characters",
+        ));
+    }
+    Ok(group_label)
+}
+
 fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
     ProviderAccountSummary {
         id: account.id.clone(),
@@ -909,6 +980,7 @@ fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
         visibility: account.visibility,
         provider: account.provider,
         label: account.label.clone(),
+        group_label: account.group_label.clone(),
         config_json: account.config_json.clone(),
         credential_kind: account.credential.kind,
         credential_revision: account.credential.revision,

@@ -96,6 +96,7 @@ impl AccountRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -240,6 +241,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -275,6 +277,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -316,8 +319,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let inserted = sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, owner_user_id, visibility, provider, label, config_json, enabled, auth_state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                (id, owner_user_id, visibility, provider, label, group_label, config_json, enabled, auth_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
             ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -326,6 +329,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .bind(visibility.as_str())
         .bind(account.provider.as_str())
         .bind(account.label)
+        .bind(account.group_label)
         .bind(account.config_json)
         .bind(database_bool(account.enabled))
         .execute(&mut *transaction)
@@ -372,11 +376,12 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             UPDATE provider_accounts
-            SET label = ?, config_json = ?, visibility = ?, updated_at = ?
+            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(update.label)
+        .bind(update.group_label)
         .bind(update.config_json)
         .bind(update.visibility.as_str())
         .bind(update.updated_at)
@@ -385,6 +390,101 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .await
         .map_err(|error| repository_error("failed to update provider account", error))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_provider_account_and_credential(
+        &self,
+        account_id: &AccountId,
+        account: ProviderAccountUpdate,
+        credential: CredentialUpdate,
+    ) -> Result<Option<CredentialWriteOutcome>, AccountRepositoryError> {
+        let expected_revision =
+            database_integer(credential.expected_revision, "credential revision")?;
+        let next_revision = credential
+            .expected_revision
+            .checked_add(1)
+            .ok_or_else(|| AccountRepositoryError::new("credential revision overflow"))?;
+        database_integer(next_revision, "credential revision")?;
+        let format_version = i64::from(credential.format_version);
+
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            repository_error("failed to start provider update transaction", error)
+        })?;
+        let account_result = sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(account.label)
+        .bind(account.group_label)
+        .bind(account.config_json)
+        .bind(account.visibility.as_str())
+        .bind(account.updated_at)
+        .bind(account_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider account", error))?;
+        if account_result.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back missing provider update", error)
+            })?;
+            return Ok(None);
+        }
+
+        let credential_result = sqlx::query(
+            r#"
+            UPDATE provider_credentials
+            SET
+                revision = revision + 1,
+                credential_kind = ?,
+                format_version = ?,
+                credential_json = ?,
+                expires_at = ?,
+                last_refreshed_at = ?,
+                updated_at = ?
+            WHERE account_id = ? AND revision = ?
+            "#,
+        )
+        .bind(credential.kind.as_str())
+        .bind(format_version)
+        .bind(credential.credential_json.expose_secret())
+        .bind(credential.expires_at)
+        .bind(credential.last_refreshed_at)
+        .bind(credential.updated_at)
+        .bind(account_id.as_str())
+        .bind(expected_revision)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider credential", error))?;
+        if credential_result.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back credential conflict", error)
+            })?;
+            return Ok(Some(CredentialWriteOutcome::Conflict));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET auth_state = 'active', safe_error_code = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(credential.updated_at)
+        .bind(account_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider account state", error))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| repository_error("failed to commit provider update", error))?;
+        Ok(Some(CredentialWriteOutcome::Updated {
+            revision: next_revision,
+        }))
     }
 
     async fn set_provider_account_enabled(
@@ -888,17 +988,20 @@ impl AuthRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO api_keys
-                (id, owner_user_id, label, key, enabled, expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, owner_user_id, group_label, label, key, enabled, expires_at,
+                 quota_limit_atoms, spent_atoms, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(key.id.as_str())
         .bind(key.owner_user_id.as_str())
+        .bind(&key.group_label)
         .bind(key.label)
         .bind(key.key.expose_secret())
         .bind(database_bool(key.enabled))
         .bind(key.expires_at)
+        .bind(key.quota_limit_atoms.as_deref())
         .bind(key.created_at)
         .bind(key.created_at)
         .execute(&self.pool)
@@ -913,8 +1016,8 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
-                   created_at, updated_at
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+                   quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE owner_user_id = ?
             ORDER BY created_at, id
@@ -934,8 +1037,8 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
-                   created_at, updated_at
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+                   quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE id = ? AND owner_user_id = ?
             "#,
@@ -952,26 +1055,54 @@ impl AuthRepository for SqliteAccountRepository {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
+        group_label: &str,
+        label: &str,
         enabled: bool,
         expires_at: Option<i64>,
+        quota_limit_atoms: Option<Option<String>>,
         updated_at: i64,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
-        let row = sqlx::query(
-            r#"
-            UPDATE api_keys
-            SET enabled = ?, expires_at = ?, updated_at = ?
-            WHERE id = ? AND owner_user_id = ?
-            RETURNING id, owner_user_id, label, key, enabled, expires_at,
-                      last_used_at, created_at, updated_at
-            "#,
-        )
-        .bind(database_bool(enabled))
-        .bind(expires_at)
-        .bind(updated_at)
-        .bind(key_id.as_str())
-        .bind(owner_user_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
+        let row = if let Some(limit) = quota_limit_atoms {
+            sqlx::query(
+                r#"
+                UPDATE api_keys
+                SET group_label = ?, label = ?, enabled = ?, expires_at = ?,
+                    quota_limit_atoms = ?, updated_at = ?
+                WHERE id = ? AND owner_user_id = ?
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                          quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
+                "#,
+            )
+            .bind(group_label)
+            .bind(label)
+            .bind(database_bool(enabled))
+            .bind(expires_at)
+            .bind(limit.as_deref())
+            .bind(updated_at)
+            .bind(key_id.as_str())
+            .bind(owner_user_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE api_keys
+                SET group_label = ?, label = ?, enabled = ?, expires_at = ?, updated_at = ?
+                WHERE id = ? AND owner_user_id = ?
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                          quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
+                "#,
+            )
+            .bind(group_label)
+            .bind(label)
+            .bind(database_bool(enabled))
+            .bind(expires_at)
+            .bind(updated_at)
+            .bind(key_id.as_str())
+            .bind(owner_user_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+        }
         .map_err(|error| auth_repository_error("failed to update API key", error))?;
         row.map(stored_api_key).transpose()
     }
@@ -993,8 +1124,8 @@ impl AuthRepository for SqliteAccountRepository {
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT k.id, k.owner_user_id, k.label, k.key, k.enabled, k.expires_at,
-                   k.last_used_at, k.created_at, k.updated_at
+            SELECT k.id, k.owner_user_id, k.group_label, k.label, k.key, k.enabled, k.expires_at,
+                   k.quota_limit_atoms, k.spent_atoms, k.last_used_at, k.created_at, k.updated_at
             FROM api_keys AS k
             INNER JOIN users AS u ON u.id = k.owner_user_id
             WHERE k.enabled = 1 AND u.enabled = 1
@@ -1005,6 +1136,55 @@ impl AuthRepository for SqliteAccountRepository {
         .await
         .map_err(|error| auth_repository_error("failed to load active API keys", error))?;
         rows.into_iter().map(stored_api_key).collect()
+    }
+
+    async fn list_visible_account_ids_by_group_label(
+        &self,
+        actor_user_id: &UserId,
+        group_label: &str,
+    ) -> Result<Vec<String>, AuthRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id
+            FROM provider_accounts
+            WHERE group_label = ?
+              AND enabled = 1
+              AND owner_user_id IS NOT NULL
+              AND (owner_user_id = ? OR visibility = 'shared')
+            ORDER BY created_at, id
+            "#,
+        )
+        .bind(group_label)
+        .bind(actor_user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to list accounts by group label", error))?;
+        let mut account_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            account_ids.push(
+                row_value::<String>(&row, "id")
+                    .map_err(|error| AuthRepositoryError::new(error.to_string()))?,
+            );
+        }
+        Ok(account_ids)
+    }
+
+    async fn load_api_key_spent_atoms(
+        &self,
+        api_key_id: &ApiKeyId,
+    ) -> Result<Option<String>, AuthRepositoryError> {
+        let spent = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT spent_atoms
+            FROM api_keys
+            WHERE id = ?
+            "#,
+        )
+        .bind(api_key_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load API key spend", error))?;
+        Ok(spent)
     }
 }
 
@@ -1093,6 +1273,7 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
         visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
+        group_label: row_value(&row, "group_label")?,
         config_json: row_value(&row, "config_json")?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
@@ -1135,6 +1316,7 @@ fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepo
         visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
+        group_label: row_value(&row, "group_label")?,
         config_json: row_value(&row, "config_json")?,
         credential_kind,
         credential_revision: row_value::<i64>(&row, "revision")?
@@ -1219,13 +1401,28 @@ fn stored_session(row: SqliteRow) -> Result<StoredSession, AuthRepositoryError> 
 }
 
 fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
+    let group_label = auth_row_value::<String>(&row, "group_label")?;
+    let quota_limit_atoms = auth_row_value::<Option<String>>(&row, "quota_limit_atoms")?;
+    let spent_atoms = auth_row_value::<String>(&row, "spent_atoms")?;
+    if quota_limit_atoms
+        .as_deref()
+        .is_some_and(|value| provider_auth::format_usd_atoms(value).is_err())
+        || provider_auth::format_usd_atoms(&spent_atoms).is_err()
+    {
+        return Err(AuthRepositoryError::new(
+            "invalid API key quota ledger value",
+        ));
+    }
     Ok(StoredApiKey {
         id: auth_api_key_id(&row, "id")?,
         owner_user_id: auth_user_id(&row, "owner_user_id")?,
+        group_label,
         label: auth_row_value(&row, "label")?,
         key: SecretString::from(auth_row_value::<String>(&row, "key")?),
         enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
         expires_at: auth_row_value(&row, "expires_at")?,
+        quota_limit_atoms,
+        spent_atoms,
         last_used_at: auth_row_value(&row, "last_used_at")?,
         created_at: auth_row_value(&row, "created_at")?,
         updated_at: auth_row_value(&row, "updated_at")?,
@@ -1384,8 +1581,8 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, provider, label, enabled, auth_state)
-            VALUES ('grok-main', 'grok', 'Main', 1, 'active')
+                (id, provider, label, group_label, enabled, auth_state)
+            VALUES ('grok-main', 'grok', 'Main', 'legacy', 1, 'active')
             "#,
         )
         .execute(&repository.pool)
@@ -1473,6 +1670,7 @@ mod tests {
             id: account_id.clone(),
             provider: ProviderKind::Codex,
             label: "Codex Main".to_owned(),
+            group_label: "default".to_owned(),
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {
@@ -1533,6 +1731,7 @@ mod tests {
             id: account_id.clone(),
             provider: ProviderKind::Grok,
             label: "Grok Models".to_owned(),
+            group_label: "default".to_owned(),
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {
@@ -1650,8 +1849,8 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, provider, label, enabled, auth_state)
-            VALUES ('existing-grok', 'grok', 'Existing Grok', 1, 'active')
+                (id, provider, label, group_label, enabled, auth_state)
+            VALUES ('existing-grok', 'grok', 'Existing Grok', 'legacy', 1, 'active')
             "#,
         )
         .execute(&repository.pool)

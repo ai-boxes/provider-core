@@ -17,20 +17,21 @@
 
 use async_trait::async_trait;
 use provider_usage::{
-    ATOM_SPLIT, AttemptFacts, AttributionBasis, CacheTotals, CostTotals, KeySummary, MAX_PAGE_SIZE,
-    RequestCursor, RequestPage, RequestSummary, SeriesBucket, TokenTotals, UsageBucket,
-    UsageOverview, UsageQuery, UsageRepositoryError, UsageScope, recombine_atoms, system_clock_ms,
+    ATOM_SPLIT, AttemptFacts, AttributionBasis, CacheTotals, CostTotals, MAX_PAGE_SIZE,
+    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
+    UsageFilterOptions, UsageOverview, UsageQuery, UsageRepositoryError, UsageScope,
+    recombine_atoms, system_clock_ms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{
     SqliteUsageRepository,
-    usage::{attempt_facts, logical_status_from, tracking_from, usage_error},
+    usage::{attempt_facts, usage_error},
 };
 
 /// The scoped source every query reads from.
 ///
-/// Bind order, once per query: owner, key, key, from, to.
+/// Bind order, once per query: owner, key, key, model, model, group, group, from, to.
 fn scoped_from(basis: AttributionBasis) -> String {
     // `final_attempt_id` is what the user actually received; confirmed dispatch is
     // what the provider actually served, retries included.
@@ -50,6 +51,8 @@ fn scoped_from(basis: AttributionBasis) -> String {
           -- All placeholders are positional. A numbered one here would silently
           -- re-use the owner parameter and shift everything after it.
           AND (? IS NULL OR l.api_key_id = ?)
+          AND (? IS NULL OR l.client_model_raw = ?)
+          AND (? IS NULL OR l.api_key_group_label = ?)
           AND l.completed_at_ms >= ?
           AND l.completed_at_ms < ?
         "#
@@ -71,37 +74,47 @@ const TOTALS_COLUMNS: &str = r#"
         THEN a.cost_atoms / 1000000 ELSE 0 END), 0) AS complete_high,
     COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
         THEN a.cost_atoms % 1000000 ELSE 0 END), 0) AS complete_low,
-    SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
-        THEN 1 ELSE 0 END) AS complete_attempts,
-    COALESCE(SUM(CASE WHEN a.cost_status = 'partial'
-        THEN a.cost_atoms / 1000000 ELSE 0 END), 0) AS partial_high,
-    COALESCE(SUM(CASE WHEN a.cost_status = 'partial'
-        THEN a.cost_atoms % 1000000 ELSE 0 END), 0) AS partial_low,
-    SUM(CASE WHEN a.cost_status = 'partial' THEN 1 ELSE 0 END) AS partial_attempts,
-    SUM(CASE WHEN a.cost_status = 'unavailable' THEN 1 ELSE 0 END) AS unavailable_attempts
+    COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
+        THEN 1 ELSE 0 END), 0) AS complete_attempts,
+    COALESCE(SUM(CASE WHEN a.cost_status = 'partial' THEN 1 ELSE 0 END), 0) AS partial_attempts,
+    COALESCE(SUM(CASE WHEN a.cost_status = 'unavailable' THEN 1 ELSE 0 END), 0) AS unavailable_attempts
 "#;
 
 /// Cache columns, following the contract's three dimensions.
+///
+/// Coverage includes an attempt when a report was expected, *or* when a cache
+/// read value was actually observed. The latter matters for providers whose
+/// contract still says reporting is unknown but which do report on some calls:
+/// a known number is a hit or a miss, never an exclusion.
 const CACHE_COLUMNS: &str = r#"
-    SUM(CASE WHEN a.cache_capability = 'supported'
+    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
               AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-        THEN 1 ELSE 0 END) AS coverage_denominator,
-    SUM(CASE WHEN a.cache_capability = 'supported'
+              AND (
+                    a.cache_reporting_expectation = 'expected'
+                    OR a.cache_read_input_tokens IS NOT NULL
+                  )
+        THEN 1 ELSE 0 END), 0) AS coverage_denominator,
+    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
               AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
+              AND (
+                    a.cache_reporting_expectation = 'expected'
+                    OR a.cache_read_input_tokens IS NOT NULL
+                  )
               AND a.cache_read_input_tokens > 0
-        THEN 1 ELSE 0 END) AS cache_hits,
-    SUM(CASE WHEN a.cache_capability = 'supported'
+        THEN 1 ELSE 0 END), 0) AS cache_hits,
+    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
               AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
+              AND (
+                    a.cache_reporting_expectation = 'expected'
+                    OR a.cache_read_input_tokens IS NOT NULL
+                  )
               AND a.cache_read_input_tokens = 0
-        THEN 1 ELSE 0 END) AS cache_misses,
-    SUM(CASE WHEN a.cache_capability = 'supported'
+        THEN 1 ELSE 0 END), 0) AS cache_misses,
+    COALESCE(SUM(CASE WHEN a.cache_capability = 'supported'
               AND a.cache_eligibility = 'eligible'
               AND a.cache_reporting_expectation = 'expected'
               AND a.cache_read_input_tokens IS NULL
-        THEN 1 ELSE 0 END) AS cache_unreported
+        THEN 1 ELSE 0 END), 0) AS cache_unreported
 "#;
 
 #[async_trait]
@@ -122,82 +135,98 @@ impl UsageQuery for SqliteUsageRepository {
             // date the snapshot ahead of when it was taken, and for a historical
             // window it would claim the numbers are as old as the data.
             as_of_ms: system_clock_ms(),
-            logical_requests: count(&row, "logical_requests"),
-            attempts: count(&row, "attempts"),
-            tokens: token_totals(&row),
-            cache: cache_totals(&row),
-            cost: cost_totals(&row),
+            logical_requests: count(&row, "logical_requests")?,
+            attempts: count(&row, "attempts")?,
+            tokens: token_totals(&row)?,
+            cache: cache_totals(&row)?,
+            cost: cost_totals(&row)?,
             tracking_gaps: self.tracking_gaps(scope).await?,
         })
     }
 
-    async fn series(
+    async fn filter_options(
         &self,
         scope: &UsageScope,
-        bucket: SeriesBucket,
-    ) -> Result<Vec<UsageBucket>, UsageRepositoryError> {
-        let width = bucket.width_ms();
-        // Floored division, so a bucket label is always at or before its facts.
+    ) -> Result<UsageFilterOptions, UsageRepositoryError> {
+        // Filter menus describe the complete range, not only the selected page
+        // and not only the currently visible API keys.
+        let mut unfiltered = scope.clone();
+        unfiltered.client_model = None;
+        unfiltered.group_label = None;
+
+        let model_sql = format!(
+            "SELECT DISTINCT l.client_model_raw AS value {} AND l.client_model_raw IS NOT NULL ORDER BY value",
+            scoped_from(unfiltered.basis)
+        );
+        let model_rows = bind_scope(sqlx::query(AssertSqlSafe(model_sql)), &unfiltered)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage model filters", error))?;
+
+        let group_sql = format!(
+            "SELECT DISTINCT l.api_key_group_label AS value {} AND l.api_key_group_label IS NOT NULL ORDER BY value",
+            scoped_from(unfiltered.basis)
+        );
+        let group_rows = bind_scope(sqlx::query(AssertSqlSafe(group_sql)), &unfiltered)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage group filters", error))?;
+
+        Ok(UsageFilterOptions {
+            client_models: model_rows.iter().map(|row| row.get("value")).collect(),
+            group_labels: group_rows.iter().map(|row| row.get("value")).collect(),
+        })
+    }
+
+    async fn provider_health(
+        &self,
+        account_ids: &[String],
+        range: provider_usage::TimeRange,
+    ) -> Result<Vec<ProviderHealthSummary>, UsageRepositoryError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = vec!["?"; account_ids.len()].join(", ");
         let sql = format!(
             r#"
             SELECT
-                (l.completed_at_ms / {width}) * {width} AS bucket_start_ms,
-                {TOTALS_COLUMNS}
-            {}
-            GROUP BY bucket_start_ms
-            ORDER BY bucket_start_ms
+                a.account_id,
+                COUNT(DISTINCT l.request_id) AS requests,
+                SUM(CASE WHEN l.logical_status = 'succeeded' THEN 1 ELSE 0 END) AS successes,
+                SUM(CASE WHEN l.logical_status = 'failed' THEN 1 ELSE 0 END) AS failures
+            FROM usage_logical_requests AS l
+            INNER JOIN usage_attempts AS a
+                ON a.id = l.final_attempt_id
+            WHERE a.account_id IN ({placeholders})
+              AND l.completed_at_ms >= ?
+              AND l.completed_at_ms < ?
+              AND l.logical_status IN ('succeeded', 'failed')
+            GROUP BY a.account_id
+            ORDER BY a.account_id
             "#,
-            scoped_from(scope.basis)
         );
-        let rows = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for account_id in account_ids {
+            query = query.bind(account_id);
+        }
+        let rows = query
+            .bind(range.from_ms)
+            .bind(range.to_ms)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| usage_error("failed to read usage series", error))?;
+            .map_err(|error| usage_error("failed to read provider health", error))?;
 
-        Ok(rows
-            .iter()
-            .map(|row| UsageBucket {
-                bucket_start_ms: row.get("bucket_start_ms"),
-                logical_requests: count(row, "logical_requests"),
-                attempts: count(row, "attempts"),
-                tokens: token_totals(row),
-                cost: cost_totals(row),
+        rows.iter()
+            .map(|row| {
+                Ok(ProviderHealthSummary {
+                    account_id: row.get("account_id"),
+                    requests: count(row, "requests")?,
+                    successes: count(row, "successes")?,
+                    failures: count(row, "failures")?,
+                })
             })
-            .collect())
-    }
-
-    async fn key_summaries(
-        &self,
-        scope: &UsageScope,
-    ) -> Result<Vec<KeySummary>, UsageRepositoryError> {
-        // Grouping on the nullable key column yields a NULL group for requests
-        // recorded without one; it is kept as its own row rather than folded into
-        // a named key.
-        let sql = format!(
-            r#"
-            SELECT l.api_key_id AS api_key_id, {TOTALS_COLUMNS}
-            {}
-            GROUP BY l.api_key_id
-            ORDER BY attempts DESC, l.api_key_id
-            LIMIT {MAX_PAGE_SIZE}
-            "#,
-            scoped_from(scope.basis)
-        );
-        let rows = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| usage_error("failed to read usage key summaries", error))?;
-
-        Ok(rows
-            .iter()
-            .map(|row| KeySummary {
-                api_key_id: row.get("api_key_id"),
-                logical_requests: count(row, "logical_requests"),
-                attempts: count(row, "attempts"),
-                tokens: token_totals(row),
-                cost: cost_totals(row),
-            })
-            .collect())
+            .collect()
     }
 
     async fn requests(
@@ -206,7 +235,9 @@ impl UsageQuery for SqliteUsageRepository {
         after: Option<&RequestCursor>,
         limit: u32,
     ) -> Result<RequestPage, UsageRepositoryError> {
-        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(UsageRepositoryError::new("usage page size is invalid"));
+        }
         // One extra row decides whether a next page exists without a second query.
         let fetch = i64::from(limit) + 1;
         // Keyset, not offset: a row inserted while paging cannot shift the window.
@@ -218,9 +249,14 @@ impl UsageQuery for SqliteUsageRepository {
         let sql = format!(
             r#"
             SELECT
-                l.request_id, l.api_key_id, l.client_model_raw, l.started_at_ms,
-                l.completed_at_ms, l.logical_status, l.tracking_state,
-                l.tracking_gap_reason,
+                l.request_id, l.api_key_id, l.api_key_label, l.api_key_group_label,
+                l.client_model_raw, l.reasoning_effort,
+                l.started_at_ms, l.completed_at_ms,
+                (
+                    SELECT first_token_at_ms
+                    FROM usage_attempts AS final_attempt
+                    WHERE final_attempt.id = l.final_attempt_id
+                ) AS first_token_at_ms,
                 {TOTALS_COLUMNS}
             {} {keyset}
             GROUP BY l.request_id
@@ -247,15 +283,14 @@ impl UsageQuery for SqliteUsageRepository {
         for row in rows.iter().take(limit as usize) {
             requests.push(request_summary(row)?);
         }
-        let next = has_more
-            .then(|| requests.last())
-            .flatten()
-            .and_then(|last| {
-                last.completed_at_ms.map(|completed_at_ms| RequestCursor {
-                    completed_at_ms,
-                    request_id: last.request_id.clone(),
-                })
-            });
+        let next = if has_more {
+            requests.last().map(|last| RequestCursor {
+                completed_at_ms: last.completed_at_ms,
+                request_id: last.request_id.clone(),
+            })
+        } else {
+            None
+        };
         Ok(RequestPage { requests, next })
     }
 
@@ -305,9 +340,9 @@ impl UsageQuery for SqliteUsageRepository {
 impl SqliteUsageRepository {
     /// Known bookkeeping losses whose bucket overlaps the range.
     async fn tracking_gaps(&self, scope: &UsageScope) -> Result<u64, UsageRepositoryError> {
-        let total: Option<i64> = sqlx::query_scalar(
+        let total: i64 = sqlx::query_scalar(
             r#"
-            SELECT SUM(count) FROM usage_tracking_gaps
+            SELECT COALESCE(SUM(count), 0) FROM usage_tracking_gaps
             WHERE owner_user_id = ?
               AND bucket_start_ms >= ?
               AND bucket_start_ms < ?
@@ -319,7 +354,8 @@ impl SqliteUsageRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|error| usage_error("failed to read usage tracking gaps", error))?;
-        Ok(u64::try_from(total.unwrap_or(0)).unwrap_or(0))
+        u64::try_from(total)
+            .map_err(|_| UsageRepositoryError::new("usage tracking gap count is invalid"))
     }
 }
 
@@ -331,74 +367,87 @@ fn bind_scope<'q>(query: SqliteQuery<'q>, scope: &'q UsageScope) -> SqliteQuery<
         .bind(&scope.owner_user_id)
         .bind(scope.api_key_id.as_deref())
         .bind(scope.api_key_id.as_deref())
+        .bind(scope.client_model.as_deref())
+        .bind(scope.client_model.as_deref())
+        .bind(scope.group_label.as_deref())
+        .bind(scope.group_label.as_deref())
         .bind(scope.range.from_ms)
         .bind(scope.range.to_ms)
 }
 
-/// A count column. Negative is impossible from `COUNT`/`SUM(CASE …)`, so a
-/// nonsensical value reads as zero rather than panicking a dashboard.
-fn count(row: &SqliteRow, column: &str) -> u64 {
-    let value: Option<i64> = row.try_get(column).unwrap_or(Some(0));
-    u64::try_from(value.unwrap_or(0)).unwrap_or(0)
+fn count(row: &SqliteRow, column: &str) -> Result<u64, UsageRepositoryError> {
+    let value: i64 = row
+        .try_get(column)
+        .map_err(|error| usage_error("failed to read usage count", error))?;
+    u64::try_from(value)
+        .map_err(|_| UsageRepositoryError::new(format!("usage count {column} is negative")))
 }
 
-fn token_totals(row: &SqliteRow) -> TokenTotals {
-    TokenTotals {
-        uncached_input: count(row, "uncached_input"),
-        cache_read_input: count(row, "cache_read_input"),
-        cache_write_input: count(row, "cache_write_input"),
-        effective_input: count(row, "effective_input"),
-        output: count(row, "output"),
-        reasoning: count(row, "reasoning"),
-        attempts_with_unknown_input: count(row, "unknown_input"),
-    }
+fn token_totals(row: &SqliteRow) -> Result<TokenTotals, UsageRepositoryError> {
+    Ok(TokenTotals {
+        uncached_input: count(row, "uncached_input")?,
+        cache_read_input: count(row, "cache_read_input")?,
+        cache_write_input: count(row, "cache_write_input")?,
+        effective_input: count(row, "effective_input")?,
+        output: count(row, "output")?,
+        reasoning: count(row, "reasoning")?,
+        attempts_with_unknown_input: count(row, "unknown_input")?,
+    })
 }
 
-fn cache_totals(row: &SqliteRow) -> CacheTotals {
-    let denominator = count(row, "coverage_denominator");
-    let attempts = count(row, "attempts");
-    CacheTotals {
+fn cache_totals(row: &SqliteRow) -> Result<CacheTotals, UsageRepositoryError> {
+    let denominator = count(row, "coverage_denominator")?;
+    let attempts = count(row, "attempts")?;
+    let excluded = attempts
+        .checked_sub(denominator)
+        .ok_or_else(|| UsageRepositoryError::new("cache coverage exceeds the attempt count"))?;
+    Ok(CacheTotals {
         coverage_denominator: denominator,
-        hits: count(row, "cache_hits"),
-        misses: count(row, "cache_misses"),
-        expected_but_unreported: count(row, "cache_unreported"),
-        excluded: attempts.saturating_sub(denominator),
-    }
+        hits: count(row, "cache_hits")?,
+        misses: count(row, "cache_misses")?,
+        expected_but_unreported: count(row, "cache_unreported")?,
+        excluded,
+    })
 }
 
-fn cost_totals(row: &SqliteRow) -> CostTotals {
-    CostTotals {
-        complete_atoms: split_sum(row, "complete_high", "complete_low"),
-        complete_attempts: count(row, "complete_attempts"),
-        partial_known_atoms: split_sum(row, "partial_high", "partial_low"),
-        partial_attempts: count(row, "partial_attempts"),
-        unavailable_attempts: count(row, "unavailable_attempts"),
-    }
+fn cost_totals(row: &SqliteRow) -> Result<CostTotals, UsageRepositoryError> {
+    Ok(CostTotals {
+        complete_atoms: split_sum(row, "complete_high", "complete_low")?,
+        complete_attempts: count(row, "complete_attempts")?,
+        partial_attempts: count(row, "partial_attempts")?,
+        unavailable_attempts: count(row, "unavailable_attempts")?,
+    })
 }
 
 /// Recombine the two halves SQL summed separately. See the module header.
-fn split_sum(row: &SqliteRow, high: &str, low: &str) -> provider_usage::UsdAtoms {
-    let high: Option<i64> = row.try_get(high).unwrap_or(Some(0));
-    let low: Option<i64> = row.try_get(low).unwrap_or(Some(0));
+fn split_sum(
+    row: &SqliteRow,
+    high: &str,
+    low: &str,
+) -> Result<provider_usage::UsdAtoms, UsageRepositoryError> {
+    let high: i64 = row
+        .try_get(high)
+        .map_err(|error| usage_error("failed to read usage cost high atoms", error))?;
+    let low: i64 = row
+        .try_get(low)
+        .map_err(|error| usage_error("failed to read usage cost low atoms", error))?;
     debug_assert_eq!(ATOM_SPLIT, 1_000_000, "the SQL divisor must match");
-    recombine_atoms(high.unwrap_or(0), low.unwrap_or(0))
+    Ok(recombine_atoms(high, low))
 }
 
 fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryError> {
-    let status: String = row.get("logical_status");
-    let tracking_state: String = row.get("tracking_state");
-    let gap_reason: Option<String> = row.get("tracking_gap_reason");
     Ok(RequestSummary {
         request_id: row.get("request_id"),
         api_key_id: row.get("api_key_id"),
+        api_key_label: row.get("api_key_label"),
+        api_key_group_label: row.get("api_key_group_label"),
         client_model_raw: row.get("client_model_raw"),
+        reasoning_effort: row.get("reasoning_effort"),
         started_at_ms: row.get("started_at_ms"),
         completed_at_ms: row.get("completed_at_ms"),
-        status: logical_status_from(&status)?,
-        tracking: tracking_from(&tracking_state, gap_reason.as_deref())?,
-        attempts: count(row, "attempts"),
-        tokens: token_totals(row),
-        cost: cost_totals(row),
+        first_token_at_ms: row.get("first_token_at_ms"),
+        tokens: token_totals(row)?,
+        cost: cost_totals(row)?,
     })
 }
 
@@ -528,8 +577,11 @@ mod tests {
                 request_id: spec.request_id.clone(),
                 owner_user_id: spec.owner.clone(),
                 api_key_id: spec.key.clone(),
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
+                reasoning_effort: None,
                 started_at_ms: spec.completed_at_ms - 1000,
             })
             .await
@@ -550,6 +602,7 @@ mod tests {
                     configured_model: Some("gpt-5-codex".to_owned()),
                     provider_reported_model: None,
                     started_at_ms: spec.completed_at_ms - 1000,
+                    first_token_at_ms: None,
                     completed_at_ms: spec.completed_at_ms,
                     dispatch_evidence: spec.evidence,
                     tracking: TrackingState::Complete,
@@ -582,6 +635,8 @@ mod tests {
         UsageScope {
             owner_user_id: owner.to_owned(),
             api_key_id: None,
+            client_model: None,
+            group_label: None,
             range: TimeRange::new(T0, T0 + 24 * HOUR).expect("range"),
             basis,
         }
@@ -765,10 +820,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_counts_exclude_attempts_without_an_expected_report() {
+    async fn cache_counts_include_unknown_when_a_value_was_reported() {
+        let repository = repository().await;
+        // Default Written cache_read is ProviderReported { 100 }.
+        let mut unknown_hit = Written::new("unknown-hit", "user-1", T0 + HOUR);
+        unknown_hit.cache_reporting = CacheReportingExpectation::Unknown;
+        write(&repository, &unknown_hit).await;
+
+        let cache = repository
+            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .await
+            .expect("overview")
+            .cache;
+        assert_eq!(cache.coverage_denominator, 1);
+        assert_eq!(
+            cache.hits, 1,
+            "a reported cache read is a hit even when expectation is unknown"
+        );
+        assert_eq!(cache.misses, 0);
+        assert_eq!(cache.expected_but_unreported, 0);
+        assert_eq!(cache.excluded, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_counts_exclude_unknown_when_nothing_was_reported() {
         let repository = repository().await;
         let mut unknown = Written::new("unknown", "user-1", T0 + HOUR);
         unknown.cache_reporting = CacheReportingExpectation::Unknown;
+        unknown.cache_read = TokenMetric::NotReported;
         write(&repository, &unknown).await;
 
         let cache = repository
@@ -791,8 +870,11 @@ mod tests {
                 request_id: "preflight-failure".to_owned(),
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: Some("key-1".to_owned()),
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: None,
                 routing_model: None,
+                reasoning_effort: None,
                 started_at_ms: T0 + HOUR - 1,
             })
             .await
@@ -822,8 +904,9 @@ mod tests {
             .await
             .expect("requests");
         assert_eq!(page.requests.len(), 1);
-        assert_eq!(page.requests[0].status, LogicalStatus::Failed);
-        assert_eq!(page.requests[0].attempts, 0);
+        assert_eq!(page.requests[0].request_id, "preflight-failure");
+        assert_eq!(page.requests[0].tokens, TokenTotals::default());
+        assert_eq!(page.requests[0].cost, CostTotals::default());
     }
 
     #[tokio::test]
@@ -891,8 +974,11 @@ mod tests {
                 request_id: "still-running".to_owned(),
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: None,
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: None,
                 routing_model: None,
+                reasoning_effort: None,
                 started_at_ms: T0 - 200 * HOUR,
             })
             .await
@@ -917,30 +1003,6 @@ mod tests {
                 .await
                 .expect("load")
                 .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn usage_without_a_key_is_its_own_row_not_folded_into_another() {
-        let repository = repository().await;
-        let mut keyless = Written::new("keyless", "user-1", T0 + HOUR);
-        keyless.key = None;
-        write(&repository, &keyless).await;
-        write(&repository, &Written::new("keyed", "user-1", T0 + HOUR)).await;
-
-        let summaries = repository
-            .key_summaries(&scope("user-1", AttributionBasis::UserFinalAttempt))
-            .await
-            .expect("keys");
-        assert_eq!(summaries.len(), 2);
-        assert!(
-            summaries.iter().any(|summary| summary.api_key_id.is_none()),
-            "requests recorded without a key keep their own row"
-        );
-        assert!(
-            summaries
-                .iter()
-                .any(|summary| summary.api_key_id.as_deref() == Some("key-1"))
         );
     }
 }

@@ -204,11 +204,12 @@ async fn deployment(upstream_url: &str) -> Deployment {
         .register_driver(CodexDriver::for_test(upstream_url, upstream_url))
         .expect("register Codex driver");
     let manager = ProviderManager::new(repository.clone(), runtime.clone());
-    manager
+    let _created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
             ProviderKind::Codex,
             "Codex".to_owned(),
+            "default".to_owned(),
             SecretString::from(
                 json!({
                     "type": "codex",
@@ -225,15 +226,16 @@ async fn deployment(upstream_url: &str) -> Deployment {
         )
         .await
         .expect("create Codex account");
-
     let api_keys = ApiKeyAuthenticator::load(repository.clone())
         .await
         .expect("API key index");
     let created_key = api_keys
         .create(
             &grant.user.id,
+            "default".to_owned(),
             "test".to_owned(),
             Some(SecretString::from("test-api-key-123".to_owned())),
+            None,
             None,
             now,
         )
@@ -908,7 +910,20 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/series?bucket=fortnight").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "removed usage APIs stay removed"
+    );
+
+    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?limit=10").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "page size is server-owned");
+
+    for filter in ["api_key_id", "model", "group"] {
+        let path = format!("/api/v1/usage/requests?{filter}=%20");
+        let (status, _) = get_usage(&server_url, &token, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty {filter} is refused");
+    }
 
     let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?cursor=garbage").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
