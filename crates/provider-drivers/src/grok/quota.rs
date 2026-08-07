@@ -18,6 +18,8 @@ use super::{
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const USER_TIMEOUT: Duration = Duration::from_secs(10);
 const BILLING_TIMEOUT: Duration = Duration::from_secs(15);
+const BILLING_TRANSPORT_ATTEMPTS: usize = 5;
+const BILLING_RETRY_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Clone)]
 pub(crate) struct GrokQuotaClient {
@@ -68,16 +70,30 @@ impl GrokQuotaClient {
         credentials: &GrokCredentials,
         user_id: &str,
     ) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
-        let response = session_headers(
-            self.http
-                .get(format!("{}/billing?format=credits", self.base_url))
-                .bearer_auth(credentials.access_token().expose_secret()),
-        )
-        .header("x-userid", user_id)
-        .timeout(BILLING_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| upstream_error("Grok billing request failed"))?;
+        let mut attempt = 1;
+        let response = loop {
+            match session_headers(
+                self.http
+                    .get(format!("{}/billing?format=credits", self.base_url))
+                    .bearer_auth(credentials.access_token().expose_secret()),
+            )
+            .header("x-userid", user_id)
+            .timeout(BILLING_TIMEOUT)
+            .send()
+            .await
+            {
+                Ok(received) => break received,
+                Err(error) if attempt < BILLING_TRANSPORT_ATTEMPTS => {
+                    eprintln!("Grok billing transport attempt {attempt} failed: {error}");
+                    attempt += 1;
+                    tokio::time::sleep(BILLING_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    eprintln!("Grok billing transport failed: {error}");
+                    return Err(upstream_error("Grok billing request failed"));
+                }
+            }
+        };
         let response: BillingResponse = response_json(response, "Grok billing").await?;
         normalize_billing(account_id, response)
     }

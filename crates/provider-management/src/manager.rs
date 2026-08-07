@@ -706,6 +706,11 @@ impl ProviderManager {
                 Ok(ProviderQuotaView::unsupported())
             }
             Err(error) => {
+                eprintln!(
+                    "quota fetch failed for account {}: {:?}: {error}",
+                    account_id.as_str(),
+                    error.kind()
+                );
                 let latest = self.load_visible_account(actor_user_id, account_id).await?;
                 let cached =
                     cached.filter(|entry| entry.credential_revision == latest.credential.revision);
