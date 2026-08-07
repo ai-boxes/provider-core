@@ -97,6 +97,12 @@ pub struct NewUser {
 }
 
 #[derive(Clone, Debug)]
+pub struct NewRegistrationCode {
+    pub code_hash: [u8; 32],
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredUser {
     pub id: UserId,
     pub username: String,

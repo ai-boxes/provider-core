@@ -1,4 +1,5 @@
-FROM rust:1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
+ENV RUSTUP_TOOLCHAIN=1.97.1
 WORKDIR /src
 
 RUN apt-get update \
@@ -8,7 +9,11 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 
-RUN cargo build --release -p provider-server
+RUN --mount=type=cache,id=provider-core-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=provider-core-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=provider-core-target,target=/src/target,sharing=locked \
+    cargo build --release --locked -p provider-server \
+    && cp /src/target/release/provider-core /tmp/provider-core
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
@@ -20,7 +25,7 @@ RUN apt-get update \
     && mkdir -p /app/data \
     && chown -R provider:provider /app
 
-COPY --from=builder /src/target/release/provider-core /usr/local/bin/provider-core
+COPY --from=builder /tmp/provider-core /usr/local/bin/provider-core
 
 USER provider
 ENV PODE_LISTEN_ADDRESS=0.0.0.0:8317

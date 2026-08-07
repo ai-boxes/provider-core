@@ -91,6 +91,10 @@ pub fn issue_api_key(custom: Option<SecretString>) -> Result<IssuedSecret, Crede
     }
 }
 
+pub fn issue_registration_code() -> Result<IssuedSecret, CredentialError> {
+    random_secret()
+}
+
 #[must_use]
 pub fn digest_secret(secret: &str) -> [u8; 32] {
     Sha256::digest(secret.as_bytes()).into()
@@ -194,5 +198,18 @@ mod tests {
         assert_eq!(custom.digest, digest_secret(custom_value));
         assert_eq!(generated.secret.expose_secret().len(), 43);
         assert_ne!(custom.digest, generated.digest);
+    }
+
+    #[test]
+    fn registration_code_is_url_safe_and_hashed() {
+        let issued = issue_registration_code().expect("registration code");
+        let code = issued.secret.expose_secret();
+
+        assert_eq!(code.len(), 43);
+        assert!(
+            code.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_eq!(issued.digest, digest_secret(code));
     }
 }

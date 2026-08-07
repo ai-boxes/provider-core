@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    ApiKeyId, NewApiKey, NewSession, NewUser, SessionId, StoredApiKey, StoredSession, StoredUser,
-    UserId, UserSummary,
+    ApiKeyId, NewApiKey, NewRegistrationCode, NewSession, NewUser, SessionId, StoredApiKey,
+    StoredSession, StoredUser, UserId, UserSummary,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +16,13 @@ pub enum InitialUserCreateOutcome {
 pub enum RefreshSessionOutcome {
     Updated,
     Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisterUserOutcome {
+    Created,
+    InvalidCode,
+    Conflict,
 }
 
 #[async_trait]
@@ -38,6 +45,25 @@ pub trait AuthRepository: Send + Sync {
     async fn list_users(&self) -> Result<Vec<UserSummary>, AuthRepositoryError>;
 
     async fn create_user(&self, user: NewUser) -> Result<bool, AuthRepositoryError>;
+
+    async fn create_registration_code(
+        &self,
+        code: NewRegistrationCode,
+    ) -> Result<(), AuthRepositoryError>;
+
+    async fn registration_code_valid(
+        &self,
+        code_hash: &[u8; 32],
+        now: i64,
+    ) -> Result<bool, AuthRepositoryError>;
+
+    async fn register_user(
+        &self,
+        code_hash: &[u8; 32],
+        user: NewUser,
+        session: NewSession,
+        now: i64,
+    ) -> Result<RegisterUserOutcome, AuthRepositoryError>;
 
     async fn set_user_enabled(
         &self,

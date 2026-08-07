@@ -2,9 +2,9 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use provider_auth::{
-    ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey, NewSession,
-    NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession, StoredUser, UserId,
-    UserRole, UserSummary,
+    ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey,
+    NewRegistrationCode, NewSession, NewUser, RefreshSessionOutcome, RegisterUserOutcome,
+    SessionId, StoredApiKey, StoredSession, StoredUser, UserId, UserRole, UserSummary,
 };
 #[cfg(test)]
 use provider_core::ProviderModelPricingTier;
@@ -874,6 +874,128 @@ impl AuthRepository for SqliteAccountRepository {
         .await
         .map_err(|error| auth_repository_error("failed to create user", error))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn create_registration_code(
+        &self,
+        code: NewRegistrationCode,
+    ) -> Result<(), AuthRepositoryError> {
+        sqlx::query(
+            r#"
+            INSERT INTO registration_codes
+                (code_hash, expires_at)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(code.code_hash.as_slice())
+        .bind(code.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to create registration code", error))?;
+        Ok(())
+    }
+
+    async fn registration_code_valid(
+        &self,
+        code_hash: &[u8; 32],
+        now: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM registration_codes
+                WHERE code_hash = ? AND expires_at > ?
+            )
+            "#,
+        )
+        .bind(code_hash.as_slice())
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to validate registration code", error))?;
+        Ok(exists != 0)
+    }
+
+    async fn register_user(
+        &self,
+        code_hash: &[u8; 32],
+        user: NewUser,
+        session: NewSession,
+        now: i64,
+    ) -> Result<RegisterUserOutcome, AuthRepositoryError> {
+        if session.user_id != user.id {
+            return Err(AuthRepositoryError::new(
+                "registration session must belong to the registered user",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start user registration transaction", error)
+        })?;
+        let consumed =
+            sqlx::query("DELETE FROM registration_codes WHERE code_hash = ? AND expires_at > ?")
+                .bind(code_hash.as_slice())
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    auth_repository_error("failed to consume registration code", error)
+                })?;
+        if consumed.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back invalid registration code", error)
+            })?;
+            return Ok(RegisterUserOutcome::InvalidCode);
+        }
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO users
+                (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(user.id.as_str())
+        .bind(user.username)
+        .bind(user.password_hash)
+        .bind(user.role.as_str())
+        .bind(database_bool(user.enabled))
+        .bind(user.created_at)
+        .bind(user.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to register user", error))?;
+        if inserted.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back registration conflict", error)
+            })?;
+            return Ok(RegisterUserOutcome::Conflict);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO user_sessions
+                (id, user_id, access_token_hash, refresh_token_hash, access_expires_at,
+                 refresh_expires_at, absolute_expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(session.id.as_str())
+        .bind(session.user_id.as_str())
+        .bind(session.access_token_hash.as_slice())
+        .bind(session.refresh_token_hash.as_slice())
+        .bind(session.access_expires_at)
+        .bind(session.refresh_expires_at)
+        .bind(session.absolute_expires_at)
+        .bind(session.created_at)
+        .bind(session.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to create registration session", error))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| auth_repository_error("failed to commit user registration", error))?;
+        Ok(RegisterUserOutcome::Created)
     }
 
     async fn set_user_enabled(
@@ -2224,6 +2346,123 @@ mod tests {
         assert_eq!(session.access_token_hash, [3; 32]);
         assert_eq!(session.refresh_expires_at, 350);
         assert_eq!(session.absolute_expires_at, 400);
+    }
+
+    #[tokio::test]
+    async fn registration_codes_are_one_time_and_survive_username_conflicts() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let admin = NewUser {
+            id: UserId::new("registration-admin").expect("admin ID"),
+            username: "admin".to_owned(),
+            password_hash: "admin-password-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 100,
+        };
+        assert_eq!(
+            repository
+                .create_initial_user(
+                    admin.clone(),
+                    test_session("registration-admin-session", admin.id.clone(), 10, 11),
+                )
+                .await
+                .expect("create admin"),
+            InitialUserCreateOutcome::Created
+        );
+        repository
+            .create_registration_code(NewRegistrationCode {
+                code_hash: [20; 32],
+                expires_at: 200,
+            })
+            .await
+            .expect("create registration code");
+        assert!(
+            repository
+                .registration_code_valid(&[20; 32], 199)
+                .await
+                .expect("validate unexpired registration code")
+        );
+        assert!(
+            !repository
+                .registration_code_valid(&[20; 32], 200)
+                .await
+                .expect("reject registration code at expiry")
+        );
+
+        let conflict = NewUser {
+            id: UserId::new("conflicting-registration").expect("user ID"),
+            username: "ADMIN".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 120,
+        };
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    conflict.clone(),
+                    test_session("conflicting-registration-session", conflict.id, 20, 21),
+                    120,
+                )
+                .await
+                .expect("reject username conflict"),
+            RegisterUserOutcome::Conflict
+        );
+
+        let member = NewUser {
+            id: UserId::new("registered-member").expect("user ID"),
+            username: "member".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 121,
+        };
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    member.clone(),
+                    test_session("registered-member-session", member.id.clone(), 22, 23),
+                    121,
+                )
+                .await
+                .expect("register member"),
+            RegisterUserOutcome::Created
+        );
+        assert!(
+            repository
+                .load_user(&member.id)
+                .await
+                .expect("load registered member")
+                .is_some()
+        );
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    NewUser {
+                        id: UserId::new("reused-registration").expect("user ID"),
+                        username: "other".to_owned(),
+                        password_hash: "password-hash".to_owned(),
+                        role: UserRole::User,
+                        enabled: true,
+                        created_at: 122,
+                    },
+                    test_session(
+                        "reused-registration-session",
+                        UserId::new("reused-registration").expect("user ID"),
+                        24,
+                        25,
+                    ),
+                    122,
+                )
+                .await
+                .expect("reject reused code"),
+            RegisterUserOutcome::InvalidCode
+        );
     }
 
     fn test_session(id: &str, user_id: UserId, access_hash: u8, refresh_hash: u8) -> NewSession {

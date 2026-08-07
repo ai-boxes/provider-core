@@ -9,11 +9,14 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
     ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
-    InitialUserCreateOutcome, NewApiKey, NewSession, NewUser, RefreshSessionOutcome, SessionId,
-    StoredApiKey, UserId, UserRole, UserSummary, add_atoms, atoms_ge, digest_secret, hash_password,
-    issue_api_key, issue_session_tokens, parse_quota_limit_usd, rotate_session_tokens,
+    InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
+    RefreshSessionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, UserId, UserRole,
+    UserSummary, add_atoms, atoms_ge, digest_secret, hash_password, issue_api_key,
+    issue_registration_code, issue_session_tokens, parse_quota_limit_usd, rotate_session_tokens,
     verify_password,
 };
+
+pub const REGISTRATION_CODE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -26,6 +29,11 @@ pub struct SessionGrant {
     pub refresh_token: SecretString,
     pub access_expires_at: i64,
     pub refresh_expires_at: i64,
+}
+
+pub struct CreatedRegistrationCode {
+    pub code: SecretString,
+    pub expires_at: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,41 +78,21 @@ impl AuthService {
             enabled: true,
             created_at: now,
         };
-        let tokens = issue_session_tokens(now)?;
-        if self
-            .repository
-            .create_initial_user(
-                user,
-                NewSession {
-                    id: SessionId::random(),
-                    user_id: user_id.clone(),
-                    access_token_hash: tokens.access.digest,
-                    refresh_token_hash: tokens.refresh.digest,
-                    access_expires_at: tokens.access_expires_at,
-                    refresh_expires_at: tokens.refresh_expires_at,
-                    absolute_expires_at: tokens.absolute_expires_at,
-                    created_at: now,
-                },
-            )
-            .await?
+        let user_summary = UserSummary {
+            id: user_id.clone(),
+            username,
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let (session, grant) = new_session_grant(user_summary, now)?;
+        if self.repository.create_initial_user(user, session).await?
             != InitialUserCreateOutcome::Created
         {
             return Err(AuthError::AlreadyConfigured);
         }
-        Ok(SessionGrant {
-            user: UserSummary {
-                id: user_id,
-                username,
-                role: UserRole::SuperAdmin,
-                enabled: true,
-                created_at: now,
-                updated_at: now,
-            },
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
+        Ok(grant)
     }
 
     pub async fn login(
@@ -209,27 +197,62 @@ impl AuthService {
         now: i64,
     ) -> Result<UserSummary, AuthError> {
         require_super_admin(actor)?;
-        let username = normalize_username(username)?;
-        let password_hash = password_hash(password).await?;
-        let user = NewUser {
-            id: UserId::random(),
-            username: username.clone(),
-            password_hash,
-            role: UserRole::User,
-            enabled: true,
-            created_at: now,
-        };
+        let user = new_standard_user(username, password, now).await?;
         if !self.repository.create_user(user.clone()).await? {
             return Err(AuthError::Conflict);
         }
-        Ok(UserSummary {
-            id: user.id,
-            username,
-            role: UserRole::User,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
+        Ok(new_user_summary(user))
+    }
+
+    pub async fn create_registration_code(
+        &self,
+        actor: &UserSummary,
+        now: i64,
+    ) -> Result<CreatedRegistrationCode, AuthError> {
+        require_super_admin(actor)?;
+        let issued = issue_registration_code()?;
+        let expires_at = now
+            .checked_add(REGISTRATION_CODE_TTL_SECONDS)
+            .ok_or(CredentialError::TimestampOutOfRange)?;
+        self.repository
+            .create_registration_code(NewRegistrationCode {
+                code_hash: issued.digest,
+                expires_at,
+            })
+            .await?;
+        Ok(CreatedRegistrationCode {
+            code: issued.secret,
+            expires_at,
         })
+    }
+
+    pub async fn register_user(
+        &self,
+        code: &str,
+        username: String,
+        password: SecretString,
+        now: i64,
+    ) -> Result<SessionGrant, AuthError> {
+        let code = normalize_registration_code(code)?;
+        let code_hash = digest_secret(code);
+        if !self
+            .repository
+            .registration_code_valid(&code_hash, now)
+            .await?
+        {
+            return Err(AuthError::InvalidRegistrationCode);
+        }
+        let user = new_standard_user(username, password, now).await?;
+        let (session, grant) = new_session_grant(new_user_summary(user.clone()), now)?;
+        match self
+            .repository
+            .register_user(&code_hash, user, session, now)
+            .await?
+        {
+            RegisterUserOutcome::Created => Ok(grant),
+            RegisterUserOutcome::InvalidCode => Err(AuthError::InvalidRegistrationCode),
+            RegisterUserOutcome::Conflict => Err(AuthError::Conflict),
+        }
     }
 
     pub async fn set_user_enabled(
@@ -284,27 +307,32 @@ impl AuthService {
     }
 
     async fn create_session(&self, user: UserSummary, now: i64) -> Result<SessionGrant, AuthError> {
-        let tokens = issue_session_tokens(now)?;
-        self.repository
-            .create_session(NewSession {
-                id: SessionId::random(),
-                user_id: user.id.clone(),
-                access_token_hash: tokens.access.digest,
-                refresh_token_hash: tokens.refresh.digest,
-                access_expires_at: tokens.access_expires_at,
-                refresh_expires_at: tokens.refresh_expires_at,
-                absolute_expires_at: tokens.absolute_expires_at,
-                created_at: now,
-            })
-            .await?;
-        Ok(SessionGrant {
-            user,
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
+        let (session, grant) = new_session_grant(user, now)?;
+        self.repository.create_session(session).await?;
+        Ok(grant)
     }
+}
+
+fn new_session_grant(user: UserSummary, now: i64) -> Result<(NewSession, SessionGrant), AuthError> {
+    let tokens = issue_session_tokens(now)?;
+    let session = NewSession {
+        id: SessionId::random(),
+        user_id: user.id.clone(),
+        access_token_hash: tokens.access.digest,
+        refresh_token_hash: tokens.refresh.digest,
+        access_expires_at: tokens.access_expires_at,
+        refresh_expires_at: tokens.refresh_expires_at,
+        absolute_expires_at: tokens.absolute_expires_at,
+        created_at: now,
+    };
+    let grant = SessionGrant {
+        user,
+        access_token: tokens.access.secret,
+        refresh_token: tokens.refresh.secret,
+        access_expires_at: tokens.access_expires_at,
+        refresh_expires_at: tokens.refresh_expires_at,
+    };
+    Ok((session, grant))
 }
 
 #[derive(Clone)]
@@ -858,6 +886,44 @@ async fn password_hash(password: SecretString) -> Result<String, AuthError> {
         .map_err(AuthError::Credential)
 }
 
+async fn new_standard_user(
+    username: String,
+    password: SecretString,
+    now: i64,
+) -> Result<NewUser, AuthError> {
+    Ok(NewUser {
+        id: UserId::random(),
+        username: normalize_username(username)?,
+        password_hash: password_hash(password).await?,
+        role: UserRole::User,
+        enabled: true,
+        created_at: now,
+    })
+}
+
+fn new_user_summary(user: NewUser) -> UserSummary {
+    UserSummary {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        enabled: user.enabled,
+        created_at: user.created_at,
+        updated_at: user.created_at,
+    }
+}
+
+fn normalize_registration_code(code: &str) -> Result<&str, AuthError> {
+    let code = code.trim();
+    if code.len() != 43
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(AuthError::InvalidRegistrationCode);
+    }
+    Ok(code)
+}
+
 async fn verify_password_async(password: SecretString, encoded: String) -> Result<bool, AuthError> {
     tokio::task::spawn_blocking(move || verify_password(&password, &encoded))
         .await
@@ -888,6 +954,8 @@ pub enum AuthError {
     Conflict,
     #[error("resource was not found")]
     NotFound,
+    #[error("registration code is invalid or expired")]
+    InvalidRegistrationCode,
     #[error("username must contain 1 to 128 characters")]
     InvalidUsername,
     #[error("label must contain 1 to 128 characters")]

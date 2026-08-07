@@ -11,7 +11,8 @@ use axum::{
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
-    CreatedApiKey, CredentialError, SessionGrant, StoredApiKey, UserId, UserSummary,
+    CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant, StoredApiKey, UserId,
+    UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
@@ -50,6 +51,7 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/users", get(list_users).post(create_user))
+        .route("/api/v1/registration-codes", post(create_registration_code))
         .route("/api/v1/users/{user_id}", put(update_user))
         .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
@@ -66,6 +68,7 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
     Router::new()
         .route("/api/v1/auth/setup", get(setup_required).post(setup))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/register", post(register_user))
         .route("/api/v1/auth/refresh", post(refresh))
         .merge(protected)
         .with_state(state)
@@ -114,6 +117,23 @@ async fn login(
         )
         .await?;
     Ok(data(session_grant_json(&grant)))
+}
+
+async fn register_user(
+    State(state): State<AuthHttpState>,
+    request: Result<Json<RegisterUserRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), AuthApiError> {
+    let request = json_request(request)?;
+    let grant = state
+        .auth
+        .register_user(
+            &request.invitation_code,
+            request.username,
+            SecretString::from(request.password),
+            unix_timestamp(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, data(session_grant_json(&grant))))
 }
 
 async fn refresh(
@@ -167,6 +187,20 @@ async fn create_user(
         )
         .await?;
     Ok((StatusCode::CREATED, data(user_json(&user))))
+}
+
+async fn create_registration_code(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+) -> Result<(StatusCode, Json<Value>), AuthApiError> {
+    let code = state
+        .auth
+        .create_registration_code(&session.user, unix_timestamp())
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        data(created_registration_code_json(&code)),
+    ))
 }
 
 async fn update_user(
@@ -323,6 +357,14 @@ struct UserCredentialsRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterUserRequest {
+    username: String,
+    password: String,
+    invitation_code: String,
+}
+
+#[derive(Deserialize)]
 struct UpdateUserRequest {
     enabled: bool,
 }
@@ -424,6 +466,13 @@ fn user_json(user: &UserSummary) -> Value {
         "enabled": user.enabled,
         "created_at": user.created_at,
         "updated_at": user.updated_at
+    })
+}
+
+fn created_registration_code_json(code: &CreatedRegistrationCode) -> Value {
+    json!({
+        "code": code.code.expose_secret(),
+        "expires_at": code.expires_at
     })
 }
 
@@ -558,6 +607,9 @@ impl From<AuthError> for AuthApiError {
             | AuthError::Credential(CredentialError::SessionExpired) => Self::unauthorized(),
             AuthError::Forbidden => Self::forbidden(),
             AuthError::NotFound => Self::not_found(),
+            AuthError::InvalidRegistrationCode => {
+                Self::invalid_request("invitation code is invalid or expired")
+            }
             AuthError::GroupNotFound => {
                 Self::invalid_request("no visible provider accounts use this group label")
             }
@@ -811,23 +863,80 @@ mod tests {
             custom_key
         );
 
-        let created_member = post_json(
+        let registration_code = client
+            .post(format!("{base_url}/api/v1/registration-codes"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("create registration code");
+        assert_eq!(registration_code.status(), StatusCode::CREATED);
+        let registration_code = response_secret(&response_json(registration_code).await, "code");
+        let conflicting_registration = post_json(
             &client,
-            format!("{base_url}/api/v1/users"),
-            json!({ "username": "member", "password": "secret2" }),
-            Some(&access_token),
-        )
-        .await;
-        assert_eq!(created_member.status(), StatusCode::CREATED);
-        let member_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "member", "password": "secret2" }),
+            format!("{base_url}/api/v1/auth/register"),
+            json!({
+                "username": "ADMIN",
+                "password": "secret2",
+                "invitation_code": registration_code.clone()
+            }),
             None,
         )
         .await;
-        assert_eq!(member_login.status(), StatusCode::OK);
-        let member_access = response_secret(&response_json(member_login).await, "access_token");
+        assert_eq!(conflicting_registration.status(), StatusCode::CONFLICT);
+        let created_member = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/register"),
+            json!({
+                "username": "member",
+                "password": "secret2",
+                "invitation_code": registration_code.clone()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(created_member.status(), StatusCode::CREATED);
+        let created_member_body = response_json(created_member).await;
+        let member_access = response_secret(&created_member_body, "access_token");
+        assert_eq!(created_member_body["data"]["user"]["username"], "member");
+        let reused_code = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/register"),
+            json!({
+                "username": "second-member",
+                "password": "secret3",
+                "invitation_code": registration_code
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(reused_code.status(), StatusCode::BAD_REQUEST);
+        let malformed_code = post_json(
+            &client,
+            format!("{base_url}/api/v1/auth/register"),
+            json!({
+                "username": "third-member",
+                "password": "secret4",
+                "invitation_code": "not-a-code"
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(malformed_code.status(), StatusCode::BAD_REQUEST);
+
+        let unauthenticated_code = client
+            .post(format!("{base_url}/api/v1/registration-codes"))
+            .send()
+            .await
+            .expect("reject unauthenticated registration code creation");
+        assert_eq!(unauthenticated_code.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden_code = client
+            .post(format!("{base_url}/api/v1/registration-codes"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("reject member registration code creation");
+        assert_eq!(forbidden_code.status(), StatusCode::FORBIDDEN);
 
         let foreign_read = client
             .get(format!("{base_url}/api/v1/keys/{key_id}"))
