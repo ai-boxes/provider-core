@@ -45,6 +45,25 @@ pub fn observe_responses_usage(
     upstream: ProviderStream,
     attempt: Arc<dyn AttemptTracking>,
 ) -> ProviderStream {
+    observe_usage(upstream, attempt, extract_responses_facts)
+}
+
+/// Wrap an OpenAI Chat Completions byte stream so its usage is observed in passing.
+#[must_use]
+pub fn observe_chat_completions_usage(
+    upstream: ProviderStream,
+    attempt: Arc<dyn AttemptTracking>,
+) -> ProviderStream {
+    observe_usage(upstream, attempt, extract_chat_completions_facts)
+}
+
+type FrameExtractor = fn(&[u8]) -> Option<ObservedFrame>;
+
+fn observe_usage(
+    upstream: ProviderStream,
+    attempt: Arc<dyn AttemptTracking>,
+    extractor: FrameExtractor,
+) -> ProviderStream {
     let state = UsageObservingStream {
         upstream,
         decoder: SseDecoder::default(),
@@ -52,6 +71,7 @@ pub fn observe_responses_usage(
         attempt: Some(attempt),
         upstream_done: false,
         blind: false,
+        extractor,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -70,6 +90,7 @@ struct UsageObservingStream {
     /// Set when the upstream framing became unparseable. Observation stops; the
     /// response itself is unaffected.
     blind: bool,
+    extractor: FrameExtractor,
 }
 
 impl UsageObservingStream {
@@ -125,7 +146,7 @@ impl UsageObservingStream {
     }
 
     fn inspect_frame(&mut self, frame: &[u8]) {
-        let Some(observed) = extract_terminal_facts(frame) else {
+        let Some(observed) = (self.extractor)(frame) else {
             return;
         };
         if let Some(attempt) = &self.attempt {
@@ -187,7 +208,7 @@ struct ObservedFrame {
 /// `response.completed` that reports no usage is still the only proof that the
 /// stream ended the way the protocol says it should — gating on `usage` alone
 /// recorded those responses as merely having stopped.
-fn extract_terminal_facts(frame: &[u8]) -> Option<ObservedFrame> {
+fn extract_responses_facts(frame: &[u8]) -> Option<ObservedFrame> {
     if !contains_subslice(frame, b"usage")
         && !contains_subslice(frame, COMPLETED_EVENT.as_bytes())
         && !FIRST_TOKEN_EVENT_TYPES
@@ -231,6 +252,81 @@ fn extract_terminal_facts(frame: &[u8]) -> Option<ObservedFrame> {
         first_token,
         success_terminal,
     })
+}
+
+/// Pull usage and lifecycle facts from one OpenAI Chat Completions SSE frame.
+fn extract_chat_completions_facts(frame: &[u8]) -> Option<ObservedFrame> {
+    if frame == b"[DONE]" {
+        return Some(ObservedFrame {
+            fields: None,
+            model: None,
+            first_token: false,
+            success_terminal: true,
+        });
+    }
+    if !contains_subslice(frame, b"usage")
+        && !contains_subslice(frame, b"model")
+        && !contains_subslice(frame, b"choices")
+    {
+        return None;
+    }
+
+    let event: Value = serde_json::from_slice(frame).ok()?;
+    let usage = event.get("usage").filter(|usage| usage.is_object());
+    let model = event
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_LEN)
+        .map(ToOwned::to_owned);
+    let choices = event.get("choices").and_then(Value::as_array);
+    let success_terminal = choices.is_some_and(|choices| {
+        choices.iter().any(|choice| {
+            choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+        })
+    });
+    let first_token = choices.is_some_and(|choices| {
+        choices
+            .iter()
+            .any(|choice| choice.get("delta").is_some_and(chat_delta_has_output))
+    });
+
+    if usage.is_none() && model.is_none() && !success_terminal && !first_token {
+        return None;
+    }
+    Some(ObservedFrame {
+        fields: usage.map(RawUsageFields::from_chat_completions_usage),
+        model,
+        first_token,
+        success_terminal,
+    })
+}
+
+fn chat_delta_has_output(delta: &Value) -> bool {
+    ["content", "reasoning_content", "reasoning"]
+        .iter()
+        .any(|field| {
+            delta
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+        || delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.get("function").is_some_and(|function| {
+                        ["arguments", "name"].iter().any(|field| {
+                            function
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.is_empty())
+                        })
+                    })
+                })
+            })
 }
 
 /// The Responses event that marks a stream's successful end.
@@ -357,6 +453,38 @@ mod tests {
         assert_eq!(forwarded, expected, "a tee must not alter the payload");
         assert!(observed.reported().is_some());
         assert!(observed.saw_first_token());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_usage_and_terminal_are_observed_without_changing_bytes() {
+        let (observed, attempt) = recording_attempt();
+        let chunks = vec![
+            "data: {\"id\":\"chat_1\",\"model\":\"qwen-max\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"model\":\"qwen-max\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let stream = observe_chat_completions_usage(byte_stream(chunks.clone()), attempt);
+
+        let forwarded: Vec<Bytes> = stream.map(|item| item.expect("no error")).collect().await;
+        let expected: Vec<Bytes> = chunks
+            .iter()
+            .map(|chunk| Bytes::from_static(chunk.as_bytes()))
+            .collect();
+        assert_eq!(forwarded, expected, "a tee must not alter the payload");
+
+        let fields = observed
+            .reported()
+            .expect("attempt told")
+            .expect("usage observed");
+        assert_eq!(fields.input, Some(12));
+        assert_eq!(fields.output, Some(4));
+        assert_eq!(fields.total, Some(16));
+        assert_eq!(
+            observed.model.lock().expect("model lock").as_deref(),
+            Some("qwen-max")
+        );
+        assert!(observed.saw_first_token());
+        assert!(observed.saw_success_terminal());
     }
 
     #[tokio::test]

@@ -36,6 +36,10 @@ pub(crate) fn prepare_request(
     body.insert("model".to_owned(), Value::String(request.model.clone()));
     body.insert("messages".to_owned(), Value::Array(messages));
     body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert(
+        "stream_options".to_owned(),
+        serde_json::json!({ "include_usage": true }),
+    );
     copy_fields(
         source,
         &mut body,
@@ -336,6 +340,7 @@ mod tests {
         assert_eq!(request.format, WireFormat::OpenAiChatCompletions);
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["max_tokens"], 512);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");

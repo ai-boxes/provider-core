@@ -17,7 +17,7 @@ use provider_core::{
     RefreshOutcome, RefreshTrigger, WireFormat,
     usage::{AttemptTracking, RequestTracking},
 };
-use provider_protocol::observe_responses_usage;
+use provider_protocol::{observe_chat_completions_usage, observe_responses_usage};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore, mpsc},
@@ -27,21 +27,22 @@ use tokio_util::{sync::CancellationToken, time::DelayQueue};
 
 /// Attach usage observation to a stream, when the wire format is one we can read.
 ///
-/// Only the OpenAI Responses observer exists so far, and only providers with an
-/// established usage contract report a profile — today just Codex, which is a
-/// Responses provider. The format check keeps a future provider on a different
-/// wire format from being silently mis-parsed: it gets an honest gap instead.
+/// Unsupported formats get an explicit observation gap rather than being
+/// silently parsed as a different protocol.
 fn observe_usage(
     stream: ProviderStream,
     attempt: Arc<dyn AttemptTracking>,
     format: WireFormat,
 ) -> ProviderStream {
-    if matches!(format, WireFormat::OpenAiResponses) {
-        return observe_responses_usage(stream, attempt);
+    match format {
+        WireFormat::OpenAiResponses => observe_responses_usage(stream, attempt),
+        WireFormat::OpenAiChatCompletions => observe_chat_completions_usage(stream, attempt),
+        _ => {
+            attempt.observation_lost();
+            attempt.finished(None);
+            stream
+        }
     }
-    attempt.observation_lost();
-    attempt.finished(None);
-    stream
 }
 
 const DEFAULT_REFRESH_CONCURRENCY: usize = 4;

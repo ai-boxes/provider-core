@@ -74,6 +74,27 @@ impl RawUsageFields {
             total: int_field(usage, "total_tokens"),
         }
     }
+
+    /// Extract counts from an OpenAI Chat Completions-style `usage` object.
+    #[must_use]
+    pub fn from_chat_completions_usage(usage: &Value) -> Self {
+        Self {
+            input: int_field(usage, "prompt_tokens"),
+            cache_read: nested_int(usage, "prompt_tokens_details", "cached_tokens"),
+            cache_write: nested_int_any(
+                usage,
+                "prompt_tokens_details",
+                &["cache_write_tokens", "cache_creation_tokens"],
+            ),
+            output: int_field(usage, "completion_tokens"),
+            reasoning: nested_int(usage, "completion_tokens_details", "reasoning_tokens"),
+            input_audio: nested_int(usage, "prompt_tokens_details", "audio_tokens"),
+            output_audio: nested_int(usage, "completion_tokens_details", "audio_tokens"),
+            image_input: nested_int(usage, "prompt_tokens_details", "image_tokens"),
+            image_output: nested_int(usage, "completion_tokens_details", "image_tokens"),
+            total: int_field(usage, "total_tokens"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +108,22 @@ mod tests {
         assert_eq!(fields.cache_read, None, "missing cache field is not zero");
         assert_eq!(fields.reasoning, None);
         assert_eq!(fields.total, None);
+    }
+
+    #[test]
+    fn chat_completions_fields_use_prompt_and_completion_names() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 12,
+            "prompt_tokens_details": { "cached_tokens": 4 },
+            "completion_tokens": 5,
+            "completion_tokens_details": { "reasoning_tokens": 2 },
+            "total_tokens": 17
+        });
+        let fields = RawUsageFields::from_chat_completions_usage(&usage);
+        assert_eq!(fields.input, Some(12));
+        assert_eq!(fields.cache_read, Some(4));
+        assert_eq!(fields.output, Some(5));
+        assert_eq!(fields.reasoning, Some(2));
+        assert_eq!(fields.total, Some(17));
     }
 }

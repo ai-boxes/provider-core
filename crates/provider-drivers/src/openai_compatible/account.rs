@@ -8,6 +8,7 @@ use provider_core::{
     ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError, ProviderDriver,
     ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest, ProviderStream,
     RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount, TokenCounter, WireFormat,
+    usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -155,6 +156,13 @@ impl ProviderAccount for OpenAiCompatibleAccount {
 
     fn account_id(&self) -> &AccountId {
         &self.account_id
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::OpenAiCompatible,
+            contract: super::usage::openai_compatible_usage_contract(),
+        })
     }
 
     fn runtime_state(&self) -> AccountRuntimeState {
