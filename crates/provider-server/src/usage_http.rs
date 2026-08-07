@@ -42,7 +42,7 @@ pub struct UsageServices {
 
 /// Default window when a caller does not give one: the last day.
 const DEFAULT_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
-const DEFAULT_PAGE_SIZE: u32 = 50;
+const DEFAULT_PAGE_SIZE: u32 = 15;
 
 pub(crate) fn router(services: UsageServices) -> Router {
     Router::new()
