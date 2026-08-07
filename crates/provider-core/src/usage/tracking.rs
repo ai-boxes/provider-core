@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ProviderKind,
+    ProviderKind, ProviderModelPricingRecord,
     usage::{RawUsageFields, UsageContractSnapshot},
 };
 
@@ -39,6 +39,7 @@ pub trait RequestTracking: Send + Sync {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing: Option<&ProviderModelPricingRecord>,
     ) -> Option<Arc<dyn AttemptTracking>>;
 }
 

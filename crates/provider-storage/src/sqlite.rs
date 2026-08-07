@@ -6,13 +6,17 @@ use provider_auth::{
     NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession, StoredUser, UserId,
     UserRole, UserSummary,
 };
+#[cfg(test)]
+use provider_core::ProviderModelPricingTier;
 use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
     CredentialUpdate, CredentialWriteOutcome, DiscoveredProviderModel, NewProviderAccount,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
-    ProviderManagementRepository, ProviderModelOverride, ProviderVisibility, StoredCredential,
+    ProviderManagementRepository, ProviderModelOverride, ProviderModelPricing,
+    ProviderModelPricingRecord, ProviderModelPricingSource, ProviderVisibility, StoredCredential,
     StoredProviderAccount, StoredProviderModel,
 };
+use provider_usage::{component_prices_from_model_pricing, context_price_tiers_from_model_pricing};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{
     ConnectOptions, Row, SqlitePool,
@@ -529,7 +533,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
-                       last_seen_at, created_at, updated_at
+                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 WHERE account_id = ?
                 ORDER BY upstream_model
@@ -542,7 +546,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
-                       last_seen_at, created_at, updated_at
+                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 ORDER BY account_id, upstream_model
                 "#,
@@ -599,17 +603,31 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .map_err(|error| repository_error("failed to mark provider models unavailable", error))?;
 
         for model in models {
-            let upstream_model = model.upstream_model.trim();
+            let upstream_model = model.upstream_model.as_str();
+            if upstream_model.is_empty() || upstream_model.trim() != upstream_model {
+                return Err(AccountRepositoryError::new(
+                    "discovered provider model must not be empty or contain surrounding whitespace",
+                ));
+            }
+            let (pricing_source, pricing_json) = encode_model_pricing(model.pricing.as_ref())?;
             sqlx::query(
                 r#"
                 INSERT INTO provider_models
                     (account_id, upstream_model, enabled, available, routable, metadata_json,
-                     last_seen_at, updated_at)
-                VALUES (?, ?, 1, 1, ?, ?, ?, ?)
+                     pricing_source, pricing_json, last_seen_at, updated_at)
+                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, upstream_model) DO UPDATE SET
                     available = 1,
                     routable = excluded.routable,
                     metadata_json = excluded.metadata_json,
+                    pricing_source = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
+                        ELSE COALESCE(excluded.pricing_source, provider_models.pricing_source)
+                    END,
+                    pricing_json = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_json
+                        ELSE COALESCE(excluded.pricing_json, provider_models.pricing_json)
+                    END,
                     last_seen_at = excluded.last_seen_at,
                     updated_at = excluded.updated_at
                 "#,
@@ -618,6 +636,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             .bind(upstream_model)
             .bind(database_bool(model.routable))
             .bind(model.metadata_json)
+            .bind(pricing_source)
+            .bind(pricing_json)
             .bind(synced_at)
             .bind(synced_at)
             .execute(&mut *transaction)
@@ -638,15 +658,37 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<bool, AccountRepositoryError> {
+        let (update_pricing, pricing_json) = match update.pricing {
+            None => (false, None),
+            Some(None) => (true, None),
+            Some(Some(pricing)) => (
+                true,
+                Some(serde_json::to_string(&pricing).map_err(|error| {
+                    repository_error("failed to encode provider model pricing", error)
+                })?),
+            ),
+        };
         let result = sqlx::query(
             r#"
             UPDATE provider_models
-            SET alias = ?, enabled = ?, updated_at = ?
+            SET alias = ?,
+                enabled = ?,
+                pricing_source = CASE
+                    WHEN ? = 0 THEN pricing_source
+                    WHEN ? IS NULL THEN NULL
+                    ELSE 'manual'
+                END,
+                pricing_json = CASE WHEN ? = 0 THEN pricing_json ELSE ? END,
+                updated_at = ?
             WHERE account_id = ? AND upstream_model = ?
             "#,
         )
         .bind(update.alias)
         .bind(database_bool(update.enabled))
+        .bind(database_bool(update_pricing))
+        .bind(pricing_json.as_deref())
+        .bind(database_bool(update_pricing))
+        .bind(pricing_json)
         .bind(update.updated_at)
         .bind(account_id.as_str())
         .bind(upstream_model)
@@ -1335,6 +1377,10 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
     let account_id = AccountId::new(account_id).map_err(|error| {
         AccountRepositoryError::new(format!("invalid provider account ID: {error}"))
     })?;
+    let pricing = decode_model_pricing(
+        row_value(&row, "pricing_source")?,
+        row_value(&row, "pricing_json")?,
+    )?;
     Ok(StoredProviderModel {
         account_id,
         upstream_model: row_value(&row, "upstream_model")?,
@@ -1343,10 +1389,56 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
         available: row_value::<i64>(&row, "available")? != 0,
         routable: row_value::<i64>(&row, "routable")? != 0,
         metadata_json: row_value(&row, "metadata_json")?,
+        pricing,
         last_seen_at: row_value(&row, "last_seen_at")?,
         created_at: row_value(&row, "created_at")?,
         updated_at: row_value(&row, "updated_at")?,
     })
+}
+
+fn encode_model_pricing(
+    record: Option<&ProviderModelPricingRecord>,
+) -> Result<(Option<&'static str>, Option<String>), AccountRepositoryError> {
+    let Some(record) = record else {
+        return Ok((None, None));
+    };
+    let json = serde_json::to_string(&record.pricing)
+        .map_err(|error| repository_error("failed to encode provider model pricing", error))?;
+    Ok((Some(record.source.as_str()), Some(json)))
+}
+
+fn decode_model_pricing(
+    source: Option<String>,
+    json: Option<String>,
+) -> Result<Option<ProviderModelPricingRecord>, AccountRepositoryError> {
+    match (source.as_deref(), json) {
+        (None, None) => Ok(None),
+        (Some(source), Some(json)) => {
+            let source = match source {
+                "catalog" => ProviderModelPricingSource::Catalog,
+                "manual" => ProviderModelPricingSource::Manual,
+                _ => {
+                    return Err(AccountRepositoryError::new(
+                        "unknown provider model pricing source",
+                    ));
+                }
+            };
+            let pricing = serde_json::from_str::<ProviderModelPricing>(&json).map_err(|error| {
+                repository_error("failed to decode provider model pricing", error)
+            })?;
+            if component_prices_from_model_pricing(&pricing).is_none()
+                || context_price_tiers_from_model_pricing(&pricing).is_none()
+            {
+                return Err(AccountRepositoryError::new(
+                    "stored provider model pricing is invalid",
+                ));
+            }
+            Ok(Some(ProviderModelPricingRecord { source, pricing }))
+        }
+        _ => Err(AccountRepositoryError::new(
+            "provider model pricing source and json must be set together",
+        )),
+    }
 }
 
 fn provider_visibility(row: &SqliteRow) -> Result<ProviderVisibility, AccountRepositoryError> {
@@ -1573,6 +1665,33 @@ fn sqlite_files(path: &Path) -> [std::path::PathBuf; 3] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stored_model_pricing_rejects_invalid_price_semantics() {
+        let decode =
+            |json: &str| decode_model_pricing(Some("catalog".to_owned()), Some(json.to_owned()));
+
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_ok());
+        assert!(decode(
+            r#"{"input":"1e3","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":null,"output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":null,"output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null},{"threshold_tokens":200000,"input":"3","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}"#
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn migrates_and_compare_and_swaps_credentials() {
         let repository = SqliteAccountRepository::in_memory()
@@ -1771,11 +1890,34 @@ mod tests {
                         upstream_model: "grok-a".to_owned(),
                         metadata_json: r#"{"version":1}"#.to_owned(),
                         routable: true,
+                        pricing: Some(ProviderModelPricingRecord {
+                            source: ProviderModelPricingSource::Catalog,
+                            pricing: ProviderModelPricing {
+                                input: Some("1".to_owned()),
+                                output: Some("2".to_owned()),
+                                cache_read: None,
+                                cache_write: None,
+                                reasoning: None,
+                                input_audio: None,
+                                output_audio: None,
+                                tiers: vec![ProviderModelPricingTier {
+                                    threshold_tokens: 200_000,
+                                    input: Some("2".to_owned()),
+                                    output: Some("4".to_owned()),
+                                    cache_read: None,
+                                    cache_write: None,
+                                    reasoning: None,
+                                    input_audio: None,
+                                    output_audio: None,
+                                }],
+                            },
+                        }),
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-b".to_owned(),
                         metadata_json: "{}".to_owned(),
                         routable: true,
+                        pricing: None,
                     },
                 ],
                 10,
@@ -1790,11 +1932,53 @@ mod tests {
                     ProviderModelOverride {
                         alias: Some("grok-latest".to_owned()),
                         enabled: false,
+                        pricing: None,
                         updated_at: 11,
                     },
                 )
                 .await
-                .expect("model override")
+                .expect("model override without pricing")
+        );
+        let catalog_model = repository
+            .list_provider_models(Some(&account_id))
+            .await
+            .expect("catalog model after override")
+            .into_iter()
+            .find(|model| model.upstream_model == "grok-a")
+            .expect("grok-a after override");
+        assert_eq!(
+            catalog_model
+                .pricing
+                .expect("catalog pricing remains")
+                .pricing
+                .tiers
+                .len(),
+            1,
+            "an alias/status-only edit must preserve catalog tiers"
+        );
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-a",
+                    ProviderModelOverride {
+                        alias: Some("grok-latest".to_owned()),
+                        enabled: false,
+                        pricing: Some(Some(ProviderModelPricing {
+                            input: Some("3".to_owned()),
+                            output: Some("4".to_owned()),
+                            cache_read: None,
+                            cache_write: None,
+                            reasoning: None,
+                            input_audio: None,
+                            output_audio: None,
+                            tiers: Vec::new(),
+                        })),
+                        updated_at: 12,
+                    },
+                )
+                .await
+                .expect("model override and manual pricing")
         );
 
         let models = repository
@@ -1805,11 +1989,25 @@ mod tests {
                         upstream_model: "grok-a".to_owned(),
                         metadata_json: r#"{"version":2}"#.to_owned(),
                         routable: true,
+                        pricing: Some(ProviderModelPricingRecord {
+                            source: ProviderModelPricingSource::Catalog,
+                            pricing: ProviderModelPricing {
+                                input: Some("10".to_owned()),
+                                output: Some("20".to_owned()),
+                                cache_read: None,
+                                cache_write: None,
+                                reasoning: None,
+                                input_audio: None,
+                                output_audio: None,
+                                tiers: Vec::new(),
+                            },
+                        }),
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-c".to_owned(),
                         metadata_json: "{}".to_owned(),
                         routable: true,
+                        pricing: None,
                     },
                 ],
                 20,
@@ -1825,6 +2023,23 @@ mod tests {
         assert!(!model_a.enabled);
         assert!(model_a.available);
         assert_eq!(model_a.metadata_json, r#"{"version":2}"#);
+        assert_eq!(
+            model_a.pricing,
+            Some(ProviderModelPricingRecord {
+                source: ProviderModelPricingSource::Manual,
+                pricing: ProviderModelPricing {
+                    input: Some("3".to_owned()),
+                    output: Some("4".to_owned()),
+                    cache_read: None,
+                    cache_write: None,
+                    reasoning: None,
+                    input_audio: None,
+                    output_audio: None,
+                    tiers: Vec::new(),
+                },
+            }),
+            "model synchronization must preserve manual pricing"
+        );
         assert!(
             !models
                 .iter()
@@ -1838,6 +2053,32 @@ mod tests {
                 .find(|model| model.upstream_model == "grok-c")
                 .expect("grok-c")
                 .available
+        );
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-a",
+                    ProviderModelOverride {
+                        alias: None,
+                        enabled: true,
+                        pricing: Some(None),
+                        updated_at: 21,
+                    },
+                )
+                .await
+                .expect("clear model pricing")
+        );
+        assert_eq!(
+            repository
+                .list_provider_models(Some(&account_id))
+                .await
+                .expect("models after clearing pricing")
+                .into_iter()
+                .find(|model| model.upstream_model == "grok-a")
+                .expect("grok-a after clearing pricing")
+                .pricing,
+            None
         );
     }
 

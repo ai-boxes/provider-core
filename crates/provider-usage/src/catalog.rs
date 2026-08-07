@@ -1,4 +1,4 @@
-//! The models.dev price catalog: parsing, and resolving a price for an attempt.
+//! The models.dev price catalog: parsing and exact model-price lookup.
 //!
 //! Source: `https://models.dev/api.json`, shaped as
 //! `{provider_id: {models: {model_id: {cost: {...}}}}}` with every cost in USD
@@ -10,56 +10,26 @@
 //!    float before this code saw it, so cost numbers are captured as raw JSON
 //!    text and converted to a scaled integer directly. A value that cannot be
 //!    represented exactly is rejected, not rounded.
-//! 2. **Mapping is exact, never guessed.** A provider or model with no entry
-//!    resolves to a stable "missing" reason, so an attempt records why it has no
-//!    price instead of appearing to be free.
+//! 2. **Mapping is exact, never guessed.** A model with no accepted exact-ID
+//!    entry remains unpriced when provider models are refreshed.
 
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
 };
 
-use provider_core::ProviderKind;
+use provider_core::{ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingTier};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::{
     money::{PRICE_SCALE, UnitPrice},
-    price::{ComponentPrices, ContextPriceTier, InlinePriceRecord, PriceResolution},
-    tracking::PriceResolver,
+    price::{ComponentPrices, ContextPriceTier},
 };
-
-/// The document layout this parser understands.
-pub const CATALOG_FORMAT_VERSION: u16 = 1;
-
-/// This parser's own version, bumped when its interpretation changes.
-pub const CATALOG_PARSER_VERSION: u16 = 2;
-
-/// The provider-to-catalog mapping's version, bumped when the mapping changes.
-pub const CATALOG_MAPPING_REVISION: u32 = 1;
 
 /// Largest catalog body accepted, before parsing. The real document is a couple
 /// of megabytes; this bounds what an unexpected response can cost us.
 pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
-
-/// The catalog provider id for one of our provider kinds.
-///
-/// Only Codex is claimed, and only because its models are OpenAI's. The others
-/// are deliberately unmapped: guessing an id would attach confident prices to a
-/// provider whose catalog entry nobody has checked.
-#[must_use]
-pub const fn catalog_provider_id(kind: ProviderKind) -> Option<&'static str> {
-    match kind {
-        ProviderKind::Codex => Some("openai"),
-        // Verified against the real document: `xai` exists with 10 models and
-        // `grok-4.3` carries input, output and cache_read prices.
-        ProviderKind::Grok => Some("xai"),
-        // A "compatible" account points at whatever the operator configured and its
-        // model ids are user-chosen, so there is no mapping to infer. These resolve
-        // to `provider_mapping_missing` — token counts without a cost.
-        ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible => None,
-    }
-}
 
 /// What the catalog says about one model.
 ///
@@ -70,8 +40,7 @@ pub const fn catalog_provider_id(kind: ProviderKind) -> Option<&'static str> {
 enum CatalogEntry {
     Priced {
         prices: Box<ComponentPrices>,
-        context_tier: Option<ContextPriceTier>,
-        unmodeled_pricing_rule: bool,
+        model_tiers: Box<Vec<ProviderModelPricingTier>>,
     },
     /// The entry exists but carries no `cost` at all.
     NoCost,
@@ -79,8 +48,8 @@ enum CatalogEntry {
     Invalid,
 }
 
-/// An immutable view of the catalog. Swapped as a whole, so a refresh can never
-/// be observed half-applied and an attempt always prices against one revision.
+/// An immutable view of the catalog. Swapped as a whole, so provider model
+/// refreshes can never observe a half-applied catalog revision.
 #[derive(Debug)]
 pub struct CatalogSnapshot {
     revision: String,
@@ -88,8 +57,7 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    /// Parse a catalog body. `revision` is the content hash the caller stored it
-    /// under, and is inlined onto every attempt priced from this snapshot.
+    /// Parse a catalog body. `revision` is the content hash stored alongside it.
     pub fn parse(body: &str, revision: impl Into<String>) -> Result<Self, CatalogParseError> {
         if body.len() > MAX_CATALOG_BYTES {
             return Err(CatalogParseError::TooLarge);
@@ -102,16 +70,13 @@ impl CatalogSnapshot {
             for (model_id, model) in provider.models {
                 let entry = match model.cost {
                     None => CatalogEntry::NoCost,
-                    Some(cost) => match component_prices(&cost) {
-                        Some(prices) => {
-                            let (context_tier, unmodeled_pricing_rule) = parse_context_tier(&cost);
-                            CatalogEntry::Priced {
-                                prices: Box::new(prices),
-                                context_tier,
-                                unmodeled_pricing_rule,
-                            }
-                        }
-                        None => CatalogEntry::Invalid,
+                    Some(cost) => match (component_prices(&cost), parse_model_pricing_tiers(&cost))
+                    {
+                        (Some(prices), Some(model_tiers)) => CatalogEntry::Priced {
+                            prices: Box::new(prices),
+                            model_tiers: Box::new(model_tiers),
+                        },
+                        _ => CatalogEntry::Invalid,
                     },
                 };
                 entries.insert((provider_id.clone(), model_id), entry);
@@ -138,57 +103,87 @@ impl CatalogSnapshot {
             .count()
     }
 
-    /// Resolve the price for one attempt.
-    ///
-    /// Every failure is a distinct, stable reason. None of them is zero.
     #[must_use]
-    pub fn resolve(
-        &self,
-        provider: ProviderKind,
-        configured_model: Option<&str>,
-    ) -> PriceResolution {
-        let Some(catalog_provider) = catalog_provider_id(provider) else {
-            return PriceResolution::ProviderMappingMissing;
-        };
-        // No model means nothing to look up; that is a missing mapping, not a
-        // reason to fall back to some default price.
-        let Some(model) = configured_model else {
-            return PriceResolution::ModelMappingMissing;
-        };
-        let Some(entry) = self
-            .entries
-            .get(&(catalog_provider.to_owned(), model.to_owned()))
-        else {
-            return PriceResolution::ModelMappingMissing;
-        };
-
-        match entry {
-            CatalogEntry::NoCost => PriceResolution::CostMissing,
-            CatalogEntry::Invalid => PriceResolution::CatalogEntryInvalid,
-            CatalogEntry::Priced {
-                prices,
-                context_tier,
-                unmodeled_pricing_rule,
-            } => {
-                PriceResolution::Resolved(Box::new(InlinePriceRecord {
-                    format_version: CATALOG_FORMAT_VERSION,
-                    parser_version: CATALOG_PARSER_VERSION,
-                    catalog_revision: self.revision.clone(),
-                    catalog_provider_id: catalog_provider.to_owned(),
-                    catalog_model_id: model.to_owned(),
-                    mapping_revision: CATALOG_MAPPING_REVISION,
-                    prices: **prices,
-                    context_tier: *context_tier,
-                    // No tier is ever *selected*: the document states two
-                    // thresholds for the same model and they disagree, so picking
-                    // one would be a guess. `unmodeled_pricing_rule` is what
-                    // carries that forward, and it makes the cost partial.
-                    selected_tier: None,
-                    unmodeled_billable_component: false,
-                    unmodeled_pricing_rule: *unmodeled_pricing_rule,
-                }))
+    pub fn exact_model_pricing(&self, model: &str) -> Option<ProviderModelPricing> {
+        if let Some(provider) = official_catalog_provider(model) {
+            if let Some(entry) = self.entries.get(&(provider.to_owned(), model.to_owned())) {
+                return model_pricing_from_entry(entry);
             }
         }
+
+        let mut candidate: Option<ProviderModelPricing> = None;
+        for ((_, model_id), entry) in &self.entries {
+            if model_id != model {
+                continue;
+            }
+            let pricing = model_pricing_from_entry(entry)?;
+            match candidate.as_ref() {
+                Some(current) if current != &pricing => return None,
+                Some(_) => {}
+                None => candidate = Some(pricing),
+            }
+        }
+        candidate
+    }
+}
+
+fn model_pricing_from_entry(entry: &CatalogEntry) -> Option<ProviderModelPricing> {
+    match entry {
+        CatalogEntry::Priced {
+            prices,
+            model_tiers,
+            ..
+        } => {
+            let mut pricing = model_pricing_from_components(**prices);
+            pricing.tiers = (**model_tiers).clone();
+            Some(pricing)
+        }
+        CatalogEntry::NoCost | CatalogEntry::Invalid => None,
+    }
+}
+
+fn official_catalog_provider(model: &str) -> Option<&'static str> {
+    if model.starts_with("grok-") {
+        Some("xai")
+    } else if model.starts_with("qwen") {
+        Some("alibaba")
+    } else if model.starts_with("gpt-")
+        || model.starts_with("chatgpt-")
+        || model.starts_with("codex-")
+        || matches!(model, "o1" | "o3" | "o4-mini")
+        || model.starts_with("o1-")
+        || model.starts_with("o3-")
+        || model.starts_with("o4-")
+    {
+        Some("openai")
+    } else if model.starts_with("claude-") {
+        Some("anthropic")
+    } else if model.starts_with("gemini-") || model.starts_with("gemma-") {
+        Some("google")
+    } else if model.starts_with("deepseek-") {
+        Some("deepseek")
+    } else if model.starts_with("kimi-") {
+        Some("moonshotai")
+    } else if model.starts_with("minimax-") || model.starts_with("MiniMax-") {
+        Some("minimax")
+    } else if model.starts_with("glm-") {
+        Some("zhipuai")
+    } else if model.starts_with("mistral-")
+        || model.starts_with("codestral-")
+        || model.starts_with("devstral-")
+        || model.starts_with("magistral-")
+        || model.starts_with("ministral-")
+        || model.starts_with("pixtral-")
+        || model.starts_with("open-mistral-")
+        || model.starts_with("open-mixtral-")
+    {
+        Some("mistral")
+    } else if model.starts_with("command-") || model.starts_with("c4ai-aya-") {
+        Some("cohere")
+    } else if model.starts_with("amazon.") {
+        Some("amazon-bedrock")
+    } else {
+        None
     }
 }
 
@@ -199,10 +194,7 @@ pub enum CatalogParseError {
     Malformed,
 }
 
-/// Holds the current snapshot, if any, and prices attempts from it.
-///
-/// Before the first successful load there is no snapshot, and every attempt
-/// resolves to `catalog_unavailable` — visibly missing rather than free.
+/// Holds the current snapshot used when provider models are refreshed.
 #[derive(Default)]
 pub struct CatalogPrices {
     snapshot: RwLock<Option<Arc<CatalogSnapshot>>>,
@@ -230,13 +222,91 @@ impl CatalogPrices {
     }
 }
 
-impl PriceResolver for CatalogPrices {
-    fn resolve(&self, provider: ProviderKind, configured_model: Option<&str>) -> PriceResolution {
-        match self.current() {
-            Some(snapshot) => snapshot.resolve(provider, configured_model),
-            None => PriceResolution::CatalogUnavailable,
-        }
+impl ProviderModelPricingCatalog for CatalogPrices {
+    fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing> {
+        self.current()?.exact_model_pricing(upstream_model)
     }
+}
+
+#[must_use]
+pub fn component_prices_from_model_pricing(
+    pricing: &ProviderModelPricing,
+) -> Option<ComponentPrices> {
+    if pricing.is_empty() {
+        return None;
+    }
+    Some(ComponentPrices {
+        uncached_input_per_million: parse_optional_price(pricing.input.as_deref())?,
+        output_per_million: parse_optional_price(pricing.output.as_deref())?,
+        cache_read_per_million: parse_optional_price(pricing.cache_read.as_deref())?,
+        cache_write_per_million: parse_optional_price(pricing.cache_write.as_deref())?,
+        reasoning_per_million: parse_optional_price(pricing.reasoning.as_deref())?,
+        input_audio_per_million: parse_optional_price(pricing.input_audio.as_deref())?,
+        output_audio_per_million: parse_optional_price(pricing.output_audio.as_deref())?,
+    })
+}
+
+#[must_use]
+pub fn context_price_tiers_from_model_pricing(
+    pricing: &ProviderModelPricing,
+) -> Option<Vec<ContextPriceTier>> {
+    let mut previous_threshold = None;
+    let mut tiers = Vec::with_capacity(pricing.tiers.len());
+    for tier in &pricing.tiers {
+        if previous_threshold.is_some_and(|previous| tier.threshold_tokens <= previous) {
+            return None;
+        }
+        let prices = component_prices_from_model_tier(tier)?;
+        tiers.push(ContextPriceTier {
+            threshold_tokens: tier.threshold_tokens,
+            prices,
+        });
+        previous_threshold = Some(tier.threshold_tokens);
+    }
+    Some(tiers)
+}
+
+fn component_prices_from_model_tier(tier: &ProviderModelPricingTier) -> Option<ComponentPrices> {
+    let pricing = ProviderModelPricing {
+        input: tier.input.clone(),
+        output: tier.output.clone(),
+        cache_read: tier.cache_read.clone(),
+        cache_write: tier.cache_write.clone(),
+        reasoning: tier.reasoning.clone(),
+        input_audio: tier.input_audio.clone(),
+        output_audio: tier.output_audio.clone(),
+        tiers: Vec::new(),
+    };
+    component_prices_from_model_pricing(&pricing)
+}
+
+#[must_use]
+pub fn canonical_model_pricing(pricing: &ProviderModelPricing) -> Option<ProviderModelPricing> {
+    component_prices_from_model_pricing(pricing).map(model_pricing_from_components)
+}
+
+fn parse_optional_price(value: Option<&str>) -> Option<Option<UnitPrice>> {
+    match value {
+        None => Some(None),
+        Some(value) => parse_unit_price(value).map(Some),
+    }
+}
+
+fn model_pricing_from_components(prices: ComponentPrices) -> ProviderModelPricing {
+    ProviderModelPricing {
+        input: decimal_price(prices.uncached_input_per_million),
+        output: decimal_price(prices.output_per_million),
+        cache_read: decimal_price(prices.cache_read_per_million),
+        cache_write: decimal_price(prices.cache_write_per_million),
+        reasoning: decimal_price(prices.reasoning_per_million),
+        input_audio: decimal_price(prices.input_audio_per_million),
+        output_audio: decimal_price(prices.output_audio_per_million),
+        tiers: Vec::new(),
+    }
+}
+
+fn decimal_price(price: Option<UnitPrice>) -> Option<String> {
+    price.map(UnitPrice::to_decimal_string)
 }
 
 #[derive(Deserialize)]
@@ -254,10 +324,8 @@ struct RawModel {
 /// [`parse_unit_price`]. Unknown sibling fields are ignored: models.dev adds
 /// fields over time and that must not invalidate a price.
 ///
-/// The two tier encodings are read only to detect that a tier *exists*. They are
-/// deliberately not interpreted: for `gpt-5.5` the document states
-/// `tiers[].tier.size = 272000` and `context_over_200k` at the same time, so the
-/// threshold itself is ambiguous and any single reading would be a guess.
+/// Both supported context-tier encodings are parsed strictly for saved model
+/// pricing. Conflicting encodings invalidate the entry.
 #[derive(Deserialize)]
 struct RawCost {
     input: Option<Box<RawValue>>,
@@ -269,15 +337,6 @@ struct RawCost {
     output_audio: Option<Box<RawValue>>,
     tiers: Option<Box<RawValue>>,
     context_over_200k: Option<Box<RawValue>>,
-}
-
-impl RawCost {
-    fn has_tier_rule(&self) -> bool {
-        [self.tiers.as_deref(), self.context_over_200k.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|raw| raw.get().trim() != "null")
-    }
 }
 
 #[derive(Deserialize)]
@@ -310,37 +369,65 @@ struct RawContextCost {
     output_audio: Option<Box<RawValue>>,
 }
 
-fn parse_context_tier(cost: &RawCost) -> (Option<ContextPriceTier>, bool) {
-    if !cost.has_tier_rule() {
-        return (None, false);
-    }
-
-    let tier = cost.tiers.as_deref().and_then(|raw| {
-        let tiers: Vec<RawTierCost> = serde_json::from_str(raw.get()).ok()?;
-        let [tier] = tiers.as_slice() else {
-            return None;
-        };
-        if tier.tier.kind != "context" {
-            return None;
+fn parse_model_pricing_tiers(cost: &RawCost) -> Option<Vec<ProviderModelPricingTier>> {
+    let tiers = match cost.tiers.as_deref() {
+        None => None,
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => {
+            let raw_tiers = serde_json::from_str::<Vec<RawTierCost>>(raw.get()).ok()?;
+            let mut tiers = Vec::with_capacity(raw_tiers.len());
+            for tier in &raw_tiers {
+                if tier.tier.kind != "context" {
+                    return None;
+                }
+                let prices = component_prices_from_tier(tier)?;
+                if prices == ComponentPrices::default() {
+                    return None;
+                }
+                tiers.push(model_pricing_tier(tier.tier.size, prices));
+            }
+            tiers.sort_by_key(|tier| tier.threshold_tokens);
+            if tiers
+                .windows(2)
+                .any(|pair| pair[0].threshold_tokens == pair[1].threshold_tokens)
+            {
+                return None;
+            }
+            Some(tiers)
         }
-        Some(ContextPriceTier {
-            threshold_tokens: tier.tier.size,
-            prices: component_prices_from_tier(tier)?,
-        })
-    });
-    let legacy = cost.context_over_200k.as_deref().and_then(|raw| {
-        let value: RawContextCost = serde_json::from_str(raw.get()).ok()?;
-        Some(ContextPriceTier {
-            threshold_tokens: 200_000,
-            prices: component_prices_from_context(&value)?,
-        })
-    });
+    };
 
-    match (tier, legacy) {
-        (Some(tier), Some(legacy)) if tier == legacy => (Some(tier), false),
-        (Some(tier), None) if cost.context_over_200k.is_none() => (Some(tier), false),
-        (None, Some(legacy)) if cost.tiers.is_none() => (Some(legacy), false),
-        _ => (None, true),
+    let legacy = match cost.context_over_200k.as_deref() {
+        None => None,
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => {
+            let tier = serde_json::from_str::<RawContextCost>(raw.get()).ok()?;
+            let prices = component_prices_from_context(&tier)?;
+            if prices == ComponentPrices::default() {
+                return None;
+            }
+            Some(vec![model_pricing_tier(200_000, prices)])
+        }
+    };
+
+    match (tiers, legacy) {
+        (None, None) => Some(Vec::new()),
+        (Some(tiers), None) | (None, Some(tiers)) => Some(tiers),
+        (Some(tiers), Some(legacy)) if tiers == legacy => Some(tiers),
+        (Some(_), Some(_)) => None,
+    }
+}
+
+fn model_pricing_tier(threshold_tokens: u64, prices: ComponentPrices) -> ProviderModelPricingTier {
+    ProviderModelPricingTier {
+        threshold_tokens,
+        input: decimal_price(prices.uncached_input_per_million),
+        output: decimal_price(prices.output_per_million),
+        cache_read: decimal_price(prices.cache_read_per_million),
+        cache_write: decimal_price(prices.cache_write_per_million),
+        reasoning: decimal_price(prices.reasoning_per_million),
+        input_audio: decimal_price(prices.input_audio_per_million),
+        output_audio: decimal_price(prices.output_audio_per_million),
     }
 }
 
@@ -476,14 +563,7 @@ pub fn parse_unit_price(text: &str) -> Option<UnitPrice> {
 
 #[cfg(test)]
 mod tests {
-    use provider_core::usage::{
-        CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
-        PricingMode, RawUsageFields, TokenInclusionRules, TotalSource, UsageContractSnapshot,
-        normalize_usage,
-    };
-
     use super::*;
-    use crate::cost::{CostReason, CostStatus, compute_observed_catalog_cost};
 
     const PER_MILLION: i128 = 10i128.pow(PRICE_SCALE);
 
@@ -554,29 +634,6 @@ mod tests {
         CatalogSnapshot::parse(CATALOG, "r".repeat(64)).expect("catalog parses")
     }
 
-    /// Enough of a contract to run the cost calculator: input already includes
-    /// cache, reasoning sits inside output, no audio.
-    fn codex_like_contract() -> UsageContractSnapshot {
-        UsageContractSnapshot {
-            contract_version: 1,
-            normalization_version: 1,
-            inclusion: TokenInclusionRules {
-                input_includes_cache: true,
-                input_categories_mutually_exclusive: false,
-                reasoning_included_in_output: true,
-                reasoning_applicable: true,
-                audio_applicable: false,
-                cache_write_applicable: false,
-                total_source: TotalSource::Reported,
-            },
-            cache_capability: CacheCapability::Supported,
-            cache_eligibility: CacheEligibility::Eligible,
-            cache_reporting_expectation: CacheReportingExpectation::Expected,
-            pricing_context_basis: PricingContextBasis::EffectiveInput,
-            pricing_mode: PricingMode::Default,
-        }
-    }
-
     #[test]
     fn plain_decimals_become_exact_scaled_integers() {
         // The whole point: no value here may pass through a float.
@@ -607,119 +664,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tiered_model_keeps_its_base_price_but_never_reads_as_complete() {
-        // The real document does this for `gpt-5.5`, which is a default Codex
-        // model: base rates plus a higher tier above some context threshold. The
-        // base rates are exact below it, so they are kept — but a cost computed
-        // from them is a floor, and presenting it as complete under-reports every
-        // long-context request by roughly half.
-        let record = snapshot()
-            .resolve(ProviderKind::Codex, Some("tiered"))
-            .resolved()
-            .expect("the base rates are still usable")
-            .clone();
-        assert_eq!(
-            record.prices.uncached_input_per_million,
-            Some(UnitPrice::from_scaled(5 * PER_MILLION)),
-            "the base rate is what the document states, unrounded"
-        );
-        assert!(record.unmodeled_pricing_rule);
-        assert_eq!(
-            record.selected_tier, None,
-            "the document states two disagreeing thresholds, so no tier is chosen"
-        );
-
-        // What a caller actually sees: the amount is there, and its status says it
-        // cannot be trusted as the whole bill.
-        let contract = codex_like_contract();
-        let observation = normalize_usage(
-            // One million uncached input tokens, nothing else, so the amount below
-            // is the input rate itself and any drift is visible in one digit.
-            Some(RawUsageFields {
-                input: Some(1_000_000),
-                cache_read: Some(0),
-                output: Some(0),
-                ..RawUsageFields::default()
-            }),
-            &contract,
-        );
-        let cost = compute_observed_catalog_cost(
-            &observation,
-            &contract,
-            &snapshot().resolve(ProviderKind::Codex, Some("tiered")),
-        );
-        assert_eq!(cost.total_known.to_decimal_string(), "5.00000000000000");
-        assert_eq!(cost.status, CostStatus::Partial);
-        assert!(cost.reasons.contains(&CostReason::PricingRuleUnsupported));
-
-        // The same path on an untiered model must still read as complete, or the
-        // marker would be worthless noise on every model.
-        let untiered = compute_observed_catalog_cost(
-            &observation,
-            &contract,
-            &snapshot().resolve(ProviderKind::Codex, Some("gpt-5-codex")),
-        );
-        assert_eq!(
-            untiered.status,
-            CostStatus::CompleteForObservedCatalogComponents
-        );
+    fn conflicting_tier_encodings_are_rejected() {
+        let snapshot = snapshot();
+        assert_eq!(snapshot.exact_model_pricing("tiered"), None);
     }
 
     #[test]
-    fn an_explicit_consistent_context_tier_is_selected_from_observed_tokens() {
-        let resolution = snapshot().resolve(ProviderKind::Codex, Some("consistent-tier"));
-        let record = resolution.resolved().expect("tiered price resolves");
-        assert_eq!(
-            record.context_tier,
-            Some(ContextPriceTier {
-                threshold_tokens: 200_000,
-                prices: ComponentPrices {
-                    uncached_input_per_million: Some(UnitPrice::from_scaled(4 * PER_MILLION)),
-                    cache_read_per_million: Some(UnitPrice::from_scaled(6 * PER_MILLION / 10)),
-                    output_per_million: Some(UnitPrice::from_scaled(12 * PER_MILLION)),
-                    ..ComponentPrices::default()
-                },
-            })
-        );
-        assert!(!record.unmodeled_pricing_rule);
-
-        let contract = codex_like_contract();
-        let below = normalize_usage(
-            Some(RawUsageFields {
-                input: Some(200_000),
-                cache_read: Some(0),
-                output: Some(0),
-                ..RawUsageFields::default()
-            }),
-            &contract,
-        );
-        let above = normalize_usage(
-            Some(RawUsageFields {
-                input: Some(200_001),
-                cache_read: Some(0),
-                output: Some(0),
-                ..RawUsageFields::default()
-            }),
-            &contract,
-        );
-        let below_cost = compute_observed_catalog_cost(&below, &contract, &resolution);
-        let above_cost = compute_observed_catalog_cost(&above, &contract, &resolution);
-        assert_eq!(
-            below_cost.status,
-            CostStatus::CompleteForObservedCatalogComponents
-        );
-        assert_eq!(
-            above_cost.status,
-            CostStatus::CompleteForObservedCatalogComponents
-        );
-        assert_eq!(
-            below_cost.total_known.to_decimal_string(),
-            "0.40000000000000"
-        );
-        assert_eq!(
-            above_cost.total_known.to_decimal_string(),
-            "0.80000400000000"
-        );
+    fn consistent_context_tier_is_saved_with_model_pricing() {
+        let model_pricing = snapshot()
+            .exact_model_pricing("consistent-tier")
+            .expect("consistent tier is saved with model pricing");
+        assert_eq!(model_pricing.tiers.len(), 1);
+        assert_eq!(model_pricing.tiers[0].threshold_tokens, 200_000);
     }
 
     #[test]
@@ -744,17 +700,95 @@ mod tests {
     }
 
     #[test]
-    fn model_ids_are_not_shared_across_providers() {
-        // `claude-4` exists in the document, but under anthropic. Codex must not
-        // reach it, or a mapping mistake would silently price against the wrong
-        // provider's rates.
+    fn exact_model_ids_remain_case_sensitive() {
         let snapshot = snapshot();
-        assert_eq!(
-            snapshot.resolve(ProviderKind::Codex, Some("claude-4")),
-            PriceResolution::ModelMappingMissing
-        );
-        // Six models are listed; `listed-without-cost` and `unreadable-cost`
+        assert!(snapshot.exact_model_pricing("claude-4").is_some());
+        assert_eq!(snapshot.exact_model_pricing("Claude-4"), None);
+        // Six models are listed; missing, unreadable, and conflicting tier costs
         // carry no price the parser accepted.
-        assert_eq!(snapshot.priced_model_count(), 4);
+        assert_eq!(snapshot.priced_model_count(), 3);
+    }
+
+    #[test]
+    fn exact_model_pricing_accepts_identical_candidates_and_rejects_conflicts() {
+        let identical = CatalogSnapshot::parse(
+            r#"{
+              "one":{"models":{"shared/model":{"cost":{"input":1,"output":2,
+                "tiers":[{"input":2,"output":4,"tier":{"type":"context","size":200000}}]}}}},
+              "two":{"models":{"shared/model":{"cost":{"input":1,"output":2,
+                "tiers":[{"input":2,"output":4,"tier":{"type":"context","size":200000}}]}}}}
+            }"#,
+            "identical",
+        )
+        .expect("identical catalog parses")
+        .exact_model_pricing("shared/model")
+        .expect("identical complete prices are usable");
+        assert_eq!(identical.input.as_deref(), Some("1.00000000"));
+        assert_eq!(identical.output.as_deref(), Some("2.00000000"));
+        assert_eq!(identical.tiers.len(), 1);
+
+        let conflicting = CatalogSnapshot::parse(
+            r#"{
+              "one":{"models":{"shared/model":{"cost":{"input":1,"output":2}}}},
+              "two":{"models":{"shared/model":{"cost":{"input":1,"output":3}}}}
+            }"#,
+            "conflicting",
+        )
+        .expect("conflicting catalog parses");
+        assert_eq!(conflicting.exact_model_pricing("shared/model"), None);
+        assert_eq!(conflicting.exact_model_pricing("Shared/model"), None);
+
+        let conflicting_tiers = CatalogSnapshot::parse(
+            r#"{
+              "one":{"models":{"shared/model":{"cost":{"input":1,"output":2}}}},
+              "two":{"models":{"shared/model":{"cost":{"input":1,"output":2,
+                "tiers":[{"input":2,"output":4,"tier":{"type":"context","size":200000}}]}}}}
+            }"#,
+            "conflicting-tiers",
+        )
+        .expect("catalog parses");
+        assert_eq!(conflicting_tiers.exact_model_pricing("shared/model"), None);
+
+        let official = CatalogSnapshot::parse(
+            r#"{
+              "reseller":{"models":{"grok-4.5":{"cost":{"input":2,"output":6,"cache_read":0.5}}}},
+              "xai":{"models":{"grok-4.5":{"cost":{"input":2,"output":6,"cache_read":0.3,
+                "tiers":[{"input":4,"output":12,"cache_read":0.6,"tier":{"type":"context","size":200000}}]}}}}
+            }"#,
+            "official",
+        )
+        .expect("official catalog parses")
+        .exact_model_pricing("grok-4.5")
+        .expect("official provider wins conflicting exact-id prices");
+        assert_eq!(official.cache_read.as_deref(), Some("0.30000000"));
+        assert_eq!(official.tiers.len(), 1);
+        assert_eq!(official.tiers[0].threshold_tokens, 200_000);
+        assert_eq!(official.tiers[0].cache_read.as_deref(), Some("0.60000000"));
+
+        let mistral = CatalogSnapshot::parse(
+            r#"{
+              "reseller":{"models":{"mistral-large-latest":{"cost":{"input":9,"output":18}}}},
+              "mistral":{"models":{"mistral-large-latest":{"cost":{"input":2,"output":6}}}}
+            }"#,
+            "mistral-official",
+        )
+        .expect("Mistral catalog parses")
+        .exact_model_pricing("mistral-large-latest")
+        .expect("verified Mistral provider wins conflicting exact-id prices");
+        assert_eq!(mistral.input.as_deref(), Some("2.00000000"));
+        assert_eq!(mistral.output.as_deref(), Some("6.00000000"));
+
+        let duplicate_tier = CatalogSnapshot::parse(
+            r#"{
+              "xai":{"models":{"grok-4.5":{"cost":{"input":2,"output":6,
+                "tiers":[
+                  {"input":4,"output":12,"tier":{"type":"context","size":200000}},
+                  {"input":5,"output":15,"tier":{"type":"context","size":200000}}
+                ]}}}}
+            }"#,
+            "duplicate-tier",
+        )
+        .expect("catalog document parses");
+        assert_eq!(duplicate_tier.exact_model_pricing("grok-4.5"), None);
     }
 }

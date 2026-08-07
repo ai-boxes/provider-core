@@ -159,6 +159,7 @@ impl GrokModelClient {
                     upstream_model: id.to_owned(),
                     metadata_json,
                     routable: !id.starts_with("grok-imagine-"),
+                    pricing: None,
                 },
             );
         }

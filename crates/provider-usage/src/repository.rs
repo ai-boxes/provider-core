@@ -113,8 +113,8 @@ pub struct AttemptFacts {
     pub tracking: TrackingState,
     pub contract: UsageContractSnapshot,
     pub observation: ProviderUsageObservation,
-    /// Resolved at attempt time from the in-memory catalog snapshot and stored
-    /// inline, so this attempt's cost never depends on the current catalog.
+    /// Frozen from the routed provider model at attempt start and stored inline,
+    /// so this attempt's cost never depends on later model-price changes.
     pub price: PriceResolution,
     pub cost: ObservedCatalogCost,
 }

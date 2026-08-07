@@ -13,16 +13,18 @@ use axum::{
 use provider_auth::AuthenticatedSession;
 use provider_core::{
     AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind, ProviderModelOverride,
-    ProviderVisibility, StoredProviderModel,
+    ProviderModelPricing, ProviderVisibility, StoredProviderModel,
 };
 use provider_drivers::compatible_api_key_credential;
 use provider_management::{
     CreatedProviderAccount, DirectProviderAccountInput, ModelCatalogSnapshot, OAuthSessionSnapshot,
     OAuthSessionStatus, ProviderCredentialReplacement, ProviderManager, ProviderManagerError,
 };
-use provider_usage::{ProviderHealthSummary, TimeRange, TimeRangeError, system_clock_ms};
+use provider_usage::{
+    ProviderHealthSummary, TimeRange, TimeRangeError, canonical_model_pricing, system_clock_ms,
+};
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -399,16 +401,17 @@ async fn update_model(
     Path(account_id): Path<String>,
     Json(request): Json<UpdateModelRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let upstream_model = request.upstream_model.trim();
-    if upstream_model.is_empty() {
+    let upstream_model = request.upstream_model.as_str();
+    if upstream_model.is_empty() || upstream_model.trim() != upstream_model {
         return Err(ApiError::invalid_request(
-            "upstream_model must not be empty",
+            "upstream_model must not be empty or contain surrounding whitespace",
         ));
     }
     let alias = request
         .alias
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    let pricing = updated_pricing(request.pricing_changed, request.pricing)?;
     let models = state
         .manager
         .update_model(
@@ -418,6 +421,7 @@ async fn update_model(
             ProviderModelOverride {
                 alias,
                 enabled: request.enabled,
+                pricing,
                 updated_at: unix_timestamp(),
             },
         )
@@ -522,10 +526,99 @@ impl ProviderHealthParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateModelRequest {
     upstream_model: String,
     alias: Option<String>,
     enabled: bool,
+    pricing_changed: bool,
+    #[serde(default)]
+    pricing: ModelPricingPatch,
+}
+
+#[derive(Default)]
+enum ModelPricingPatch {
+    #[default]
+    Missing,
+    Null,
+    Value(UpdateModelPricingRequest),
+}
+
+impl<'de> Deserialize<'de> for ModelPricingPatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<UpdateModelPricingRequest>::deserialize(deserializer)
+            .map(|pricing| pricing.map_or(Self::Null, Self::Value))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateModelPricingRequest {
+    input: Value,
+    output: Value,
+    cache_read: Value,
+    cache_write: Value,
+    reasoning: Value,
+    input_audio: Value,
+    output_audio: Value,
+}
+
+impl UpdateModelPricingRequest {
+    fn into_model_pricing(self) -> Option<ProviderModelPricing> {
+        Some(ProviderModelPricing {
+            input: nullable_price(self.input)?,
+            output: nullable_price(self.output)?,
+            cache_read: nullable_price(self.cache_read)?,
+            cache_write: nullable_price(self.cache_write)?,
+            reasoning: nullable_price(self.reasoning)?,
+            input_audio: nullable_price(self.input_audio)?,
+            output_audio: nullable_price(self.output_audio)?,
+            tiers: Vec::new(),
+        })
+    }
+}
+
+fn nullable_price(value: Value) -> Option<Option<String>> {
+    match value {
+        Value::Null => Some(None),
+        Value::String(value) => Some(Some(value)),
+        _ => None,
+    }
+}
+
+fn updated_pricing(
+    pricing_changed: bool,
+    pricing: ModelPricingPatch,
+) -> Result<Option<Option<ProviderModelPricing>>, ApiError> {
+    if !pricing_changed {
+        return match pricing {
+            ModelPricingPatch::Missing => Ok(None),
+            ModelPricingPatch::Null | ModelPricingPatch::Value(_) => Err(
+                ApiError::invalid_request("pricing must be omitted when pricing_changed is false"),
+            ),
+        };
+    }
+
+    match pricing {
+        ModelPricingPatch::Missing => Err(ApiError::invalid_request(
+            "pricing is required when pricing_changed is true",
+        )),
+        ModelPricingPatch::Null => Ok(Some(None)),
+        ModelPricingPatch::Value(pricing) => {
+            let pricing = pricing.into_model_pricing().ok_or_else(|| {
+                ApiError::invalid_request("pricing fields must be decimal strings or null")
+            })?;
+            let pricing = canonical_model_pricing(&pricing).ok_or_else(|| {
+                ApiError::invalid_request(
+                    "pricing must contain at least one plain non-negative decimal with at most 8 fractional digits",
+                )
+            })?;
+            Ok(Some(Some(pricing)))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -614,6 +707,7 @@ fn model_json(model: &StoredProviderModel) -> Value {
         "routable": model.routable,
         "metadata": serde_json::from_str::<Value>(&model.metadata_json)
             .expect("stored provider model metadata must be valid JSON"),
+        "pricing": model.pricing.as_ref().map(|record| &record.pricing),
         "last_seen_at": model.last_seen_at,
         "created_at": model.created_at,
         "updated_at": model.updated_at
@@ -778,7 +872,52 @@ mod tests {
 
     use crate::router_with_management;
 
-    use super::unix_timestamp;
+    use super::{ModelPricingPatch, UpdateModelRequest, unix_timestamp, updated_pricing};
+
+    #[test]
+    fn model_update_pricing_request_is_strict_and_preserves_field_presence() {
+        let missing: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":false}"#,
+        )
+        .expect("missing pricing field");
+        assert!(matches!(missing.pricing, ModelPricingPatch::Missing));
+
+        let null: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":null}"#,
+        )
+        .expect("explicit null pricing");
+        assert!(matches!(null.pricing, ModelPricingPatch::Null));
+
+        let value: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}}"#,
+        )
+        .expect("complete pricing object");
+        assert!(matches!(value.pricing, ModelPricingPatch::Value(_)));
+
+        assert!(
+            serde_json::from_str::<UpdateModelRequest>(
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<UpdateModelRequest>(
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2"}}"#,
+            )
+            .is_err()
+        );
+
+        assert!(matches!(
+            updated_pricing(false, ModelPricingPatch::Missing),
+            Ok(None)
+        ));
+        assert!(updated_pricing(false, ModelPricingPatch::Null).is_err());
+        assert!(updated_pricing(true, ModelPricingPatch::Missing).is_err());
+        assert!(matches!(
+            updated_pricing(true, ModelPricingPatch::Null),
+            Ok(Some(None))
+        ));
+    }
 
     async fn captured_models(
         State(authorization): State<Arc<Mutex<Vec<String>>>>,
@@ -1346,7 +1485,9 @@ mod tests {
             .patch(format!("{endpoint}/{shared_account_id}/models"))
             .bearer_auth(&member_access_token)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"upstream_model":"model-a","alias":"no","enabled":true}"#)
+            .body(
+                r#"{"upstream_model":"model-a","alias":"no","enabled":true,"pricing_changed":false}"#,
+            )
             .send()
             .await
             .expect("shared model update");

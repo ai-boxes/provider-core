@@ -290,8 +290,8 @@ impl UsageRepository for SqliteUsageRepository {
         .bind(&token_kinds_json)
         .bind(&warnings_json)
         .bind(price_resolution_str(&facts.price))
-        .bind(record.map(|record| record.catalog_revision.as_str()))
-        .bind(record.and_then(|record| record.selected_tier.as_deref()))
+        .bind(record.and_then(|record| record.catalog_revision()))
+        .bind(record.and_then(|record| record.selected_tier()))
         .bind(price_json.as_deref())
         .bind(i64::from(cost.calculator_version))
         .bind(cost_status_str(cost.status))
@@ -1463,7 +1463,7 @@ fn unknown_value(field: &str, value: &str) -> UsageRepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use provider_usage::{ComponentPrices, PRICE_SCALE, UnitPrice};
+    use provider_usage::{CatalogInlinePriceRecordV1, ComponentPrices, PRICE_SCALE, UnitPrice};
 
     use super::*;
     use crate::SqliteAccountRepository;
@@ -1541,24 +1541,28 @@ mod tests {
     }
 
     fn price_record() -> PriceResolution {
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "a".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 3,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(125 * PER_MILLION / 100)),
-                cache_read_per_million: Some(UnitPrice::from_scaled(PER_MILLION / 8)),
-                output_per_million: Some(UnitPrice::from_scaled(10 * PER_MILLION)),
-                ..ComponentPrices::default()
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "a".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 3,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(
+                        125 * PER_MILLION / 100,
+                    )),
+                    cache_read_per_million: Some(UnitPrice::from_scaled(PER_MILLION / 8)),
+                    output_per_million: Some(UnitPrice::from_scaled(10 * PER_MILLION)),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: Some("context_over_200k".to_owned()),
+                unmodeled_billable_component: true,
+                unmodeled_pricing_rule: true,
             },
-            context_tier: None,
-            selected_tier: Some("context_over_200k".to_owned()),
-            unmodeled_billable_component: true,
-            unmodeled_pricing_rule: true,
-        }))
+        )))
     }
 
     fn attempt(request_id: &str, attempt_id: &str, sequence: u32) -> AttemptFacts {
@@ -1738,28 +1742,30 @@ mod tests {
             .expect("begin");
         let mut facts = attempt("req-1", "att-1", 1);
         let awkward = UnitPrice::from_scaled(123_456_789_987_654_321);
-        facts.price = PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "b".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(awkward),
-                ..ComponentPrices::default()
+        facts.price = PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "b".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 1,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(awkward),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
             },
-            context_tier: None,
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }));
+        )));
         repository.record_attempt(&facts).await.expect("record");
 
         let loaded = repository.load_attempts("req-1").await.expect("load");
         let record = loaded[0].price.resolved().expect("resolved");
         assert_eq!(
-            record.prices.uncached_input_per_million,
+            record.prices().uncached_input_per_million,
             Some(awkward),
             "an exact scaled price must not be rounded by persistence"
         );

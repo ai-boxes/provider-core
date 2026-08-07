@@ -176,10 +176,11 @@ impl ProviderRuntime {
         &self,
         account_id: &AccountId,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.request_account(account_id).await?;
-        self.execute_entry(entry, request, tracking).await
+        self.execute_entry(entry, request, pricing, tracking).await
     }
 
     pub async fn count_tokens_for(
@@ -275,12 +276,16 @@ impl ProviderRuntime {
         &self,
         entry: Arc<AccountEntry>,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
 
-        match self.execute_attempt(&entry, first_request, tracking).await {
+        match self
+            .execute_attempt(&entry, first_request, pricing, tracking)
+            .await
+        {
             Err(error) if error.upstream_status() == Some(401) => {
                 let account_id = entry.account.account_id().clone();
                 let refresh = self
@@ -290,7 +295,8 @@ impl ProviderRuntime {
                 // A failed refresh is not a model call, so it must not invent a
                 // second attempt.
                 refresh.map_err(refresh_provider_error)?;
-                self.execute_attempt(&entry, request, tracking).await
+                self.execute_attempt(&entry, request, pricing, tracking)
+                    .await
             }
             result => result,
         }
@@ -305,6 +311,7 @@ impl ProviderRuntime {
         &self,
         entry: &AccountEntry,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let format = request.format;
@@ -316,6 +323,7 @@ impl ProviderRuntime {
                         profile,
                         entry.account.account_id().as_str(),
                         Some(request.model.as_str()),
+                        pricing,
                     )
                 });
 
@@ -423,7 +431,7 @@ impl Provider for ProviderRuntime {
         let entry = self.selected_account().await?;
         // The bare `Provider` entry point picks any available account and carries
         // no request identity, so there is nothing to attribute an attempt to.
-        self.execute_entry(entry, request, None).await
+        self.execute_entry(entry, request, None, None).await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {

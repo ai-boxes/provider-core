@@ -27,7 +27,7 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::{
-    ProviderKind, ProviderVisibility, ProxyService,
+    AccountId, ProviderKind, ProviderModelPricingSource, ProviderVisibility, ProxyService,
     usage::{TokenMetric, TokenUnknownReason},
 };
 use provider_drivers::codex::CodexDriver;
@@ -37,8 +37,8 @@ use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, CostReason, CostStatus, DEFAULT_WRITE_QUEUE, DeliveryOutcome,
-    DispatchEvidence, ExecutionOutcome, LogicalStatus, NoCatalog, PriceResolution, RefreshOutcome,
-    TrackingState, UsageRepository, UsageTracking, UsageWriter, content_revision,
+    DispatchEvidence, ExecutionOutcome, LogicalStatus, PriceResolution, RefreshOutcome,
+    TrackingState, UsageRepository, UsageTracking, UsageWriter,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
@@ -135,6 +135,8 @@ struct Deployment {
     api_key: String,
     auth: AuthService,
     manager: ProviderManager,
+    owner_user_id: String,
+    account_id: AccountId,
     usage: Arc<SqliteUsageRepository>,
     writer: Arc<UsageWriter>,
 }
@@ -164,7 +166,6 @@ async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        Arc::new(NoCatalog),
     ));
     let server_url = spawn(provider_server::router_with_usage(
         deployment.service.clone(),
@@ -183,6 +184,13 @@ async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool
 }
 
 async fn deployment(upstream_url: &str) -> Deployment {
+    deployment_with_pricing(upstream_url, None).await
+}
+
+async fn deployment_with_pricing(
+    upstream_url: &str,
+    pricing: Option<Arc<CatalogPrices>>,
+) -> Deployment {
     let repository = Arc::new(
         SqliteAccountRepository::in_memory()
             .await
@@ -203,8 +211,15 @@ async fn deployment(upstream_url: &str) -> Deployment {
     runtime
         .register_driver(CodexDriver::for_test(upstream_url, upstream_url))
         .expect("register Codex driver");
-    let manager = ProviderManager::new(repository.clone(), runtime.clone());
-    let _created_account = manager
+    let manager = match pricing {
+        Some(pricing) => ProviderManager::with_model_pricing_catalog(
+            repository.clone(),
+            runtime.clone(),
+            pricing,
+        ),
+        None => ProviderManager::new(repository.clone(), runtime.clone()),
+    };
+    let created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
             ProviderKind::Codex,
@@ -252,6 +267,8 @@ async fn deployment(upstream_url: &str) -> Deployment {
         api_key: created_key.key.expose_secret().to_owned(),
         auth,
         manager,
+        owner_user_id: grant.user.id.as_str().to_owned(),
+        account_id: created_account.account.id,
         usage,
         writer,
     }
@@ -367,10 +384,11 @@ async fn a_successful_response_records_what_the_provider_actually_reported() {
         "an unreported total stays unreported rather than being invented"
     );
 
-    // No catalog is loaded yet, so the cost is honestly unavailable, not $0.
-    assert_eq!(attempt.price, PriceResolution::CatalogUnavailable);
+    // The selected provider model has no saved price, so the cost is honestly
+    // unavailable rather than falling back to a request-time catalog lookup.
+    assert_eq!(attempt.price, PriceResolution::ModelMappingMissing);
     assert_eq!(attempt.cost.status, CostStatus::Unavailable);
-    assert_eq!(attempt.cost.reasons, vec![CostReason::CatalogUnavailable]);
+    assert_eq!(attempt.cost.reasons, vec![CostReason::ModelMappingMissing]);
 }
 
 #[tokio::test]
@@ -569,10 +587,11 @@ async fn a_priced_response_records_an_exact_cost() {
     )
     .await;
 
-    let deployment = deployment(&upstream_url).await;
-
-    // Refresh from the mock catalog, then confirm it is what prices requests.
     let prices = Arc::new(CatalogPrices::new());
+    let deployment = deployment_with_pricing(&upstream_url, Some(prices.clone())).await;
+
+    // Refresh from the mock catalog, then refresh the provider model so the
+    // exact-id price is saved and loaded into runtime before the request.
     let refresher = CatalogRefresher::new(
         deployment.usage.clone(),
         Arc::new(
@@ -583,11 +602,19 @@ async fn a_priced_response_records_an_exact_cost() {
         provider_usage::system_clock_ms,
     );
     assert_eq!(refresher.refresh_once().await, RefreshOutcome::Installed);
+    deployment
+        .manager
+        .refresh_models(
+            &deployment.owner_user_id,
+            &deployment.account_id,
+            unix_timestamp(),
+        )
+        .await
+        .expect("refresh provider models with catalog pricing");
 
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        prices,
     ));
     let server_url = spawn(provider_server::router_with_usage(
         deployment.service.clone(),
@@ -640,8 +667,9 @@ async fn a_priced_response_records_an_exact_cost() {
     );
 
     let record = attempt.price.resolved().expect("prices were resolved");
-    assert_eq!(record.catalog_model_id, "gpt-5.5");
-    assert_eq!(record.catalog_revision, content_revision(CATALOG_BODY));
+    assert_eq!(record.source(), Some(ProviderModelPricingSource::Catalog));
+    assert_eq!(record.catalog_model_id(), None);
+    assert_eq!(record.catalog_revision(), None);
 
     // 20 @ $1.25/M + 100 @ $0.125/M + 8 @ $10/M = $0.0001175 exactly.
     //
@@ -716,7 +744,6 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        Arc::new(NoCatalog),
     ));
     let services = provider_server::UsageServices {
         tracking,
@@ -831,7 +858,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         attempt["cost"]["usd"].is_null(),
         "an unavailable cost is absent, never 0"
     );
-    assert_eq!(attempt["price"]["resolution"], "catalog_unavailable");
+    assert_eq!(attempt["price"]["resolution"], "model_mapping_missing");
 }
 
 #[tokio::test]
@@ -849,7 +876,6 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         tracking: Arc::new(UsageTracking::new(
             deployment.usage.clone(),
             deployment.writer.clone(),
-            Arc::new(NoCatalog),
         )),
         query: deployment.usage.clone(),
         repository: deployment.usage.clone(),

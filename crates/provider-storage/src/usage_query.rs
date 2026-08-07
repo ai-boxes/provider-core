@@ -442,10 +442,10 @@ mod tests {
         },
     };
     use provider_usage::{
-        AttemptSequence, ComponentPrices, CostStatus, DeliveryOutcome, DispatchEvidence,
-        ExecutionOutcome, InlinePriceRecord, LogicalRequestStart, LogicalRequestTerminal,
-        LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution, TimeRange, TrackingState,
-        UnitPrice, UsageRepository, UsdAtoms,
+        AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices, CostStatus, DeliveryOutcome,
+        DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
+        LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution,
+        TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
     };
 
     use super::*;
@@ -500,22 +500,26 @@ mod tests {
     }
 
     fn resolved_price() -> PriceResolution {
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "a".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(10i128.pow(PRICE_SCALE))),
-                ..ComponentPrices::default()
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "a".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 1,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(
+                        10i128.pow(PRICE_SCALE),
+                    )),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
             },
-            context_tier: None,
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }))
+        )))
     }
 
     struct Written {

@@ -27,7 +27,9 @@ pub use management::{
     StartedProviderOAuth,
 };
 pub use model::{
-    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, StoredProviderModel,
+    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, ProviderModelPricing,
+    ProviderModelPricingCatalog, ProviderModelPricingRecord, ProviderModelPricingSource,
+    ProviderModelPricingTier, StoredProviderModel,
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{

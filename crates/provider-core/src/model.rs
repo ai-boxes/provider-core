@@ -29,11 +29,74 @@ impl ProviderModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelPricingSource {
+    Catalog,
+    Manual,
+}
+
+impl ProviderModelPricingSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelPricing {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub cache_read: Option<String>,
+    pub cache_write: Option<String>,
+    pub reasoning: Option<String>,
+    pub input_audio: Option<String>,
+    pub output_audio: Option<String>,
+    pub tiers: Vec<ProviderModelPricingTier>,
+}
+
+impl ProviderModelPricing {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.input.is_none()
+            && self.output.is_none()
+            && self.cache_read.is_none()
+            && self.cache_write.is_none()
+            && self.reasoning.is_none()
+            && self.input_audio.is_none()
+            && self.output_audio.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelPricingTier {
+    pub threshold_tokens: u64,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub cache_read: Option<String>,
+    pub cache_write: Option<String>,
+    pub reasoning: Option<String>,
+    pub input_audio: Option<String>,
+    pub output_audio: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderModelPricingRecord {
+    pub source: ProviderModelPricingSource,
+    pub pricing: ProviderModelPricing,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredProviderModel {
     pub upstream_model: String,
     pub metadata_json: String,
     pub routable: bool,
+    pub pricing: Option<ProviderModelPricingRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +108,7 @@ pub struct StoredProviderModel {
     pub available: bool,
     pub routable: bool,
     pub metadata_json: String,
+    pub pricing: Option<ProviderModelPricingRecord>,
     pub last_seen_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -61,5 +125,10 @@ impl StoredProviderModel {
 pub struct ProviderModelOverride {
     pub alias: Option<String>,
     pub enabled: bool,
+    pub pricing: Option<Option<ProviderModelPricing>>,
     pub updated_at: i64,
+}
+
+pub trait ProviderModelPricingCatalog: Send + Sync {
+    fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing>;
 }

@@ -160,13 +160,7 @@ pub fn compute_observed_catalog_cost(
         }
     };
 
-    let prices = match record.context_tier {
-        Some(tier) => match observation.pricing_context_tokens.known_value() {
-            Some(tokens) if tokens > tier.threshold_tokens => tier.prices,
-            Some(_) | None => record.prices,
-        },
-        None => record.prices,
-    };
+    let prices = record.prices_for_context(observation.pricing_context_tokens.known_value());
     // Reasoning that the contract says is already inside `output_tokens` must not
     // be priced again, even when the catalog carries a separate reasoning price.
     let reasoning_tokens = if contract.inclusion.reasoning_included_in_output {
@@ -218,17 +212,17 @@ pub fn compute_observed_catalog_cost(
     if matches!(contract.pricing_mode, PricingMode::Unknown) {
         push_unique(&mut reasons, CostReason::PriceModeUnknown);
     }
-    if record.unmodeled_billable_component || !observation.billable.is_empty() {
+    if record.unmodeled_billable_component() || !observation.billable.is_empty() {
         push_unique(&mut reasons, CostReason::UnmodeledBillableComponent);
     }
-    if record.unmodeled_pricing_rule {
+    if record.unmodeled_pricing_rule() {
         // The base rates are exact for a request under the rule's threshold and
         // too low above it, and nothing observed says which side this request fell
         // on. Partial is the only honest status: the amount is real but it is a
         // floor, not the answer.
         push_unique(&mut reasons, CostReason::PricingRuleUnsupported);
     }
-    if record.context_tier.is_some() && observation.pricing_context_tokens.known_value().is_none() {
+    if record.has_context_tiers() && observation.pricing_context_tokens.known_value().is_none() {
         push_unique(&mut reasons, CostReason::TierBasisUnavailable);
     }
     if observation
@@ -265,12 +259,16 @@ pub fn compute_observed_catalog_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use provider_core::ProviderModelPricingSource;
     use provider_core::usage::{
         CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
         RawUsageFields, TokenInclusionRules, TokenUnknownReason, TotalSource, normalize_usage,
     };
 
-    use crate::price::{ComponentPrices, InlinePriceRecord};
+    use crate::price::{
+        CatalogInlinePriceRecordV1, ComponentPrices, ContextPriceTier, InlinePriceRecord,
+        ModelInlinePriceRecordV2,
+    };
 
     const PER_MILLION: i128 = 10i128.pow(crate::money::PRICE_SCALE);
 
@@ -296,19 +294,21 @@ mod tests {
     }
 
     fn record(prices: ComponentPrices) -> PriceResolution {
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "test".to_owned(),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-x".to_owned(),
-            mapping_revision: 1,
-            prices,
-            context_tier: None,
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }))
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "test".to_owned(),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-x".to_owned(),
+                mapping_revision: 1,
+                prices,
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
+            },
+        )))
     }
 
     fn reported(value: u64) -> TokenMetric {
@@ -330,6 +330,60 @@ mod tests {
             billable: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn model_price_uses_the_highest_matching_context_tier() {
+        let resolution = PriceResolution::Resolved(Box::new(InlinePriceRecord::ModelV2(
+            ModelInlinePriceRecordV2 {
+                format_version: 2,
+                source: ProviderModelPricingSource::Catalog,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(PER_MILLION)),
+                    output_per_million: Some(UnitPrice::from_scaled(10 * PER_MILLION)),
+                    ..ComponentPrices::default()
+                },
+                tiers: vec![
+                    ContextPriceTier {
+                        threshold_tokens: 100,
+                        prices: ComponentPrices {
+                            uncached_input_per_million: Some(UnitPrice::from_scaled(
+                                2 * PER_MILLION,
+                            )),
+                            output_per_million: Some(UnitPrice::from_scaled(20 * PER_MILLION)),
+                            ..ComponentPrices::default()
+                        },
+                    },
+                    ContextPriceTier {
+                        threshold_tokens: 200,
+                        prices: ComponentPrices {
+                            uncached_input_per_million: Some(UnitPrice::from_scaled(
+                                3 * PER_MILLION,
+                            )),
+                            output_per_million: Some(UnitPrice::from_scaled(30 * PER_MILLION)),
+                            ..ComponentPrices::default()
+                        },
+                    },
+                ],
+            },
+        )));
+        let mut usage = observation(reported(201), reported(1));
+        usage.pricing_context_tokens = reported(201);
+        let cost =
+            compute_observed_catalog_cost(&usage, &contract(PricingMode::Default), &resolution);
+        assert_eq!(
+            cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        );
+        assert_eq!(cost.total_known.as_atoms(), (201 * 3 + 30) * PER_MILLION);
+
+        usage.pricing_context_tokens = reported(200);
+        let boundary =
+            compute_observed_catalog_cost(&usage, &contract(PricingMode::Default), &resolution);
+        assert_eq!(
+            boundary.total_known.as_atoms(),
+            (201 * 2 + 20) * PER_MILLION
+        );
     }
 
     #[test]

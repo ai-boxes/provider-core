@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use provider_core::{
-    ProviderKind,
+    ProviderKind, ProviderModelPricingRecord,
     usage::{
         AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
         RequestTracking, UsageContractSnapshot, normalize_usage,
@@ -27,9 +27,10 @@ use provider_core::{
 
 use crate::{
     attempt::{AttemptSequence, DispatchEvidence, TrackingGapReason, TrackingState},
+    catalog::{component_prices_from_model_pricing, context_price_tiers_from_model_pricing},
     cost::{CostStatus, ObservedCatalogCost, compute_observed_catalog_cost},
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
-    price::PriceResolution,
+    price::{InlinePriceRecord, ModelInlinePriceRecordV2, PriceResolution},
     repository::{
         AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
         UsageRepository,
@@ -55,54 +56,29 @@ pub fn system_clock_ms() -> i64 {
         .expect("unix timestamp must fit i64")
 }
 
-/// Supplies the price for a model from the catalog snapshot held right now.
-///
-/// A separate trait so the catalog can land later without touching attempt
-/// tracking: until it does, [`NoCatalog`] reports the honest answer.
-pub trait PriceResolver: Send + Sync {
-    fn resolve(&self, provider: ProviderKind, configured_model: Option<&str>) -> PriceResolution;
-}
-
-/// No catalog is loaded, so nothing can be priced. Costs come out `unavailable`
-/// with a reason — never as `$0`.
-pub struct NoCatalog;
-
-impl PriceResolver for NoCatalog {
-    fn resolve(&self, _provider: ProviderKind, _configured_model: Option<&str>) -> PriceResolution {
-        PriceResolution::CatalogUnavailable
-    }
-}
-
 /// Entry point held by the server and the runtime.
 pub struct UsageTracking {
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
-    prices: Arc<dyn PriceResolver>,
     spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
 }
 
 impl UsageTracking {
     #[must_use]
-    pub fn new(
-        repository: Arc<dyn UsageRepository>,
-        writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
-    ) -> Self {
-        Self::with_clock_and_spend_observer(repository, writer, prices, system_clock_ms, None)
+    pub fn new(repository: Arc<dyn UsageRepository>, writer: Arc<UsageWriter>) -> Self {
+        Self::with_clock_and_spend_observer(repository, writer, system_clock_ms, None)
     }
 
     #[must_use]
     pub fn with_spend_observer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
         spend_observer: SpendObserver,
     ) -> Self {
         Self::with_clock_and_spend_observer(
             repository,
             writer,
-            prices,
             system_clock_ms,
             Some(spend_observer),
         )
@@ -112,24 +88,21 @@ impl UsageTracking {
     pub fn with_clock(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
         now_ms: ClockMs,
     ) -> Self {
-        Self::with_clock_and_spend_observer(repository, writer, prices, now_ms, None)
+        Self::with_clock_and_spend_observer(repository, writer, now_ms, None)
     }
 
     #[must_use]
     fn with_clock_and_spend_observer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
         now_ms: ClockMs,
         spend_observer: Option<SpendObserver>,
     ) -> Self {
         Self {
             repository,
             writer,
-            prices,
             spend_observer,
             now_ms,
         }
@@ -152,7 +125,6 @@ impl UsageTracking {
         Arc::new(LogicalTracker {
             start,
             writer: Arc::clone(&self.writer),
-            prices: Arc::clone(&self.prices),
             spend_observer: self.spend_observer.clone(),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
@@ -198,7 +170,6 @@ struct LogicalState {
 pub struct LogicalTracker {
     start: LogicalRequestStart,
     writer: Arc<UsageWriter>,
-    prices: Arc<dyn PriceResolver>,
     spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
@@ -552,11 +523,9 @@ impl RequestTracking for RequestTrackingHandle {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing: Option<&ProviderModelPricingRecord>,
     ) -> Option<Arc<dyn AttemptTracking>> {
-        // Resolved now, from the catalog snapshot held at this moment, and
-        // carried with the attempt: completion must never re-read "current"
-        // prices, or a catalog refresh would silently rewrite history.
-        let price = self.0.prices.resolve(profile.provider, configured_model);
+        let price = model_price_resolution(pricing);
         Some(self.0.open_attempt(AttemptSpec {
             provider: profile.provider,
             account_id: account_id.to_owned(),
@@ -565,6 +534,26 @@ impl RequestTracking for RequestTrackingHandle {
             price,
         }))
     }
+}
+
+fn model_price_resolution(pricing: Option<&ProviderModelPricingRecord>) -> PriceResolution {
+    let Some(pricing) = pricing else {
+        return PriceResolution::ModelMappingMissing;
+    };
+    let Some(prices) = component_prices_from_model_pricing(&pricing.pricing) else {
+        return PriceResolution::CatalogEntryInvalid;
+    };
+    let Some(tiers) = context_price_tiers_from_model_pricing(&pricing.pricing) else {
+        return PriceResolution::CatalogEntryInvalid;
+    };
+    PriceResolution::Resolved(Box::new(InlinePriceRecord::ModelV2(
+        ModelInlinePriceRecordV2 {
+            format_version: 2,
+            source: pricing.source,
+            prices,
+            tiers,
+        },
+    )))
 }
 
 impl AttemptTracking for AttemptTracker {
@@ -688,7 +677,7 @@ mod tests {
         attempt::LogicalStatus,
         cost::{CostReason, CostStatus},
         money::{PRICE_SCALE, UnitPrice},
-        price::{ComponentPrices, InlinePriceRecord},
+        price::{CatalogInlinePriceRecordV1, ComponentPrices, InlinePriceRecord},
         writer::DEFAULT_WRITE_QUEUE,
     };
 
@@ -723,24 +712,26 @@ mod tests {
 
     fn priced() -> PriceResolution {
         let per_million = 10i128.pow(PRICE_SCALE);
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "a".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(per_million)),
-                cache_read_per_million: Some(UnitPrice::from_scaled(per_million / 10)),
-                output_per_million: Some(UnitPrice::from_scaled(10 * per_million)),
-                ..ComponentPrices::default()
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "a".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 1,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(per_million)),
+                    cache_read_per_million: Some(UnitPrice::from_scaled(per_million / 10)),
+                    output_per_million: Some(UnitPrice::from_scaled(10 * per_million)),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
             },
-            context_tier: None,
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }))
+        )))
     }
 
     fn spec(price: PriceResolution) -> AttemptSpec {
@@ -792,12 +783,7 @@ mod tests {
     async fn harness() -> Harness {
         let repository = Arc::new(crate::tests_support::TestRepository::default());
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
-        let tracking = UsageTracking::with_clock(
-            repository.clone(),
-            writer.clone(),
-            Arc::new(NoCatalog),
-            ticking_clock,
-        );
+        let tracking = UsageTracking::with_clock(repository.clone(), writer.clone(), ticking_clock);
         Harness {
             tracking,
             writer,
@@ -854,7 +840,6 @@ mod tests {
         let tracking = UsageTracking::with_clock_and_spend_observer(
             repository,
             writer.clone(),
-            Arc::new(NoCatalog),
             ticking_clock,
             Some(observer),
         );
@@ -1018,12 +1003,7 @@ mod tests {
             ..crate::tests_support::TestRepository::default()
         });
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
-        let tracking = UsageTracking::with_clock(
-            repository.clone(),
-            writer.clone(),
-            Arc::new(NoCatalog),
-            ticking_clock,
-        );
+        let tracking = UsageTracking::with_clock(repository.clone(), writer.clone(), ticking_clock);
 
         // begin_request must not fail: statistics never block a proxy request.
         let logical = tracking.begin_request(start("req-1")).await;

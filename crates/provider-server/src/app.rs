@@ -34,12 +34,30 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let _instance = InstanceGuard::acquire(DATABASE_PATH)?;
 
     let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
+    let usage_repository = Arc::new(repository.usage_repository());
+    let prices = Arc::new(CatalogPrices::new());
+    let refresher = Arc::new(CatalogRefresher::new(
+        usage_repository.clone(),
+        Arc::new(HttpCatalogSource::models_dev()?),
+        prices.clone(),
+        system_clock_ms,
+    ));
+    let stored_catalog = refresher.install_stored().await;
+    match stored_catalog.as_deref() {
+        Some(revision) => println!("price catalog {} loaded from storage", &revision[..12]),
+        None if catalog_sync_enabled() => {
+            let outcome = refresher.refresh_once().await;
+            println!("initial price catalog refresh: {outcome:?}");
+        }
+        None => println!("no stored price catalog; model prices remain unconfigured"),
+    }
+
     let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
     runtime.register_driver(Arc::new(CodexDriver::new()))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
-    let model_catalog = ModelCatalogService::new(repository.clone());
+    let model_catalog = ModelCatalogService::with_pricing(repository.clone(), prices.clone());
     for account in repository.load_enabled_accounts().await? {
         let kind = account.provider;
         let access = account.access();
@@ -66,7 +84,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Usage facts share the accounts database. Anything a previous run left in
     // flight has no knowable terminal, so it is closed as incomplete with a gap
     // before this run records anything new.
-    let usage_repository = Arc::new(repository.usage_repository());
     let recovered = usage_repository
         .recover_in_flight_requests(unix_timestamp() * 1000)
         .await?;
@@ -85,19 +102,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             }
         })
     };
-    // Price from whatever catalog is already stored before any fetch, so a
-    // restart does not lose cost estimates while it waits for the network.
-    let prices = Arc::new(CatalogPrices::new());
-    let refresher = Arc::new(CatalogRefresher::new(
-        usage_repository.clone(),
-        Arc::new(HttpCatalogSource::models_dev()?),
-        prices.clone(),
-        system_clock_ms,
-    ));
-    match refresher.install_stored().await {
-        Some(revision) => println!("price catalog {} loaded from storage", &revision[..12]),
-        None => println!("no stored price catalog yet; costs stay unavailable until one loads"),
-    }
     if catalog_sync_enabled() {
         tokio::spawn(Arc::clone(&refresher).run(DEFAULT_REFRESH_PERIOD));
     } else {
@@ -121,16 +125,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         tracking: Arc::new(UsageTracking::with_spend_observer(
             usage_repository.clone(),
             writer.clone(),
-            prices.clone(),
             spend_observer,
         )),
         query: usage_repository.clone(),
         repository: usage_repository,
-        catalog: prices,
+        catalog: prices.clone(),
         writer: writer.clone(),
     };
 
-    let manager = ProviderManager::new(repository, runtime.clone());
+    let manager = ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices);
     let listen_address = listen_address();
     let listener = TcpListener::bind(&listen_address).await?;
 

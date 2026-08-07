@@ -81,7 +81,10 @@ impl ProxyService {
             .protocol
             .prepare(request, route.route.native_format())?;
         let (request, response) = prepared.into_parts();
-        let stream = route.route.execute_stream(request, tracking).await?;
+        let stream = route
+            .route
+            .execute_stream(request, route.pricing.as_ref(), tracking)
+            .await?;
         Ok(response.translate_stream(stream))
     }
 
@@ -188,6 +191,7 @@ impl ProviderRouter for SingleProviderRouter {
         }
         vec![ProviderRouteCandidate {
             upstream_model: model.to_owned(),
+            pricing: None,
             route: self.route.clone(),
         }]
     }
@@ -210,6 +214,7 @@ impl ProviderRoute for SingleProviderRoute {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        _pricing: Option<&crate::ProviderModelPricingRecord>,
         // A bare `Provider` has no account or established usage contract, so
         // there is nothing to attribute an attempt to.
         _tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,

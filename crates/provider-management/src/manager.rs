@@ -8,9 +8,10 @@ use provider_core::{
     AccountId, AccountProvisioningInput, CredentialKind, CredentialUpdate, CredentialWriteOutcome,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderControl,
     ProviderControlError, ProviderKind, ProviderManagementRepository, ProviderModelOverride,
-    ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness,
-    ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView, ProviderVisibility,
-    QuotaGroupAudience, StoredProviderAccount, StoredProviderModel, merge_quota_groups,
+    ProviderModelPricingCatalog, ProviderOAuthChallenge, ProviderQuotaErrorKind,
+    ProviderQuotaFreshness, ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView,
+    ProviderVisibility, QuotaGroupAudience, StoredProviderAccount, StoredProviderModel,
+    merge_quota_groups,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -113,6 +114,21 @@ impl ProviderManager {
     ) -> Self {
         Self {
             models: ModelCatalogService::new(repository.clone()),
+            repository,
+            control,
+            oauth_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
+            quota: Arc::new(QuotaState::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_model_pricing_catalog(
+        repository: Arc<dyn ProviderManagementRepository>,
+        control: Arc<dyn ProviderControl>,
+        pricing: Arc<dyn ProviderModelPricingCatalog>,
+    ) -> Self {
+        Self {
+            models: ModelCatalogService::with_pricing(repository.clone(), pricing),
             repository,
             control,
             oauth_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -555,6 +571,9 @@ impl ProviderManager {
         account_id: &AccountId,
         now: i64,
     ) -> Result<ModelCatalogSnapshot, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         let stored = self.load_owned_account(actor_user_id, account_id).await?;
         let account = self.control.build_account(stored.clone())?;
         let models = self.models.refresh(account.as_ref(), now).await?;
@@ -578,6 +597,9 @@ impl ProviderManager {
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<Vec<StoredProviderModel>, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         self.load_owned_account(actor_user_id, account_id).await?;
         if !self
             .repository

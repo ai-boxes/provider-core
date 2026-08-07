@@ -250,6 +250,7 @@ impl ProviderRouter for ProviderModelRouter {
                     account_id.clone(),
                     ProviderRouteCandidate {
                         upstream_model: provider_model.upstream_model.clone(),
+                        pricing: provider_model.pricing.clone(),
                         route: account.route.clone(),
                     },
                 ));
@@ -316,10 +317,11 @@ impl ProviderRoute for RuntimeAccountRoute {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         self.runtime
-            .execute_stream_for(&self.account_id, request, tracking)
+            .execute_stream_for(&self.account_id, request, pricing, tracking)
             .await
     }
 
@@ -500,6 +502,7 @@ mod tests {
                         payload: bytes::Bytes::new(),
                         metadata: RequestMetadata::default(),
                     },
+                    None,
                     None,
                 )
                 .await
@@ -885,6 +888,7 @@ mod tests {
             routable: true,
             metadata_json: serde_json::to_string(&ProviderModel::new(upstream_model, "test"))
                 .expect("serialize provider model"),
+            pricing: None,
             last_seen_at: None,
             created_at: 0,
             updated_at: 0,

@@ -94,6 +94,7 @@ pub trait ProviderRoute: Send + Sync {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        pricing: Option<&crate::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError>;
 
@@ -103,6 +104,7 @@ pub trait ProviderRoute: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRouteCandidate {
     pub upstream_model: String,
+    pub pricing: Option<crate::ProviderModelPricingRecord>,
     pub route: Arc<dyn ProviderRoute>,
 }
 

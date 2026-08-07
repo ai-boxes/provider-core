@@ -365,9 +365,11 @@ fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
                 .cloned()
                 .expect("price resolution serialization must contain kind"),
             "catalog_revision": attempt.price.resolved()
-                .map(|record| record.catalog_revision.clone()),
+                .and_then(|record| record.catalog_revision().map(ToOwned::to_owned)),
             "catalog_model_id": attempt.price.resolved()
-                .map(|record| record.catalog_model_id.clone()),
+                .and_then(|record| record.catalog_model_id().map(ToOwned::to_owned)),
+            "source": attempt.price.resolved()
+                .and_then(|record| record.source().map(|source| source.as_str())),
             "input_per_million_usd": price_json(
                 prices.and_then(|prices| prices.uncached_input_per_million),
             ),
@@ -396,15 +398,7 @@ fn is_attributed_attempt(
 
 fn selected_prices(attempt: &AttemptFacts) -> Option<ComponentPrices> {
     let record = attempt.price.resolved()?;
-    Some(match record.context_tier {
-        Some(tier)
-            if attempt.observation.pricing_context_tokens.known_value()
-                > Some(tier.threshold_tokens) =>
-        {
-            tier.prices
-        }
-        Some(_) | None => record.prices,
-    })
+    Some(record.prices_for_context(attempt.observation.pricing_context_tokens.known_value()))
 }
 
 fn component_cost_json(
@@ -482,8 +476,9 @@ mod tests {
         },
     };
     use provider_usage::{
-        AttemptSequence, ContextPriceTier, DispatchEvidence, InlinePriceRecord, PRICE_SCALE,
-        PriceResolution, TrackingState, compute_observed_catalog_cost,
+        AttemptSequence, CatalogInlinePriceRecordV1, ContextPriceTier, DispatchEvidence,
+        InlinePriceRecord, PRICE_SCALE, PriceResolution, TrackingState,
+        compute_observed_catalog_cost,
     };
 
     use super::*;
@@ -531,32 +526,34 @@ mod tests {
             billable: Vec::new(),
             warnings: Vec::new(),
         };
-        let price = PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "catalog-test".to_owned(),
-            catalog_provider_id: "test-provider".to_owned(),
-            catalog_model_id: "test-model".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(2 * PRICE_UNIT)),
-                cache_read_per_million: Some(UnitPrice::from_scaled(PRICE_UNIT)),
-                output_per_million: Some(UnitPrice::from_scaled(6 * PRICE_UNIT)),
-                ..ComponentPrices::default()
-            },
-            context_tier: Some(ContextPriceTier {
-                threshold_tokens: 200,
+        let price = PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "catalog-test".to_owned(),
+                catalog_provider_id: "test-provider".to_owned(),
+                catalog_model_id: "test-model".to_owned(),
+                mapping_revision: 1,
                 prices: ComponentPrices {
-                    uncached_input_per_million: Some(UnitPrice::from_scaled(5 * PRICE_UNIT)),
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(2 * PRICE_UNIT)),
                     cache_read_per_million: Some(UnitPrice::from_scaled(PRICE_UNIT)),
-                    output_per_million: Some(UnitPrice::from_scaled(30 * PRICE_UNIT)),
+                    output_per_million: Some(UnitPrice::from_scaled(6 * PRICE_UNIT)),
                     ..ComponentPrices::default()
                 },
-            }),
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }));
+                context_tier: Some(ContextPriceTier {
+                    threshold_tokens: 200,
+                    prices: ComponentPrices {
+                        uncached_input_per_million: Some(UnitPrice::from_scaled(5 * PRICE_UNIT)),
+                        cache_read_per_million: Some(UnitPrice::from_scaled(PRICE_UNIT)),
+                        output_per_million: Some(UnitPrice::from_scaled(30 * PRICE_UNIT)),
+                        ..ComponentPrices::default()
+                    },
+                }),
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
+            },
+        )));
         let cost = compute_observed_catalog_cost(&observation, &contract, &price);
 
         AttemptFacts {

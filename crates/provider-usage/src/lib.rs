@@ -28,15 +28,18 @@ pub use attempt::{
     AttemptSequence, DispatchEvidence, LogicalStatus, TrackingGapReason, TrackingState,
 };
 pub use catalog::{
-    CATALOG_FORMAT_VERSION, CATALOG_MAPPING_REVISION, CATALOG_PARSER_VERSION, CatalogParseError,
-    CatalogPrices, CatalogSnapshot, MAX_CATALOG_BYTES, catalog_provider_id, parse_unit_price,
+    CatalogParseError, CatalogPrices, CatalogSnapshot, MAX_CATALOG_BYTES, canonical_model_pricing,
+    component_prices_from_model_pricing, context_price_tiers_from_model_pricing, parse_unit_price,
 };
 pub use cost::{
     CALCULATOR_VERSION, CostReason, CostStatus, ObservedCatalogCost, compute_observed_catalog_cost,
 };
 pub use lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal};
 pub use money::{AMOUNT_SCALE, PRICE_SCALE, UnitPrice, UsdAtoms, component_cost_atoms};
-pub use price::{ComponentPrices, ContextPriceTier, InlinePriceRecord, PriceResolution};
+pub use price::{
+    CatalogInlinePriceRecordV1, ComponentPrices, ContextPriceTier, InlinePriceRecord,
+    ModelInlinePriceRecordV2, PriceResolution,
+};
 pub use query::{
     ATOM_SPLIT, AttributionBasis, CacheTotals, CostTotals, MAX_PAGE_SIZE, MAX_QUERY_RANGE,
     ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TimeRange, TimeRangeError,
@@ -55,8 +58,8 @@ pub use retention::{
     RetentionWorker,
 };
 pub use tracking::{
-    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, NoCatalog, PriceResolver, SpendObserver,
-    UsageTracking, system_clock_ms,
+    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, SpendObserver, UsageTracking,
+    system_clock_ms,
 };
 pub use writer::{
     DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, SubmitOutcome, UsageFact, UsageWrite, UsageWriter,

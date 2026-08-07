@@ -307,6 +307,7 @@ fn normalize_models(
                 upstream_model: id.to_owned(),
                 metadata_json,
                 routable: true,
+                pricing: None,
             },
         );
     }

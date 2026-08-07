@@ -7,10 +7,10 @@
 //!
 //! * Replace a working catalog with a broken one. A body that does not parse
 //!   leaves the last known good snapshot in place and records why.
-//! * Touch the request path. It runs on its own schedule; a request only ever
-//!   reads the in-memory snapshot.
-//! * Fail startup. With no catalog at all, costs resolve to `catalog_unavailable`
-//!   and the proxy is unaffected.
+//! * Touch the request path. Only provider model refresh reads the installed
+//!   snapshot; requests use prices already saved with their routed model.
+//! * Fail startup. With no catalog at all, model prices remain unconfigured and
+//!   the proxy is unaffected.
 
 use std::{sync::Arc, time::Duration};
 
@@ -231,8 +231,8 @@ impl CatalogRefresher {
 
 /// The catalog revision: SHA-256 of the exact bytes, hex encoded.
 ///
-/// Content-addressed rather than validator-addressed, so an attempt's inlined
-/// revision identifies the prices themselves.
+/// Content-addressed rather than validator-addressed, so storage and the
+/// installed snapshot refer to the exact same document bytes.
 #[must_use]
 pub fn content_revision(body: &str) -> String {
     let digest = Sha256::digest(body.as_bytes());
@@ -248,10 +248,8 @@ pub fn content_revision(body: &str) -> String {
 mod tests {
     use std::sync::Mutex;
 
-    use provider_core::ProviderKind;
-
     use super::*;
-    use crate::{price::PriceResolution, tests_support::TestRepository, tracking::PriceResolver};
+    use crate::{component_prices_from_model_pricing, tests_support::TestRepository};
 
     const GOOD: &str = r#"{"openai":{"models":{"gpt-5-codex":{"cost":{"input":1,"output":2}}}}}"#;
 
@@ -318,13 +316,12 @@ mod tests {
     }
 
     fn priced(prices: &CatalogPrices) -> Option<i128> {
-        PriceResolution::resolved(&PriceResolver::resolve(
-            prices,
-            ProviderKind::Codex,
-            Some("gpt-5-codex"),
-        ))
-        .and_then(|record| record.prices.uncached_input_per_million)
-        .map(|price| price.as_scaled())
+        prices
+            .current()?
+            .exact_model_pricing("gpt-5-codex")
+            .and_then(|pricing| component_prices_from_model_pricing(&pricing))
+            .and_then(|prices| prices.uncached_input_per_million)
+            .map(|price| price.as_scaled())
     }
 
     #[tokio::test]
@@ -379,7 +376,7 @@ mod tests {
         assert_eq!(
             priced(&prices),
             None,
-            "nothing is priced from a revision that was never stored"
+            "no model pricing is exposed from a revision that was never stored"
         );
     }
 }
