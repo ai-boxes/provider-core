@@ -1254,6 +1254,18 @@ mod tests {
             .expect("reject compatible credential document");
         assert_eq!(compatible_credential.status(), StatusCode::BAD_REQUEST);
 
+        let unsupported_oauth = client
+            .post(format!("http://{address}/api/v1/oauth/sessions"))
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                r#"{"provider":"openai_compatible","label":"unsupported oauth","group_label":"default"}"#,
+            )
+            .send()
+            .await
+            .expect("reject unsupported OAuth provider");
+        assert_eq!(unsupported_oauth.status(), StatusCode::BAD_REQUEST);
+
         let failed_discovery = client
             .post(&endpoint)
             .bearer_auth(&access_token)

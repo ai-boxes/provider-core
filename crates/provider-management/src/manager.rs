@@ -196,6 +196,14 @@ impl ProviderManager {
         group_label: String,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        if matches!(
+            kind,
+            ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible
+        ) {
+            return Err(ProviderManagerError::InvalidInput(
+                "provider does not support OAuth onboarding",
+            ));
+        }
         let label = label.trim().to_owned();
         if label.is_empty() {
             return Err(ProviderManagerError::InvalidInput(
