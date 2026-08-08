@@ -1682,10 +1682,10 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO api_keys (
-                id, owner_user_id, group_label, label, key_digest, enabled,
+                id, owner_user_id, group_label, label, key, enabled,
                 quota_limit_atoms, spent_atoms, created_at, updated_at
             )
-            VALUES ('key-1', 'user-1', 'default', 'quota', zeroblob(32), 1,
+            VALUES ('key-1', 'user-1', 'default', 'quota', 'quota-key-1', 1,
                     '9999999999999999', '0', 1, 1)
             "#,
         )
@@ -1751,10 +1751,10 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO api_keys (
-                id, owner_user_id, group_label, label, key_digest, enabled,
+                id, owner_user_id, group_label, label, key, enabled,
                 quota_limit_atoms, spent_atoms, created_at, updated_at
             )
-            VALUES ('key-deleted', 'user-1', 'default', 'quota', zeroblob(32), 1,
+            VALUES ('key-deleted', 'user-1', 'default', 'quota', 'quota-key-deleted', 1,
                     '9999999999999999', '0', 1, 1)
             "#,
         )

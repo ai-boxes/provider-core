@@ -1165,7 +1165,7 @@ impl AuthRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO api_keys
-                (id, owner_user_id, group_label, label, key_digest, enabled, expires_at,
+                (id, owner_user_id, group_label, label, key, enabled, expires_at,
                  quota_limit_atoms, spent_atoms, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)
             ON CONFLICT DO NOTHING
@@ -1175,7 +1175,7 @@ impl AuthRepository for SqliteAccountRepository {
         .bind(key.owner_user_id.as_str())
         .bind(&key.group_label)
         .bind(key.label)
-        .bind(key.key_digest.as_slice())
+        .bind(key.key.expose_secret())
         .bind(database_bool(key.enabled))
         .bind(key.expires_at)
         .bind(key.quota_limit_atoms.as_deref())
@@ -1193,7 +1193,7 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, owner_user_id, group_label, label, key_digest, enabled, expires_at,
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
                    quota_limit_atoms, spent_atoms, quota_accounting_state, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE owner_user_id = ?
@@ -1214,7 +1214,7 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT id, owner_user_id, group_label, label, key_digest, enabled, expires_at,
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
                    quota_limit_atoms, spent_atoms, quota_accounting_state, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE id = ? AND owner_user_id = ?
@@ -1246,7 +1246,7 @@ impl AuthRepository for SqliteAccountRepository {
                 SET group_label = ?, label = ?, enabled = ?, expires_at = ?,
                     quota_limit_atoms = ?, updated_at = ?
                 WHERE id = ? AND owner_user_id = ?
-                RETURNING id, owner_user_id, group_label, label, key_digest, enabled, expires_at,
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
                           quota_limit_atoms, spent_atoms, quota_accounting_state, last_used_at, created_at, updated_at
                 "#,
             )
@@ -1266,7 +1266,7 @@ impl AuthRepository for SqliteAccountRepository {
                 UPDATE api_keys
                 SET group_label = ?, label = ?, enabled = ?, expires_at = ?, updated_at = ?
                 WHERE id = ? AND owner_user_id = ?
-                RETURNING id, owner_user_id, group_label, label, key_digest, enabled, expires_at,
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
                           quota_limit_atoms, spent_atoms, quota_accounting_state, last_used_at, created_at, updated_at
                 "#,
             )
@@ -1301,7 +1301,7 @@ impl AuthRepository for SqliteAccountRepository {
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT k.id, k.owner_user_id, k.group_label, k.label, k.key_digest, k.enabled, k.expires_at,
+            SELECT k.id, k.owner_user_id, k.group_label, k.label, k.key, k.enabled, k.expires_at,
                    k.quota_limit_atoms, k.spent_atoms, k.quota_accounting_state,
                    k.last_used_at, k.created_at, k.updated_at
             FROM api_keys AS k
@@ -1674,7 +1674,7 @@ fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
         owner_user_id: auth_user_id(&row, "owner_user_id")?,
         group_label,
         label: auth_row_value(&row, "label")?,
-        key_digest: auth_hash(&row, "key_digest")?,
+        key: SecretString::from(auth_row_value::<String>(&row, "key")?),
         enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
         expires_at: auth_row_value(&row, "expires_at")?,
         quota_limit_atoms,

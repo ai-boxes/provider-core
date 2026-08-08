@@ -65,7 +65,10 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/users/{user_id}", put(update_user))
         .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
-        .route("/api/v1/keys/{key_id}", put(update_key).delete(delete_key))
+        .route(
+            "/api/v1/keys/{key_id}",
+            get(get_key).put(update_key).delete(delete_key),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.auth_service(),
             require_access,
@@ -299,6 +302,18 @@ async fn create_key(
         )
         .await?;
     Ok((StatusCode::CREATED, data(created_api_key_json(&key)?)))
+}
+
+async fn get_key(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(key_id): Path<String>,
+) -> Result<Json<Value>, AuthApiError> {
+    let key = state
+        .api_keys
+        .get(&session.user.id, &parse_api_key_id(&key_id)?)
+        .await?;
+    Ok(data(stored_api_key_json(&key)?))
 }
 
 async fn update_key(
@@ -573,6 +588,32 @@ fn created_api_key_json(created: &CreatedApiKey) -> Result<Value, AuthApiError> 
     Ok(value)
 }
 
+fn stored_api_key_json(key: &provider_auth::StoredApiKey) -> Result<Value, AuthApiError> {
+    let quota_limit_usd = key
+        .quota_limit_atoms
+        .as_deref()
+        .map(provider_auth::format_usd_atoms)
+        .transpose()
+        .map_err(|()| AuthApiError::internal())?;
+    let spent_usd =
+        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
+    Ok(json!({
+        "id": key.id.as_str(),
+        "owner_user_id": key.owner_user_id.as_str(),
+        "group_label": key.group_label,
+        "label": key.label,
+        "key": key.key.expose_secret(),
+        "enabled": key.enabled,
+        "expires_at": key.expires_at,
+        "quota_limit_usd": quota_limit_usd,
+        "spent_usd": spent_usd,
+        "quota_accounting": if key.quota_accounting_ready { "ready" } else { "indeterminate" },
+        "last_used_at": key.last_used_at,
+        "created_at": key.created_at,
+        "updated_at": key.updated_at
+    }))
+}
+
 fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
     let quota_limit_usd = key
         .quota_limit_atoms
@@ -587,6 +628,7 @@ fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
         "owner_user_id": key.owner_user_id.as_str(),
         "group_label": key.group_label,
         "label": key.label,
+        "key": key.key,
         "enabled": key.enabled,
         "expires_at": key.expires_at,
         "quota_limit_usd": quota_limit_usd,
@@ -961,8 +1003,22 @@ mod tests {
             .expect("list API keys");
         assert_eq!(listed_keys.status(), StatusCode::OK);
         let listed_keys = response_json(listed_keys).await;
-        assert!(listed_keys["data"][0].get("key").is_none());
+        let masked_key = listed_keys["data"][0]["key"]
+            .as_str()
+            .expect("masked API key");
+        assert_ne!(masked_key, issued_key);
+        assert!(masked_key.starts_with(&issued_key[..3]));
+        assert!(masked_key.ends_with(&issued_key[issued_key.len() - 3..]));
         assert!(!listed_keys.to_string().contains(&issued_key));
+
+        let key_detail = client
+            .get(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("get API key detail");
+        assert_eq!(key_detail.status(), StatusCode::OK);
+        assert_eq!(response_json(key_detail).await["data"]["key"], issued_key);
 
         repository
             .usage_repository()
@@ -1068,6 +1124,14 @@ mod tests {
             .expect("foreign API key update");
         assert_eq!(foreign_update.status(), StatusCode::NOT_FOUND);
 
+        let foreign_get = client
+            .get(format!("{base_url}/api/v1/keys/{key_id}"))
+            .bearer_auth(&member_access)
+            .send()
+            .await
+            .expect("foreign API key detail");
+        assert_eq!(foreign_get.status(), StatusCode::NOT_FOUND);
+
         seed_account_with_group(
             repository.clone(),
             &UserId::new(owner_id.clone()).expect("user ID"),
@@ -1144,7 +1208,7 @@ mod tests {
         let updated_expiry = response_json(updated_expiry).await;
         assert_eq!(updated_expiry["data"]["expires_at"], expires_at);
         assert_eq!(updated_expiry["data"]["enabled"], true);
-        assert!(updated_expiry["data"].get("key").is_none());
+        assert_eq!(updated_expiry["data"]["key"], masked_key);
 
         let invalid_expiry = client
             .put(format!("{base_url}/api/v1/keys/{key_id}"))

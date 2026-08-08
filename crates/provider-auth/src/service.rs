@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
 };
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -427,7 +427,7 @@ impl ApiKeyAuthenticator {
             owner_user_id: owner_user_id.clone(),
             group_label: group_label.clone(),
             label,
-            key_digest: issued.digest,
+            key: issued.secret.clone(),
             enabled: true,
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
@@ -438,6 +438,7 @@ impl ApiKeyAuthenticator {
             owner_user_id: key.owner_user_id.clone(),
             group_label: group_label.clone(),
             label: key.label.clone(),
+            key: mask_api_key(key.key.expose_secret()),
             enabled: true,
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
@@ -492,6 +493,17 @@ impl ApiKeyAuthenticator {
             .iter()
             .map(api_key_summary)
             .collect())
+    }
+
+    pub async fn get(
+        &self,
+        owner_user_id: &UserId,
+        key_id: &ApiKeyId,
+    ) -> Result<StoredApiKey, AuthError> {
+        self.repository
+            .load_api_key(owner_user_id, key_id)
+            .await?
+            .ok_or(AuthError::NotFound)
     }
 
     pub async fn update(
@@ -576,7 +588,7 @@ impl ApiKeyAuthenticator {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(
-                    updated.key_digest,
+                    digest_secret(updated.key.expose_secret()),
                     ActiveApiKey {
                         id: updated.id.clone(),
                         owner_user_id: updated.owner_user_id.clone(),
@@ -792,7 +804,7 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
     keys.into_iter()
         .map(|key| {
             (
-                key.key_digest,
+                digest_secret(key.key.expose_secret()),
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
@@ -812,6 +824,7 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
         owner_user_id: key.owner_user_id.clone(),
         group_label: key.group_label.clone(),
         label: key.label.clone(),
+        key: mask_api_key(key.key.expose_secret()),
         enabled: key.enabled,
         expires_at: key.expires_at,
         quota_limit_atoms: key.quota_limit_atoms.clone(),
@@ -821,6 +834,19 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
         created_at: key.created_at,
         updated_at: key.updated_at,
     }
+}
+
+fn mask_api_key(key: &str) -> String {
+    let characters = key.chars().collect::<Vec<_>>();
+    if characters.len() <= 6 {
+        return "*".repeat(characters.len());
+    }
+    let prefix = characters[..3].iter().collect::<String>();
+    let suffix = characters[characters.len() - 3..]
+        .iter()
+        .collect::<String>();
+    let masked = "*".repeat(characters.len() - 6);
+    format!("{prefix}{masked}{suffix}")
 }
 
 fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
