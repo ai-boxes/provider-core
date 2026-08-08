@@ -50,18 +50,6 @@ pub enum TimeRangeError {
     TooWide,
 }
 
-/// Which usage a number describes. The two answer different questions and must
-/// never be presented as one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AttributionBasis {
-    /// What the user's request consumed: the final attempt only. A retry that was
-    /// replaced is not something the user received.
-    UserFinalAttempt,
-    /// What this key caused upstream: every attempt that reached the provider,
-    /// retries included. This is the number that explains provider-side load.
-    KeyTriggeredConfirmedDispatch,
-}
-
 /// The scope of one query. Constructed per request, always with an owner.
 #[derive(Clone, Debug)]
 pub struct UsageScope {
@@ -73,25 +61,14 @@ pub struct UsageScope {
     /// Narrow the request list to the group captured on the request.
     pub group_label: Option<String>,
     pub range: TimeRange,
-    pub basis: AttributionBasis,
 }
 
 /// Token sums over a scope.
-///
-/// Only known numbers are summed. `attempts_with_unknown_input` says how many
-/// attempts contributed nothing to `effective_input` because the provider did not
-/// report it — the count that stops a sum from being read as complete.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TokenTotals {
-    pub uncached_input: u64,
     pub cache_read_input: u64,
-    pub cache_write_input: u64,
     pub effective_input: u64,
     pub output: u64,
-    pub reasoning: u64,
-    pub attempts_with_unknown_input: u64,
-    pub attempts_with_unknown_output: u64,
-    pub attempts_with_unknown_cache: u64,
 }
 
 /// Cache token totals over a scope.
@@ -104,34 +81,21 @@ pub struct TokenTotals {
 pub struct CacheTotals {
     pub reported_input_tokens: u64,
     pub cache_read_input_tokens: u64,
-    pub attempts_with_unknown_cache: u64,
 }
 
-/// Cost over a scope, split by how trustworthy each part is.
+/// Cost over attempts that were fully priced from the observed catalog.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CostTotals {
-    /// Sum over attempts whose estimate covered every observed component.
-    pub complete_atoms: UsdAtoms,
-    pub complete_attempts: u64,
-    pub partial_attempts: u64,
-    /// Attempts with no amount at all. Never rendered as `$0`.
-    pub unavailable_attempts: u64,
+    pub atoms: Option<UsdAtoms>,
 }
 
 /// Everything an overview shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageOverview {
-    /// When this snapshot was read. Explains concurrent differences; it is not a
-    /// token that can be replayed for a consistent historical read.
-    pub as_of_ms: i64,
     pub logical_requests: u64,
-    pub attempts: u64,
     pub tokens: TokenTotals,
     pub cache: CacheTotals,
     pub cost: CostTotals,
-    /// Known bookkeeping losses overlapping the range. Their facts are missing
-    /// from every number above, and saying so is the only honest option.
-    pub tracking_gaps: u64,
 }
 
 /// One row of the request list.
@@ -216,13 +180,13 @@ pub trait UsageQuery: Send + Sync {
         limit: u32,
     ) -> Result<RequestPage, UsageRepositoryError>;
 
-    /// One request's attempts, or `None` when it does not exist *for this owner* —
-    /// the two are deliberately indistinguishable to the caller.
-    async fn request_attempts(
+    /// One request's final attempt, or `None` when it does not exist for this
+    /// owner. The two are deliberately indistinguishable to the caller.
+    async fn request_attempt(
         &self,
         scope: &UsageScope,
         request_id: &str,
-    ) -> Result<Option<Vec<crate::repository::AttemptFacts>>, UsageRepositoryError>;
+    ) -> Result<Option<crate::repository::AttemptFacts>, UsageRepositoryError>;
 }
 
 /// Recombine a cost sum that SQL had to split to stay exact.

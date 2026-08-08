@@ -359,6 +359,7 @@ async fn require_access(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserCredentialsRequest {
     username: String,
     password: String,
@@ -373,16 +374,19 @@ struct RegisterUserRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateUserRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResetUserPasswordRequest {
     password: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RefreshRequest {
     refresh_token: String,
 }
@@ -727,6 +731,29 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn auth_request_bodies_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<UserCredentialsRequest>(
+                r#"{"username":"user","password":"secret","extra":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<UpdateUserRequest>(r#"{"enabled":true,"extra":true}"#,).is_err()
+        );
+        assert!(
+            serde_json::from_str::<ResetUserPasswordRequest>(
+                r#"{"password":"secret","extra":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<RefreshRequest>(r#"{"refresh_token":"token","extra":true}"#,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn auth_rate_limits_isolate_ips_and_prune_old_windows() {

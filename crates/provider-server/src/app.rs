@@ -139,10 +139,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             quota_writer.clone(),
             spend_observer,
         )),
-        query: usage_repository.clone(),
-        repository: usage_repository,
-        catalog: prices.clone(),
-        writer: writer.clone(),
+        query: usage_repository,
     };
 
     let manager = ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices);

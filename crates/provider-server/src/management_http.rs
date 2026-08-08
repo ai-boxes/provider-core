@@ -503,11 +503,13 @@ struct UpdateAccountRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetEnabledRequest {
     enabled: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderHealthParams {
     from_ms: Option<i64>,
     to_ms: Option<i64>,
@@ -910,7 +912,21 @@ mod tests {
 
     use crate::router_with_management;
 
-    use super::{ModelPricingPatch, UpdateModelRequest, unix_timestamp, updated_pricing};
+    use super::{
+        ModelPricingPatch, ProviderHealthParams, SetEnabledRequest, UpdateModelRequest,
+        unix_timestamp, updated_pricing,
+    };
+
+    #[test]
+    fn management_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<SetEnabledRequest>(r#"{"enabled":true,"extra":true}"#,).is_err()
+        );
+        assert!(serde_json::from_str::<ProviderHealthParams>(
+            r#"{"from_ms":1,"to_ms":2,"extra":true}"#,
+        )
+        .is_err());
+    }
 
     #[test]
     fn model_update_pricing_request_is_strict_and_preserves_field_presence() {

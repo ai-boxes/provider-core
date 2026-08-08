@@ -747,9 +747,6 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let services = provider_server::UsageServices {
         tracking,
         query: deployment.usage.clone(),
-        repository: deployment.usage.clone(),
-        catalog: Arc::new(CatalogPrices::new()),
-        writer: deployment.writer.clone(),
     };
     let server_url = spawn(provider_server::router_with_management_and_usage(
         deployment.service.clone(),
@@ -777,15 +774,9 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     assert_eq!(status, StatusCode::OK);
     let overview = &body["data"];
     assert_eq!(overview["logical_requests"], 1);
-    assert_eq!(overview["attempts"], 1);
     assert_eq!(overview["tokens"]["effective_input"], 120);
     assert_eq!(overview["tokens"]["cache_read_input"], 100);
-    assert_eq!(overview["attribution_basis"], "user_final_attempt");
-    // No catalog in this deployment, so nothing is priced and nothing pretends to
-    // be zero: the amount is a separate, explicitly unavailable count.
-    assert_eq!(overview["cost"]["unavailable_attempts"], 1);
-    assert_eq!(overview["cost"]["complete_attempts"], 0);
-    assert_eq!(overview["tracking_gaps"], 0);
+    assert!(overview["cost"]["usd"].is_null());
 
     // A second user with no usage of their own sees nothing, not the admin's.
     let created_text = reqwest::Client::new()
@@ -812,7 +803,6 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         body["data"]["logical_requests"], 0,
         "another user's usage must be invisible"
     );
-    assert_eq!(body["data"]["attempts"], 0);
 
     // And the admin's own request is not readable by id either.
     let request_id = deployment
@@ -840,25 +830,12 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let attempt = &body["data"]["attempts"][0];
-    assert_eq!(attempt["dispatch_evidence"], "response_observed");
-    assert_eq!(attempt["provider"], "codex");
-    // The metric kinds travel to the client, so it can tell a zero from an absence.
-    assert_eq!(
-        attempt["tokens"]["effective_input"]["kind"],
-        "provider_reported"
-    );
-    assert_eq!(attempt["tokens"]["effective_input"]["value"], 120);
-    assert_eq!(
-        attempt["tokens"]["cache_write_input"]["kind"],
-        "not_applicable"
-    );
-    assert_eq!(attempt["cost"]["status"], "unavailable");
+    let attempt = &body["data"]["attempt"];
     assert!(
         attempt["cost"]["usd"].is_null(),
         "an unavailable cost is absent, never 0"
     );
-    assert_eq!(attempt["price"]["resolution"], "model_mapping_missing");
+    assert!(attempt["price"]["input_per_million_usd"].is_null());
 }
 
 #[tokio::test]
@@ -878,9 +855,6 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
             deployment.writer.clone(),
         )),
         query: deployment.usage.clone(),
-        repository: deployment.usage.clone(),
-        catalog: Arc::new(CatalogPrices::new()),
-        writer: deployment.writer.clone(),
     };
     let server_url = spawn(provider_server::router_with_management_and_usage(
         deployment.service.clone(),
@@ -933,8 +907,12 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty range is refused");
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/overview?basis=whatever").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/overview?unknown=1").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown fields are refused"
+    );
 
     let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/series?bucket=fortnight").await;
     assert_eq!(
@@ -955,10 +933,10 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
     let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?cursor=garbage").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // Health reports the catalog as inactive rather than omitting the question.
-    let (status, body) = get_usage(&server_url, &token, "/api/v1/usage/health").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["catalog"]["pricing_active"], false);
-    assert!(body["data"]["catalog"]["revision"].is_null());
-    assert_eq!(body["data"]["writer"]["unrecorded_facts"], 0);
+    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/health").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "removed usage APIs stay removed"
+    );
 }
