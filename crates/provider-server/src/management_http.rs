@@ -564,6 +564,7 @@ struct UpdateModelPricingRequest {
     reasoning: Value,
     input_audio: Value,
     output_audio: Value,
+    tiers: Vec<UpdateModelPricingTierRequest>,
 }
 
 impl UpdateModelPricingRequest {
@@ -576,7 +577,39 @@ impl UpdateModelPricingRequest {
             reasoning: nullable_price(self.reasoning)?,
             input_audio: nullable_price(self.input_audio)?,
             output_audio: nullable_price(self.output_audio)?,
-            tiers: Vec::new(),
+            tiers: self
+                .tiers
+                .into_iter()
+                .map(UpdateModelPricingTierRequest::into_model_pricing_tier)
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateModelPricingTierRequest {
+    threshold_tokens: u64,
+    input: Value,
+    output: Value,
+    cache_read: Value,
+    cache_write: Value,
+    reasoning: Value,
+    input_audio: Value,
+    output_audio: Value,
+}
+
+impl UpdateModelPricingTierRequest {
+    fn into_model_pricing_tier(self) -> Option<provider_core::ProviderModelPricingTier> {
+        Some(provider_core::ProviderModelPricingTier {
+            threshold_tokens: self.threshold_tokens,
+            input: nullable_price(self.input)?,
+            output: nullable_price(self.output)?,
+            cache_read: nullable_price(self.cache_read)?,
+            cache_write: nullable_price(self.cache_write)?,
+            reasoning: nullable_price(self.reasoning)?,
+            input_audio: nullable_price(self.input_audio)?,
+            output_audio: nullable_price(self.output_audio)?,
         })
     }
 }
@@ -613,7 +646,7 @@ fn updated_pricing(
             })?;
             let pricing = canonical_model_pricing(&pricing).ok_or_else(|| {
                 ApiError::invalid_request(
-                    "pricing must contain at least one plain non-negative decimal with at most 8 fractional digits",
+                    "pricing and tiers must contain valid plain non-negative decimals with strictly increasing thresholds",
                 )
             })?;
             Ok(Some(Some(pricing)))
@@ -690,9 +723,7 @@ fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiErro
 
 fn model_snapshot_json(snapshot: &ModelCatalogSnapshot) -> Value {
     json!({
-        "source": snapshot.source,
-        "models": snapshot.models.iter().map(model_json).collect::<Vec<_>>(),
-        "warning": snapshot.warning
+        "models": snapshot.models.iter().map(model_json).collect::<Vec<_>>()
     })
 }
 
@@ -717,6 +748,7 @@ fn model_json(model: &StoredProviderModel) -> Value {
 fn oauth_session_json(session: &OAuthSessionSnapshot) -> Value {
     let status = match session.status {
         OAuthSessionStatus::Pending => "pending",
+        OAuthSessionStatus::Provisioning => "provisioning",
         OAuthSessionStatus::Completed => "completed",
         OAuthSessionStatus::Failed => "failed",
         OAuthSessionStatus::Cancelled => "cancelled",
@@ -889,14 +921,19 @@ mod tests {
         assert!(matches!(null.pricing, ModelPricingPatch::Null));
 
         let value: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
         )
         .expect("complete pricing object");
-        assert!(matches!(value.pricing, ModelPricingPatch::Value(_)));
+        let ModelPricingPatch::Value(value) = value.pricing else {
+            panic!("pricing value");
+        };
+        let pricing = value.into_model_pricing().expect("valid pricing fields");
+        assert_eq!(pricing.tiers.len(), 1);
+        assert_eq!(pricing.tiers[0].threshold_tokens, 200_000);
 
         assert!(
             serde_json::from_str::<UpdateModelRequest>(
-                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}}"#,
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"extra":true}]}}"#,
             )
             .is_err()
         );
@@ -1072,6 +1109,7 @@ mod tests {
         let upstream = Router::new()
             .route("/models", get(captured_models))
             .route("/codex/models", get(captured_models))
+            .route("/broken/models", get(|| async { StatusCode::BAD_GATEWAY }))
             .with_state(authorization.clone());
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1215,6 +1253,47 @@ mod tests {
             .await
             .expect("reject compatible credential document");
         assert_eq!(compatible_credential.status(), StatusCode::BAD_REQUEST);
+
+        let failed_discovery = client
+            .post(&endpoint)
+            .bearer_auth(&access_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "method": "direct",
+                    "provider": "openai_compatible",
+                    "label": "failed discovery",
+                    "group_label": "default",
+                    "base_url": format!("http://{upstream_address}/broken"),
+                    "api_key": "failed-discovery-key"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("fail account model discovery");
+        assert!(failed_discovery.status().is_server_error());
+        let accounts_after_failure = client
+            .get(&endpoint)
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list accounts after failed creation");
+        let accounts_after_failure: Value = serde_json::from_str(
+            &accounts_after_failure
+                .text()
+                .await
+                .expect("accounts after failed creation body"),
+        )
+        .expect("accounts after failed creation JSON");
+        assert!(
+            accounts_after_failure["data"]
+                .as_array()
+                .expect("provider accounts")
+                .iter()
+                .all(|account| account["label"] != "failed discovery"),
+            "a failed model discovery must not leave a provider account"
+        );
 
         let codex = client
             .post(&endpoint)

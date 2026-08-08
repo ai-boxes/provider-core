@@ -6,8 +6,6 @@ use thiserror::Error;
 
 pub const PASSWORD_MIN_CHARACTERS: usize = 6;
 pub const PASSWORD_MAX_BYTES: usize = 1024;
-pub const API_KEY_MIN_CHARACTERS: usize = 16;
-pub const API_KEY_MAX_BYTES: usize = 256;
 pub const ACCESS_TOKEN_TTL_SECONDS: i64 = 4 * 60 * 60;
 pub const REFRESH_TOKEN_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const ABSOLUTE_SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -72,23 +70,8 @@ pub fn rotate_session_tokens(
     session_tokens(now, absolute_expires_at)
 }
 
-pub fn issue_api_key(custom: Option<SecretString>) -> Result<IssuedSecret, CredentialError> {
-    match custom {
-        Some(secret) => {
-            let value = secret.expose_secret();
-            if value.chars().count() < API_KEY_MIN_CHARACTERS {
-                return Err(CredentialError::ApiKeyTooShort);
-            }
-            if value.len() > API_KEY_MAX_BYTES {
-                return Err(CredentialError::ApiKeyTooLong);
-            }
-            Ok(IssuedSecret {
-                digest: digest_secret(value),
-                secret,
-            })
-        }
-        None => random_secret(),
-    }
+pub fn issue_api_key() -> Result<IssuedSecret, CredentialError> {
+    random_secret()
 }
 
 pub fn issue_registration_code() -> Result<IssuedSecret, CredentialError> {
@@ -140,10 +123,6 @@ pub enum CredentialError {
     PasswordTooShort,
     #[error("password must not exceed 1024 bytes")]
     PasswordTooLong,
-    #[error("API key must contain at least 16 characters")]
-    ApiKeyTooShort,
-    #[error("API key must not exceed 256 bytes")]
-    ApiKeyTooLong,
     #[error("secure random source is unavailable")]
     RandomSource,
     #[error("failed to process password hash")]
@@ -189,15 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_custom_api_key_and_generates_random_key() {
-        let custom_value = "custom-key-12345";
-        let custom =
-            issue_api_key(Some(SecretString::from(custom_value.to_owned()))).expect("custom key");
-        let generated = issue_api_key(None).expect("generated key");
+    fn generates_random_api_key() {
+        let generated = issue_api_key().expect("generated key");
 
-        assert_eq!(custom.digest, digest_secret(custom_value));
         assert_eq!(generated.secret.expose_secret().len(), 43);
-        assert_ne!(custom.digest, generated.digest);
+        assert_eq!(
+            generated.digest,
+            digest_secret(generated.secret.expose_secret())
+        );
     }
 
     #[test]

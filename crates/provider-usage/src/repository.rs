@@ -119,6 +119,18 @@ pub struct AttemptFacts {
     pub cost: ObservedCatalogCost,
 }
 
+/// One authoritative logical-request quota result. `cost_atoms = Some` means
+/// every dispatched attempt was completely priced and contains their total
+/// (zero is valid); `None` means at least one dispatched attempt is unknowable
+/// and the key must stop claiming a reliable remaining quota.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaLedgerEntry {
+    pub entry_id: String,
+    pub api_key_id: String,
+    pub cost_atoms: Option<String>,
+    pub recorded_at_ms: i64,
+}
+
 /// The stored models.dev catalog. Exactly one is kept; an absent row means the
 /// vendored seed is in effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +167,13 @@ pub trait UsageRepository: Send + Sync {
     /// *different* attempt claiming an already-used sequence is an error,
     /// because that would silently duplicate upstream usage.
     async fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), UsageRepositoryError>;
+
+    /// Persist a logical request's quota result idempotently and update the API
+    /// key's cumulative ledger in the same transaction.
+    async fn record_quota_ledger_entry(
+        &self,
+        entry: &QuotaLedgerEntry,
+    ) -> Result<(), UsageRepositoryError>;
 
     /// Add `count` lost facts to a bucket, creating it if needed. Counting rather
     /// than inserting per loss is what keeps a saturated writer from turning
@@ -194,7 +213,7 @@ pub trait UsageRepository: Send + Sync {
         batch: u32,
     ) -> Result<u64, UsageRepositoryError>;
 
-    /// Delete up to `batch` tracking-gap buckets that started before `cutoff_ms`.
+    /// Delete up to `batch` tracking-gap buckets that end at or before `cutoff_ms`.
     async fn delete_tracking_gaps_before(
         &self,
         cutoff_ms: i64,

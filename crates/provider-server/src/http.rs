@@ -48,7 +48,9 @@ pub fn router_with_usage(
     usage: Option<Arc<UsageTracking>>,
 ) -> Router {
     Router::new()
-        .route("/healthz", get(health))
+        .route("/healthz", get(liveness))
+        .route("/livez", get(liveness))
+        .route("/readyz", get(readiness))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
@@ -66,7 +68,7 @@ pub fn router_with_management(
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
 ) -> Router {
-    router_with_management_and_usage(service, manager, auth, api_keys, None)
+    router_with_management_and_usage(service, manager, auth, api_keys, None, None)
 }
 
 pub fn router_with_management_and_usage(
@@ -75,9 +77,14 @@ pub fn router_with_management_and_usage(
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
     usage: Option<crate::usage_http::UsageServices>,
+    trusted_proxy_ip: Option<std::net::IpAddr>,
 ) -> Router {
-    let auth_state =
-        crate::auth_http::AuthHttpState::new(auth.clone(), api_keys.clone(), manager.clone());
+    let auth_state = crate::auth_http::AuthHttpState::new(
+        auth.clone(),
+        api_keys.clone(),
+        manager.clone(),
+        trusted_proxy_ip,
+    );
     let mut management = crate::management_http::router(manager, usage.clone());
     if let Some(usage) = &usage {
         // Behind the same session guard as the rest of management: usage is read
@@ -90,8 +97,30 @@ pub fn router_with_management_and_usage(
         .merge(management)
 }
 
-async fn health() -> Json<Value> {
+async fn liveness() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let database_ready = state.api_keys.quota_ledger_ready().await.is_ok();
+    let writer_ready = state
+        .usage
+        .as_ref()
+        .is_none_or(|usage| usage.quota_ledger_ready());
+    let ready = database_ready && writer_ready;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "database": database_ready,
+            "quota_ledger": writer_ready
+        })),
+    )
+        .into_response()
 }
 
 async fn models(
@@ -261,6 +290,12 @@ async fn proxy_prepared_stream(
             return Err(error);
         }
     };
+    if let Some(logical) = logical.as_ref()
+        && logical.reserve_quota().await.is_err()
+    {
+        finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+        return Err(HttpError::internal(protocol));
+    }
     let account_ids = match load_key_account_filter(&state.api_keys, key, protocol).await {
         Ok(account_ids) => account_ids,
         Err(error) => {
@@ -439,20 +474,40 @@ fn observe_delivery(
                     // The body error is terminal to the downstream. Drop the
                     // usage observer now so the attempt closes before logical.
                     drop(state.inner.take());
-                    if let Some(logical) = state.logical.as_ref() {
+                    let receipt = if let Some(logical) = state.logical.as_ref() {
                         logical.record_execution(ExecutionOutcome::TranslatorOrStreamError);
                         logical.record_delivery(if state.sent_bytes {
                             DeliveryOutcome::ErrorAfterBytes
                         } else {
                             DeliveryOutcome::ErrorBeforeBytes
                         });
-                        logical.finish();
+                        logical.finish()
+                    } else {
+                        None
+                    };
+                    if let Some(receipt) = receipt {
+                        let _ = receipt.persisted().await;
                     }
                     Some((Err(error), state))
                 }
                 None => {
-                    if let Some(logical) = state.logical.as_ref() {
+                    drop(state.inner.take());
+                    let receipt = if let Some(logical) = state.logical.as_ref() {
                         logical.record_delivery(DeliveryOutcome::CleanEof);
+                        logical.finish()
+                    } else {
+                        None
+                    };
+                    if let Some(receipt) = receipt
+                        && !receipt.persisted().await
+                    {
+                        return Some((
+                            Err(ProviderError::new(
+                                ProviderErrorKind::Internal,
+                                "quota ledger stopped before persisting request",
+                            )),
+                            state,
+                        ));
                     }
                     None
                 }
@@ -689,10 +744,6 @@ async fn ensure_key_quota(
         Err(AuthError::QuotaExceeded) => Err(HttpError::rate_limited(
             protocol,
             "API key USD quota has been exhausted",
-        )),
-        Err(AuthError::QuotaInFlight) => Err(HttpError::rate_limited(
-            protocol,
-            "API key already has a request in flight",
         )),
         Err(_) => Err(HttpError::internal(protocol)),
     }
@@ -946,7 +997,6 @@ mod tests {
                 &grant.user.id,
                 "default".to_owned(),
                 "test".to_owned(),
-                Some(SecretString::from("test-api-key-123".to_owned())),
                 None,
                 None,
                 now,

@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -34,7 +34,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     attempt::TrackingGapReason,
-    repository::{AttemptFacts, LogicalRequestTerminal, LogicalWriteOutcome, UsageRepository},
+    repository::{
+        AttemptFacts, LogicalRequestTerminal, LogicalWriteOutcome, QuotaLedgerEntry,
+        UsageRepository,
+    },
 };
 
 /// How many pending writes the queue holds before shedding.
@@ -42,6 +45,7 @@ use crate::{
 /// Sized so a burst of terminals rides through while a stalled database still
 /// costs bounded memory.
 pub const DEFAULT_WRITE_QUEUE: usize = 1024;
+pub const DEFAULT_QUOTA_QUEUE: usize = 1024;
 
 /// Tracking gaps are counted per minute, so a saturated writer records a count
 /// rather than one row per lost fact.
@@ -89,6 +93,125 @@ enum Job {
 pub struct UsageWriter {
     sender: mpsc::Sender<Job>,
     shed: Arc<ShedGaps>,
+}
+
+enum QuotaJob {
+    Entry(QuotaLedgerEntry, oneshot::Sender<()>),
+    Flush(oneshot::Sender<()>),
+}
+
+/// An unsheddable writer for the authoritative quota ledger. It retries the
+/// current entry until SQLite accepts it, exposes failures to readiness, and
+/// drains without a timeout during shutdown.
+pub struct QuotaLedgerWriter {
+    sender: mpsc::Sender<QuotaJob>,
+    healthy: Arc<AtomicBool>,
+    pending: Arc<AtomicU64>,
+}
+
+pub struct QuotaLedgerPermit {
+    permit: mpsc::OwnedPermit<QuotaJob>,
+    pending: Arc<AtomicU64>,
+}
+
+pub struct QuotaLedgerReceipt(oneshot::Receiver<()>);
+
+impl QuotaLedgerReceipt {
+    pub async fn persisted(self) -> bool {
+        self.0.await.is_ok()
+    }
+}
+
+impl QuotaLedgerPermit {
+    pub fn submit(self, entry: QuotaLedgerEntry) -> QuotaLedgerReceipt {
+        let (ack, acked) = oneshot::channel();
+        self.pending.fetch_add(1, Ordering::Release);
+        self.permit.send(QuotaJob::Entry(entry, ack));
+        QuotaLedgerReceipt(acked)
+    }
+}
+
+impl QuotaLedgerWriter {
+    #[must_use]
+    pub fn spawn(repository: Arc<dyn UsageRepository>, capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let pending = Arc::new(AtomicU64::new(0));
+        tokio::spawn(run_quota_ledger(
+            receiver,
+            repository,
+            Arc::clone(&healthy),
+            Arc::clone(&pending),
+        ));
+        Self {
+            sender,
+            healthy,
+            pending,
+        }
+    }
+
+    pub async fn reserve(&self) -> Option<QuotaLedgerPermit> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.sender.clone().reserve_owned().await {
+            Ok(permit) if self.healthy.load(Ordering::Acquire) => Some(QuotaLedgerPermit {
+                permit,
+                pending: Arc::clone(&self.pending),
+            }),
+            Ok(_) => None,
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        !self.sender.is_closed()
+            && self.healthy.load(Ordering::Acquire)
+            && self.sender.capacity() > 0
+    }
+
+    #[must_use]
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    pub async fn drain(&self) -> bool {
+        let (ack, acked) = oneshot::channel();
+        self.sender.send(QuotaJob::Flush(ack)).await.is_ok() && acked.await.is_ok()
+    }
+}
+
+async fn run_quota_ledger(
+    mut receiver: mpsc::Receiver<QuotaJob>,
+    repository: Arc<dyn UsageRepository>,
+    healthy: Arc<AtomicBool>,
+    pending: Arc<AtomicU64>,
+) {
+    while let Some(job) = receiver.recv().await {
+        match job {
+            QuotaJob::Entry(entry, ack) => loop {
+                match repository.record_quota_ledger_entry(&entry).await {
+                    Ok(()) => {
+                        healthy.store(true, Ordering::Release);
+                        pending.fetch_sub(1, Ordering::Release);
+                        let _ = ack.send(());
+                        break;
+                    }
+                    Err(_) => {
+                        healthy.store(false, Ordering::Release);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            },
+            QuotaJob::Flush(ack) => {
+                let _ = ack.send(());
+            }
+        }
+    }
 }
 
 impl UsageWriter {
@@ -285,6 +408,79 @@ mod tests {
 
     const AT_MS: i64 = 1_700_000_090_123;
     const BUCKET_MS: i64 = 1_700_000_040_000;
+
+    fn quota_entry(id: &str) -> QuotaLedgerEntry {
+        QuotaLedgerEntry {
+            entry_id: id.to_owned(),
+            api_key_id: "key-1".to_owned(),
+            cost_atoms: Some("1".to_owned()),
+            recorded_at_ms: AT_MS,
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_writer_applies_bounded_fail_closed_backpressure() {
+        let repository = Arc::new(TestRepository {
+            fail_facts: true,
+            ..TestRepository::default()
+        });
+        let writer = QuotaLedgerWriter::spawn(repository, 1);
+        writer
+            .reserve()
+            .await
+            .expect("first quota permit")
+            .submit(quota_entry("req-1"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writer.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer reports repository failure");
+        assert!(writer.reserve().await.is_none());
+        assert!(!writer.is_ready());
+        assert_eq!(writer.pending(), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_writer_receipt_confirms_persistence_and_drain() {
+        let repository = Arc::new(TestRepository::default());
+        let writer = QuotaLedgerWriter::spawn(repository.clone(), 1);
+        let receipt = writer
+            .reserve()
+            .await
+            .expect("quota permit")
+            .submit(quota_entry("req-success"));
+
+        assert!(receipt.persisted().await);
+        assert!(writer.drain().await);
+        assert!(writer.is_ready());
+        assert_eq!(writer.pending(), 0);
+        assert_eq!(repository.quota_entries(), vec![quota_entry("req-success")]);
+    }
+
+    #[tokio::test]
+    async fn quota_writer_is_not_ready_when_worker_exits() {
+        let repository = Arc::new(TestRepository {
+            panic_quota: true,
+            ..TestRepository::default()
+        });
+        let writer = QuotaLedgerWriter::spawn(repository, 1);
+        let _receipt = writer
+            .reserve()
+            .await
+            .expect("quota permit")
+            .submit(quota_entry("req-panic"));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writer.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed worker channel must fail readiness");
+        assert!(!writer.is_ready());
+    }
 
     fn attempt_write(attempt_id: &str) -> UsageWrite {
         UsageWrite {

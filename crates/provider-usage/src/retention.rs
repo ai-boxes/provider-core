@@ -28,17 +28,11 @@ pub const DEFAULT_RETENTION_BATCH: u32 = 500;
 /// gain from checking more often than this.
 pub const DEFAULT_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60);
 
-/// Batches per cycle, so one run cannot occupy the database indefinitely. A
-/// backlog is simply picked up by the next cycle.
-const MAX_BATCHES_PER_CYCLE: u32 = 40;
-
 /// What one retention cycle removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetentionReport {
     pub logical_requests_deleted: u64,
     pub gap_buckets_deleted: u64,
-    /// The cycle stopped at its batch cap with work still pending.
-    pub stopped_early: bool,
 }
 
 pub struct RetentionWorker {
@@ -80,7 +74,7 @@ impl RetentionWorker {
         let cutoff = self.cutoff_ms();
         let mut report = RetentionReport::default();
 
-        for _ in 0..MAX_BATCHES_PER_CYCLE {
+        loop {
             match self
                 .repository
                 .delete_logical_requests_before(cutoff, self.batch)
@@ -96,16 +90,22 @@ impl RetentionWorker {
                 Err(_) => return report,
             }
         }
-        report.stopped_early = report.logical_requests_deleted
-            >= u64::from(self.batch) * u64::from(MAX_BATCHES_PER_CYCLE);
 
-        // Gap buckets are tiny but would otherwise accumulate forever.
-        if let Ok(deleted) = self
-            .repository
-            .delete_tracking_gaps_before(cutoff, self.batch)
-            .await
-        {
-            report.gap_buckets_deleted = deleted;
+        // Gap buckets use the same bounded statements and must also catch up.
+        loop {
+            match self
+                .repository
+                .delete_tracking_gaps_before(cutoff, self.batch)
+                .await
+            {
+                Ok(deleted) => {
+                    report.gap_buckets_deleted += deleted;
+                    if deleted < u64::from(self.batch) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
         report
     }
@@ -153,6 +153,35 @@ mod tests {
             *repository.expired_requests.lock().expect("lock"),
             vec![NOW - 29 * DAY, NOW - DAY],
             "anything still inside the window stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_cycle_drains_backlog_beyond_the_old_fixed_cap_in_small_batches() {
+        let repository = Arc::new(TestRepository::default());
+        *repository.expired_requests.lock().expect("lock") = vec![NOW - 60 * DAY; 20_501];
+        *repository.expired_gap_buckets.lock().expect("lock") = vec![NOW - 60 * DAY; 1_201];
+
+        let report = worker(repository.clone(), 500).run_once().await;
+
+        assert_eq!(report.logical_requests_deleted, 20_501);
+        assert_eq!(report.gap_buckets_deleted, 1_201);
+        assert!(repository.expired_requests.lock().expect("lock").is_empty());
+        assert!(
+            repository
+                .expired_gap_buckets
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
+        assert!(
+            repository
+                .retention_batches
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|batch| *batch == 500),
+            "every delete remains a bounded batch statement"
         );
     }
 }

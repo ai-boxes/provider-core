@@ -11,16 +11,19 @@ use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{InstanceGuard, SqliteAccountRepository};
 use provider_usage::{
-    CatalogPrices, CatalogRefresher, DEFAULT_REFRESH_PERIOD, DEFAULT_RETENTION,
-    DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, RetentionWorker, SpendObserver, UsageRepository,
-    UsageTracking, UsageWriter, system_clock_ms,
+    CatalogPrices, CatalogRefresher, DEFAULT_QUOTA_QUEUE, DEFAULT_REFRESH_PERIOD,
+    DEFAULT_RETENTION, DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, QuotaLedgerWriter,
+    RefreshOutcome, RetentionWorker, SpendObserver, UsageRepository, UsageTracking, UsageWriter,
+    system_clock_ms,
 };
 use tokio::net::TcpListener;
 
 use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
-    config::{CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address},
+    config::{
+        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address, trusted_proxy_ip,
+    },
     router_with_management_and_usage,
 };
 
@@ -59,22 +62,32 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
     let model_catalog = ModelCatalogService::with_pricing(repository.clone(), prices.clone());
     for account in repository.load_enabled_accounts().await? {
+        let account_id = account.id.clone();
         let kind = account.provider;
         let access = account.access();
-        let account = runtime.build_account(account)?;
-        let models = model_catalog
+        let account = match runtime.build_account(account) {
+            Ok(account) => account,
+            Err(error) => {
+                eprintln!("failed to build provider account {account_id}: {error}");
+                continue;
+            }
+        };
+        let models = match model_catalog
             .refresh(account.as_ref(), unix_timestamp())
-            .await?;
-        if let Some(warning) = models.warning.as_deref() {
-            eprintln!(
-                "provider model discovery used {:?} catalog for account {}: {warning}",
-                models.source,
-                account.account_id()
-            );
-        }
-        runtime
+            .await
+        {
+            Ok(models) => models,
+            Err(error) => {
+                eprintln!("failed to discover models for provider account {account_id}: {error}");
+                continue;
+            }
+        };
+        if let Err(error) = runtime
             .activate_account(kind, account, models.models, access)
-            .await?;
+            .await
+        {
+            eprintln!("failed to activate provider account {account_id}: {error}");
+        }
     }
 
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
@@ -94,20 +107,18 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         usage_repository.clone(),
         DEFAULT_WRITE_QUEUE,
     ));
+    let quota_writer = Arc::new(QuotaLedgerWriter::spawn(
+        usage_repository.clone(),
+        DEFAULT_QUOTA_QUEUE,
+    ));
     let spend_observer: SpendObserver = {
         let api_keys = api_keys.clone();
         Arc::new(move |api_key_id, atoms| {
             if let Ok(api_key_id) = ApiKeyId::new(api_key_id.to_owned()) {
-                api_keys.record_spend(&api_key_id, atoms);
+                api_keys.record_quota_result(&api_key_id, atoms);
             }
         })
     };
-    if catalog_sync_enabled() {
-        tokio::spawn(Arc::clone(&refresher).run(DEFAULT_REFRESH_PERIOD));
-    } else {
-        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
-    }
-
     // Raw facts expire on their own so the database does not grow without bound.
     // In-flight requests are never touched, and each cycle deletes in small
     // batches rather than one long transaction.
@@ -125,6 +136,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         tracking: Arc::new(UsageTracking::with_spend_observer(
             usage_repository.clone(),
             writer.clone(),
+            quota_writer.clone(),
             spend_observer,
         )),
         query: usage_repository.clone(),
@@ -134,20 +146,70 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let manager = ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices);
+    if catalog_sync_enabled() {
+        let refresher = Arc::clone(&refresher);
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
+            loop {
+                ticker.tick().await;
+                if refresher.refresh_once().await == RefreshOutcome::Installed
+                    && let Err(error) = manager
+                        .refresh_enabled_model_catalogs(unix_timestamp())
+                        .await
+                {
+                    eprintln!("failed to apply refreshed prices to routed models: {error}");
+                }
+            }
+        });
+    } else {
+        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
+    }
     let listen_address = listen_address();
     let listener = TcpListener::bind(&listen_address).await?;
 
     println!("provider-core listening on http://{listen_address}");
     let result = axum::serve(
         listener,
-        router_with_management_and_usage(service, manager, auth, api_keys, Some(usage)),
+        router_with_management_and_usage(
+            service,
+            manager,
+            auth,
+            api_keys,
+            Some(usage),
+            trusted_proxy_ip()?,
+        )
+        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await;
     runtime.shutdown();
+    if !quota_writer.drain().await {
+        return Err("quota ledger writer stopped before shutdown drain completed".into());
+    }
     // Best-effort: a slow database must not hold up shutdown.
     writer.drain(USAGE_DRAIN).await;
     result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must install");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("Ctrl-C handler must install");
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Ctrl-C handler must install");
 }
 
 fn unix_timestamp() -> i64 {

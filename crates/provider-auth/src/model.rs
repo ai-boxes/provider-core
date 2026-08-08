@@ -155,7 +155,7 @@ pub struct NewApiKey {
     pub owner_user_id: UserId,
     pub group_label: String,
     pub label: String,
-    pub key: SecretString,
+    pub key_digest: [u8; 32],
     pub enabled: bool,
     pub expires_at: Option<i64>,
     /// Lifetime USD ceiling as integer atoms (10^-14 USD). `None` is unlimited.
@@ -169,12 +169,14 @@ pub struct StoredApiKey {
     pub owner_user_id: UserId,
     pub group_label: String,
     pub label: String,
-    pub key: SecretString,
+    pub key_digest: [u8; 32],
     pub enabled: bool,
     pub expires_at: Option<i64>,
     pub quota_limit_atoms: Option<String>,
-    /// Cumulative known catalog cost atoms for this key.
+    /// Cumulative fully-accounted catalog cost atoms for this key.
     pub spent_atoms: String,
+    /// False after any dispatched attempt could not be priced completely.
+    pub quota_accounting_ready: bool,
     pub last_used_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -186,11 +188,11 @@ pub struct ApiKeySummary {
     pub owner_user_id: UserId,
     pub group_label: String,
     pub label: String,
-    pub key: String,
     pub enabled: bool,
     pub expires_at: Option<i64>,
     pub quota_limit_atoms: Option<String>,
     pub spent_atoms: String,
+    pub quota_accounting_ready: bool,
     pub last_used_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,

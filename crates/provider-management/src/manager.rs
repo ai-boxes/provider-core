@@ -50,6 +50,7 @@ pub struct ProviderCredentialReplacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OAuthSessionStatus {
     Pending,
+    Provisioning,
     Completed,
     Failed,
     Cancelled,
@@ -234,22 +235,27 @@ impl ProviderManager {
         let task_session_id = session_id.clone();
         let handle = tokio::spawn(async move {
             let result = match started.pending.complete().await {
-                Ok(credential_json) => manager
-                    .create_account(
-                        &owner_user_id,
-                        kind,
-                        AccountProvisioningInput::CredentialJson {
-                            id: account_id,
-                            label,
-                            group_label,
-                            credential_json,
-                        },
-                        visibility,
-                        unix_timestamp(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
+                Ok(credential_json) => {
+                    if !manager.begin_oauth_provisioning(&task_session_id) {
+                        return;
+                    }
+                    manager
+                        .create_account(
+                            &owner_user_id,
+                            kind,
+                            AccountProvisioningInput::CredentialJson {
+                                id: account_id,
+                                label,
+                                group_label,
+                                credential_json,
+                            },
+                            visibility,
+                            unix_timestamp(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
                 Err(error) => Err(error.to_string()),
             };
             manager.finish_oauth_session(&task_session_id, result);
@@ -285,13 +291,7 @@ impl ProviderManager {
         if entry.snapshot.owner_user_id != actor_user_id {
             return None;
         }
-        if entry.snapshot.status == OAuthSessionStatus::Pending {
-            if let Some(abort) = entry.abort.take() {
-                abort.abort();
-            }
-            entry.snapshot.status = OAuthSessionStatus::Cancelled;
-            entry.snapshot.error = None;
-        }
+        cancel_pending_oauth(entry);
         Some(entry.snapshot.clone())
     }
 
@@ -378,21 +378,33 @@ impl ProviderManager {
                 return Err(ProviderManagerError::Conflict);
             }
         }
-        let stored = self.load_account(&account.id).await?;
-        let runtime_account = self.control.build_account(stored.clone())?;
-        let models = self.models.refresh(runtime_account.as_ref(), now).await?;
-        self.control
-            .activate_account(
-                stored.provider,
-                runtime_account,
-                models.models.clone(),
-                stored.access(),
-            )
-            .await?;
-        Ok(CreatedProviderAccount {
-            account: account_summary(&stored),
-            models,
-        })
+        let account_id = account.id.clone();
+        let provisioned: Result<_, ProviderManagerError> = async {
+            let stored = self.load_account(&account_id).await?;
+            let runtime_account = self.control.build_account(stored.clone())?;
+            let models = self.models.refresh(runtime_account.as_ref(), now).await?;
+            self.control
+                .activate_account(
+                    stored.provider,
+                    runtime_account,
+                    models.models.clone(),
+                    stored.access(),
+                )
+                .await?;
+            Ok(CreatedProviderAccount {
+                account: account_summary(&stored),
+                models,
+            })
+        }
+        .await;
+        match provisioned {
+            Ok(created) => Ok(created),
+            Err(error) => {
+                self.control.remove_account(&account_id).await;
+                self.repository.delete_provider_account(&account_id).await?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn update_account(
@@ -588,6 +600,42 @@ impl ProviderManager {
                 .await?;
         }
         Ok(models)
+    }
+
+    /// Re-discover every enabled account after the shared price catalog changes.
+    /// The repository synchronization updates catalog-sourced prices and the
+    /// activation replaces the routing snapshot before the cycle completes.
+    pub async fn refresh_enabled_model_catalogs(
+        &self,
+        now: i64,
+    ) -> Result<(), ProviderManagerError> {
+        let mut first_error = None;
+        for stored in self.repository.load_enabled_accounts().await? {
+            let result = async {
+                let account_id = stored.id.clone();
+                let gate = self.account_gate(&account_id);
+                let _guard = gate.lock().await;
+                let stored = self.load_account(&account_id).await?;
+                if !stored.enabled {
+                    return Ok(());
+                }
+                let kind = stored.provider;
+                let access = stored.access();
+                let account = self.control.build_account(stored)?;
+                let models = self.models.refresh(account.as_ref(), now).await?;
+                self.control
+                    .activate_account(kind, account, models.models, access)
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn update_model(
@@ -877,7 +925,9 @@ impl ProviderManager {
         let Some(entry) = sessions.get_mut(session_id) else {
             return;
         };
-        if entry.snapshot.status != OAuthSessionStatus::Pending {
+        if entry.snapshot.status != OAuthSessionStatus::Pending
+            && entry.snapshot.status != OAuthSessionStatus::Provisioning
+        {
             return;
         }
         entry.abort = None;
@@ -893,11 +943,40 @@ impl ProviderManager {
         }
     }
 
+    fn begin_oauth_provisioning(&self, session_id: &str) -> bool {
+        let mut sessions = self.oauth_sessions();
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        begin_oauth_provisioning_entry(entry)
+    }
+
     fn oauth_sessions(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, OAuthSessionEntry>> {
         self.oauth_sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn begin_oauth_provisioning_entry(entry: &mut OAuthSessionEntry) -> bool {
+    if entry.snapshot.status != OAuthSessionStatus::Pending {
+        return false;
+    }
+    entry.abort = None;
+    entry.snapshot.status = OAuthSessionStatus::Provisioning;
+    true
+}
+
+fn cancel_pending_oauth(entry: &mut OAuthSessionEntry) -> bool {
+    if entry.snapshot.status != OAuthSessionStatus::Pending {
+        return false;
+    }
+    if let Some(abort) = entry.abort.take() {
+        abort.abort();
+    }
+    entry.snapshot.status = OAuthSessionStatus::Cancelled;
+    entry.snapshot.error = None;
+    true
 }
 
 fn generated_account_id() -> AccountId {
@@ -1048,6 +1127,36 @@ mod tests {
         ProviderQuotaSnapshot, QuotaAmount, QuotaGroup, QuotaGroupScope, QuotaMetric,
         QuotaMetricKind, QuotaUnit,
     };
+
+    #[test]
+    fn oauth_provisioning_cannot_be_cancelled() {
+        let mut entry = OAuthSessionEntry {
+            snapshot: OAuthSessionSnapshot {
+                id: "session".to_owned(),
+                owner_user_id: "owner".to_owned(),
+                visibility: ProviderVisibility::Private,
+                provider: ProviderKind::Grok,
+                account_id: AccountId::new("account").expect("account ID"),
+                label: "Grok".to_owned(),
+                group_label: "default".to_owned(),
+                status: OAuthSessionStatus::Pending,
+                challenge: ProviderOAuthChallenge {
+                    verification_uri: "https://example.com/device".to_owned(),
+                    verification_uri_complete: None,
+                    user_code: "CODE".to_owned(),
+                    expires_at: 1,
+                    interval_seconds: 1,
+                },
+                error: None,
+            },
+            abort: None,
+        };
+
+        assert!(begin_oauth_provisioning_entry(&mut entry));
+        assert_eq!(entry.snapshot.status, OAuthSessionStatus::Provisioning);
+        assert!(!cancel_pending_oauth(&mut entry));
+        assert_eq!(entry.snapshot.status, OAuthSessionStatus::Provisioning);
+    }
 
     #[test]
     fn observation_updates_snapshot_without_changing_full_fetch_state() {

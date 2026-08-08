@@ -90,6 +90,8 @@ pub struct TokenTotals {
     pub output: u64,
     pub reasoning: u64,
     pub attempts_with_unknown_input: u64,
+    pub attempts_with_unknown_output: u64,
+    pub attempts_with_unknown_cache: u64,
 }
 
 /// Cache token totals over a scope.

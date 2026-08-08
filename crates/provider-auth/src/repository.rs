@@ -72,7 +72,7 @@ pub trait AuthRepository: Send + Sync {
         updated_at: i64,
     ) -> Result<bool, AuthRepositoryError>;
 
-    async fn update_user_password(
+    async fn reset_user_password(
         &self,
         user_id: &UserId,
         password_hash: String,
@@ -106,12 +106,6 @@ pub trait AuthRepository: Send + Sync {
         session_id: &SessionId,
         revoked_at: i64,
     ) -> Result<bool, AuthRepositoryError>;
-
-    async fn revoke_user_sessions(
-        &self,
-        user_id: &UserId,
-        revoked_at: i64,
-    ) -> Result<u64, AuthRepositoryError>;
 
     async fn create_api_key(&self, key: NewApiKey) -> Result<bool, AuthRepositoryError>;
 
@@ -157,7 +151,9 @@ pub trait AuthRepository: Send + Sync {
     async fn load_api_key_spent_atoms(
         &self,
         api_key_id: &ApiKeyId,
-    ) -> Result<Option<String>, AuthRepositoryError>;
+    ) -> Result<Option<(String, bool)>, AuthRepositoryError>;
+
+    async fn quota_ledger_ready(&self) -> Result<(), AuthRepositoryError>;
 }
 
 #[derive(Debug, Error)]

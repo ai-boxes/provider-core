@@ -50,8 +50,8 @@ pub use refresh::{
     MODELS_DEV_URL, RefreshOutcome, content_revision, reason,
 };
 pub use repository::{
-    AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome, StoredCatalog,
-    StoredLogicalRequest, UsageRepository, UsageRepositoryError,
+    AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
+    QuotaLedgerEntry, StoredCatalog, StoredLogicalRequest, UsageRepository, UsageRepositoryError,
 };
 pub use retention::{
     DEFAULT_RETENTION, DEFAULT_RETENTION_BATCH, DEFAULT_RETENTION_PERIOD, RetentionReport,
@@ -62,6 +62,6 @@ pub use tracking::{
     system_clock_ms,
 };
 pub use writer::{
-    DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, SubmitOutcome, UsageFact, UsageWrite, UsageWriter,
-    gap_bucket,
+    DEFAULT_QUOTA_QUEUE, DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, QuotaLedgerPermit, QuotaLedgerReceipt,
+    QuotaLedgerWriter, SubmitOutcome, UsageFact, UsageWrite, UsageWriter, gap_bucket,
 };

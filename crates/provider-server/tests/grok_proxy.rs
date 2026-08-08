@@ -136,7 +136,6 @@ async fn proxies_codex_and_claude_through_mock_grok() {
             &grant.user.id,
             "default".to_owned(),
             "test".to_owned(),
-            Some(SecretString::from("test-api-key-123".to_owned())),
             None,
             None,
             now,

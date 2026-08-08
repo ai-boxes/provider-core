@@ -1,8 +1,13 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, PoisonError},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Request, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Extension, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     middleware,
     middleware::Next,
@@ -11,8 +16,7 @@ use axum::{
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
-    CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant, StoredApiKey, UserId,
-    UserSummary,
+    CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant, UserId, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
@@ -24,6 +28,7 @@ pub(crate) struct AuthHttpState {
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
     manager: ProviderManager,
+    rate_limits: Arc<AuthRateLimits>,
 }
 
 impl AuthHttpState {
@@ -32,11 +37,16 @@ impl AuthHttpState {
         auth: AuthService,
         api_keys: ApiKeyAuthenticator,
         manager: ProviderManager,
+        trusted_proxy_ip: Option<IpAddr>,
     ) -> Self {
         Self {
             auth,
             api_keys,
             manager,
+            rate_limits: Arc::new(AuthRateLimits {
+                trusted_proxy_ip,
+                ..AuthRateLimits::default()
+            }),
         }
     }
 
@@ -55,21 +65,36 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/users/{user_id}", put(update_user))
         .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
-        .route("/api/v1/keys/generate", post(generate_key))
-        .route(
-            "/api/v1/keys/{key_id}",
-            get(get_key).put(update_key).delete(delete_key),
-        )
+        .route("/api/v1/keys/{key_id}", put(update_key).delete(delete_key))
         .route_layer(middleware::from_fn_with_state(
             state.auth_service(),
             require_access,
         ));
 
+    let login_route = Router::new()
+        .route("/api/v1/auth/login", post(login))
+        .route_layer(middleware::from_fn_with_state(
+            AuthRateLimitState {
+                limits: Arc::clone(&state.rate_limits),
+                route: AuthRoute::Login,
+            },
+            require_auth_rate,
+        ));
+    let register_route = Router::new()
+        .route("/api/v1/auth/register", post(register_user))
+        .route_layer(middleware::from_fn_with_state(
+            AuthRateLimitState {
+                limits: Arc::clone(&state.rate_limits),
+                route: AuthRoute::Register,
+            },
+            require_auth_rate,
+        ));
+
     Router::new()
         .route("/api/v1/auth/setup", get(setup_required).post(setup))
-        .route("/api/v1/auth/login", post(login))
-        .route("/api/v1/auth/register", post(register_user))
         .route("/api/v1/auth/refresh", post(refresh))
+        .merge(login_route)
+        .merge(register_route)
         .merge(protected)
         .with_state(state)
 }
@@ -219,6 +244,11 @@ async fn update_user(
             unix_timestamp(),
         )
         .await?;
+    if request.enabled {
+        state.api_keys.reload_owner(&user.id).await?;
+    } else {
+        state.api_keys.revoke_owner(&user.id);
+    }
     Ok(data(user_json(&user)))
 }
 
@@ -251,15 +281,6 @@ async fn list_keys(
     )))
 }
 
-async fn generate_key(
-    Extension(_session): Extension<AuthenticatedSession>,
-) -> Result<Json<Value>, AuthApiError> {
-    let key = provider_auth::issue_api_key(None).map_err(|_| AuthApiError::internal())?;
-    Ok(data(json!({
-        "key": key.secret.expose_secret()
-    })))
-}
-
 async fn create_key(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -272,25 +293,12 @@ async fn create_key(
             &session.user.id,
             request.group_label,
             request.label,
-            request.key.map(SecretString::from),
             request.expires_at,
             request.quota_limit_usd,
             unix_timestamp(),
         )
         .await?;
     Ok((StatusCode::CREATED, data(created_api_key_json(&key)?)))
-}
-
-async fn get_key(
-    State(state): State<AuthHttpState>,
-    Extension(session): Extension<AuthenticatedSession>,
-    Path(key_id): Path<String>,
-) -> Result<Json<Value>, AuthApiError> {
-    let key = state
-        .api_keys
-        .get(&session.user.id, &parse_api_key_id(&key_id)?)
-        .await?;
-    Ok(data(stored_api_key_json(&key)?))
 }
 
 async fn update_key(
@@ -379,12 +387,91 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum AuthRoute {
+    Login,
+    Register,
+}
+
+#[derive(Clone)]
+struct AuthRateLimitState {
+    limits: Arc<AuthRateLimits>,
+    route: AuthRoute,
+}
+
+async fn require_auth_rate(
+    State(state): State<AuthRateLimitState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthApiError> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0);
+    state.limits.check(state.route, peer, request.headers())?;
+    Ok(next.run(request).await)
+}
+
+#[derive(Default)]
+struct AuthRateLimits {
+    windows: Mutex<HashMap<(AuthRoute, IpAddr), (i64, u32)>>,
+    trusted_proxy_ip: Option<IpAddr>,
+}
+
+impl AuthRateLimits {
+    fn check(
+        &self,
+        route: AuthRoute,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> Result<(), AuthApiError> {
+        let ip = client_ip(peer, headers, self.trusted_proxy_ip);
+        let now = unix_timestamp();
+        let minute = now.div_euclid(60);
+        let limit = match route {
+            AuthRoute::Login => 10,
+            AuthRoute::Register => 5,
+        };
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        windows.retain(|_, (window, _)| *window >= minute);
+        let entry = windows.entry((route, ip)).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        if entry.1 >= limit {
+            return Err(AuthApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_type: "rate_limit_error",
+                message: "too many authentication attempts",
+            });
+        }
+        entry.1 += 1;
+        Ok(())
+    }
+}
+
+fn client_ip(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxy_ip: Option<IpAddr>,
+) -> IpAddr {
+    let peer_ip = peer.map(|peer| peer.ip());
+    if peer_ip == trusted_proxy_ip
+        && let Some(forwarded) = headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+    {
+        return forwarded;
+    }
+    peer_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateApiKeyRequest {
     label: String,
     group_label: String,
-    key: Option<String>,
     expires_at: Option<i64>,
     /// Positive USD decimal string, or omitted for unlimited.
     quota_limit_usd: Option<String>,
@@ -496,36 +583,11 @@ fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
         "owner_user_id": key.owner_user_id.as_str(),
         "group_label": key.group_label,
         "label": key.label,
-        "key": key.key,
         "enabled": key.enabled,
         "expires_at": key.expires_at,
         "quota_limit_usd": quota_limit_usd,
         "spent_usd": spent_usd,
-        "last_used_at": key.last_used_at,
-        "created_at": key.created_at,
-        "updated_at": key.updated_at
-    }))
-}
-
-fn stored_api_key_json(key: &StoredApiKey) -> Result<Value, AuthApiError> {
-    let quota_limit_usd = key
-        .quota_limit_atoms
-        .as_deref()
-        .map(provider_auth::format_usd_atoms)
-        .transpose()
-        .map_err(|()| AuthApiError::internal())?;
-    let spent_usd =
-        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
-    Ok(json!({
-        "id": key.id.as_str(),
-        "owner_user_id": key.owner_user_id.as_str(),
-        "group_label": key.group_label,
-        "label": key.label,
-        "key": key.key.expose_secret(),
-        "enabled": key.enabled,
-        "expires_at": key.expires_at,
-        "quota_limit_usd": quota_limit_usd,
-        "spent_usd": spent_usd,
+        "quota_accounting": if key.quota_accounting_ready { "ready" } else { "indeterminate" },
         "last_used_at": key.last_used_at,
         "created_at": key.created_at,
         "updated_at": key.updated_at
@@ -619,12 +681,10 @@ impl From<AuthError> for AuthApiError {
             | AuthError::InvalidQuotaLimit
             | AuthError::InvalidGroup
             | AuthError::Credential(CredentialError::PasswordTooShort)
-            | AuthError::Credential(CredentialError::PasswordTooLong)
-            | AuthError::Credential(CredentialError::ApiKeyTooShort)
-            | AuthError::Credential(CredentialError::ApiKeyTooLong) => {
+            | AuthError::Credential(CredentialError::PasswordTooLong) => {
                 Self::invalid_request("request validation failed")
             }
-            AuthError::QuotaExceeded | AuthError::QuotaInFlight => Self {
+            AuthError::QuotaExceeded => Self {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 error_type: "insufficient_quota",
                 message: "API key USD quota has been exhausted",
@@ -655,6 +715,7 @@ impl IntoResponse for AuthApiError {
 mod tests {
     use std::sync::Arc;
 
+    use provider_auth::AuthRepository;
     use provider_core::{
         AccountId, CredentialKind, NewCredential, NewProviderAccount, ProviderKind,
         ProviderManagementRepository, ProviderVisibility,
@@ -662,9 +723,71 @@ mod tests {
     use provider_management::ProviderManager;
     use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
+    use provider_usage::{QuotaLedgerEntry, UsageRepository};
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn auth_rate_limits_isolate_ips_and_prune_old_windows() {
+        let limits = AuthRateLimits::default();
+        let headers = HeaderMap::new();
+        let first = Some("198.51.100.10:1234".parse().expect("first peer"));
+        let second = Some("198.51.100.11:1234".parse().expect("second peer"));
+        for _ in 0..10 {
+            assert!(limits.check(AuthRoute::Login, first, &headers).is_ok());
+        }
+        assert!(limits.check(AuthRoute::Login, first, &headers).is_err());
+        assert!(limits.check(AuthRoute::Login, second, &headers).is_ok());
+
+        limits.windows.lock().expect("rate windows").insert(
+            (
+                AuthRoute::Register,
+                "203.0.113.9".parse().expect("stale IP"),
+            ),
+            (unix_timestamp().div_euclid(60) - 1, 1),
+        );
+        assert!(limits.check(AuthRoute::Register, second, &headers).is_ok());
+        assert_eq!(limits.windows.lock().expect("rate windows").len(), 3);
+    }
+
+    #[test]
+    fn forwarded_ip_is_only_trusted_from_internal_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.20".parse().expect("header"));
+        assert_eq!(
+            client_ip(
+                Some("127.0.0.1:80".parse().expect("proxy")),
+                &headers,
+                Some("172.20.0.3".parse().expect("trusted proxy")),
+            ),
+            "127.0.0.1".parse::<IpAddr>().expect("peer IP")
+        );
+        assert_eq!(
+            client_ip(
+                Some("172.20.0.3:80".parse().expect("compose proxy")),
+                &headers,
+                Some("172.20.0.3".parse().expect("trusted proxy")),
+            ),
+            "203.0.113.20".parse::<IpAddr>().expect("forwarded IP")
+        );
+        assert_eq!(
+            client_ip(
+                Some("172.20.0.4:80".parse().expect("other internal peer")),
+                &headers,
+                Some("172.20.0.3".parse().expect("trusted proxy")),
+            ),
+            "172.20.0.4".parse::<IpAddr>().expect("peer IP")
+        );
+        assert_eq!(
+            client_ip(
+                Some("198.51.100.30:80".parse().expect("direct peer")),
+                &headers,
+                Some("172.20.0.3".parse().expect("trusted proxy")),
+            ),
+            "198.51.100.30".parse::<IpAddr>().expect("peer IP")
+        );
+    }
 
     async fn seed_account_with_group(
         repository: Arc<SqliteAccountRepository>,
@@ -716,7 +839,7 @@ mod tests {
         let server = tokio::spawn(
             axum::serve(
                 listener,
-                router(AuthHttpState::new(auth, api_keys, manager)),
+                router(AuthHttpState::new(auth, api_keys.clone(), manager, None)),
             )
             .into_future(),
         );
@@ -760,51 +883,6 @@ mod tests {
             .expect("authenticated me");
         assert_eq!(me.status(), StatusCode::OK);
 
-        let unauthenticated_generation = post_json(
-            &client,
-            format!("{base_url}/api/v1/keys/generate"),
-            json!({}),
-            None,
-        )
-        .await;
-        assert_eq!(
-            unauthenticated_generation.status(),
-            StatusCode::UNAUTHORIZED
-        );
-
-        let generated_key = post_json(
-            &client,
-            format!("{base_url}/api/v1/keys/generate"),
-            json!({}),
-            Some(&access_token),
-        )
-        .await;
-        assert_eq!(generated_key.status(), StatusCode::OK);
-        let generated_key = response_json(generated_key).await;
-        let generated_key = generated_key["data"]["key"]
-            .as_str()
-            .expect("generated API key");
-        assert_eq!(generated_key.len(), 43);
-        assert!(
-            generated_key.chars().all(
-                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-            )
-        );
-        let keys_after_generation = client
-            .get(format!("{base_url}/api/v1/keys"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("list API keys after generation");
-        assert_eq!(keys_after_generation.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(keys_after_generation).await["data"]
-                .as_array()
-                .expect("API key list after generation")
-                .len(),
-            0
-        );
-
         let owner_id = setup_body["data"]["user"]["id"]
             .as_str()
             .expect("setup user ID")
@@ -816,13 +894,11 @@ mod tests {
             "shared-codex",
         )
         .await;
-        let custom_key = "custom-key-12345";
         let created_key = post_json(
             &client,
             format!("{base_url}/api/v1/keys"),
             json!({
                 "label": "local",
-                "key": custom_key,
                 "group_label": "shared-codex",
                 "quota_limit_usd": "12.5"
             }),
@@ -831,7 +907,17 @@ mod tests {
         .await;
         assert_eq!(created_key.status(), StatusCode::CREATED);
         let created_key = response_json(created_key).await;
-        assert_eq!(created_key["data"]["key"], custom_key);
+        let issued_key = response_secret(&created_key, "key");
+        assert_eq!(issued_key.len(), 43);
+        let authenticated = api_keys
+            .authenticate(&issued_key, unix_timestamp())
+            .expect("authenticate issued key");
+        let (first_admission, second_admission) = tokio::join!(
+            api_keys.acquire_quota(&authenticated),
+            api_keys.acquire_quota(&authenticated)
+        );
+        assert!(first_admission.is_ok());
+        assert!(second_admission.is_ok());
         assert_eq!(created_key["data"]["group_label"], "shared-codex");
         assert_eq!(created_key["data"]["quota_limit_usd"], "12.50000000000000");
         assert_eq!(created_key["data"]["spent_usd"], "0.00000000000000");
@@ -848,20 +934,27 @@ mod tests {
             .expect("list API keys");
         assert_eq!(listed_keys.status(), StatusCode::OK);
         let listed_keys = response_json(listed_keys).await;
-        assert_eq!(listed_keys["data"][0]["key"], "cus**********345");
-        assert!(!listed_keys.to_string().contains(custom_key));
+        assert!(listed_keys["data"][0].get("key").is_none());
+        assert!(!listed_keys.to_string().contains(&issued_key));
 
-        let retrieved_key = client
-            .get(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .send()
+        repository
+            .usage_repository()
+            .record_quota_ledger_entry(&QuotaLedgerEntry {
+                entry_id: "single-overage".to_owned(),
+                api_key_id: key_id.clone(),
+                cost_atoms: Some("1300000000000000".to_owned()),
+                recorded_at_ms: unix_timestamp() * 1000,
+            })
             .await
-            .expect("retrieve API key");
-        assert_eq!(retrieved_key.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(retrieved_key).await["data"]["key"],
-            custom_key
+            .expect("persist one request beyond quota");
+        api_keys.record_quota_result(
+            &ApiKeyId::new(key_id.clone()).expect("API key ID"),
+            Some(1_300_000_000_000_000),
         );
+        assert!(matches!(
+            api_keys.ensure_quota_available(&authenticated).await,
+            Err(AuthError::QuotaExceeded)
+        ));
 
         let registration_code = client
             .post(format!("{base_url}/api/v1/registration-codes"))
@@ -938,14 +1031,6 @@ mod tests {
             .expect("reject member registration code creation");
         assert_eq!(forbidden_code.status(), StatusCode::FORBIDDEN);
 
-        let foreign_read = client
-            .get(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("foreign API key read");
-        assert_eq!(foreign_read.status(), StatusCode::NOT_FOUND);
-
         let foreign_update = client
             .put(format!("{base_url}/api/v1/keys/{key_id}"))
             .bearer_auth(&member_access)
@@ -995,7 +1080,7 @@ mod tests {
         assert_eq!(unlimited.status(), StatusCode::OK);
         let unlimited = response_json(unlimited).await;
         assert_eq!(unlimited["data"]["quota_limit_usd"], Value::Null);
-        assert_eq!(unlimited["data"]["spent_usd"], "0.00000000000000");
+        assert_eq!(unlimited["data"]["spent_usd"], "13.00000000000000");
 
         for quota_limit_usd in ["", "0", "-1", "1.000000000000001"] {
             let invalid_quota = client
@@ -1032,7 +1117,7 @@ mod tests {
         let updated_expiry = response_json(updated_expiry).await;
         assert_eq!(updated_expiry["data"]["expires_at"], expires_at);
         assert_eq!(updated_expiry["data"]["enabled"], true);
-        assert_eq!(updated_expiry["data"]["key"], "cus**********345");
+        assert!(updated_expiry["data"].get("key").is_none());
 
         let invalid_expiry = client
             .put(format!("{base_url}/api/v1/keys/{key_id}"))
@@ -1183,7 +1268,7 @@ mod tests {
         let server = tokio::spawn(
             axum::serve(
                 listener,
-                router(AuthHttpState::new(auth, api_keys, manager)),
+                router(AuthHttpState::new(auth, api_keys.clone(), manager, None)),
             )
             .into_future(),
         );
@@ -1221,6 +1306,61 @@ mod tests {
             .as_str()
             .expect("member user ID")
             .to_owned();
+        let member_user_id = UserId::new(member_id.clone()).expect("member user ID");
+        seed_account_with_group(
+            repository.clone(),
+            &member_user_id,
+            "acct-member-1",
+            "member-group",
+        )
+        .await;
+        let enabled_key = api_keys
+            .create(
+                &member_user_id,
+                "member-group".to_owned(),
+                "enabled".to_owned(),
+                None,
+                None,
+                unix_timestamp(),
+            )
+            .await
+            .expect("create enabled member key");
+        let enabled_secret = enabled_key.key.expose_secret().to_owned();
+        let disabled_key = api_keys
+            .create(
+                &member_user_id,
+                "member-group".to_owned(),
+                "disabled".to_owned(),
+                None,
+                None,
+                unix_timestamp(),
+            )
+            .await
+            .expect("create disabled member key");
+        let disabled_secret = disabled_key.key.expose_secret().to_owned();
+        api_keys
+            .update(
+                &member_user_id,
+                &disabled_key.summary.id,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                unix_timestamp(),
+            )
+            .await
+            .expect("disable one member key");
+        assert!(
+            api_keys
+                .authenticate(&enabled_secret, unix_timestamp())
+                .is_ok()
+        );
+        assert!(
+            api_keys
+                .authenticate(&disabled_secret, unix_timestamp())
+                .is_err()
+        );
 
         let listed_users = client
             .get(format!("{base_url}/api/v1/users"))
@@ -1296,6 +1436,11 @@ mod tests {
             .await
             .expect("disabled member me");
         assert_eq!(disabled_me.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            api_keys
+                .authenticate(&enabled_secret, unix_timestamp())
+                .is_err()
+        );
 
         let enabled_member = client
             .put(format!("{base_url}/api/v1/users/{member_id}"))
@@ -1307,6 +1452,34 @@ mod tests {
             .expect("enable member");
         assert_eq!(enabled_member.status(), StatusCode::OK);
         assert_eq!(response_json(enabled_member).await["data"]["enabled"], true);
+        assert!(
+            api_keys
+                .authenticate(&enabled_secret, unix_timestamp())
+                .is_ok()
+        );
+        assert!(
+            api_keys
+                .authenticate(&disabled_secret, unix_timestamp())
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .load_api_key(&member_user_id, &enabled_key.summary.id)
+                .await
+                .expect("enabled key state")
+                .expect("enabled key")
+                .enabled,
+            true
+        );
+        assert_eq!(
+            repository
+                .load_api_key(&member_user_id, &disabled_key.summary.id)
+                .await
+                .expect("disabled key state")
+                .expect("disabled key")
+                .enabled,
+            false
+        );
 
         let member_login = post_json(
             &client,

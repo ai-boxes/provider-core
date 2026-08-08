@@ -17,8 +17,8 @@
 
 use async_trait::async_trait;
 use provider_usage::{
-    ATOM_SPLIT, AttemptFacts, AttributionBasis, CacheTotals, CostTotals, MAX_PAGE_SIZE,
-    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
+    ATOM_SPLIT, AttemptFacts, AttributionBasis, CacheTotals, CostTotals, GAP_BUCKET_MS,
+    MAX_PAGE_SIZE, ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
     UsageFilterOptions, UsageOverview, UsageQuery, UsageRepositoryError, UsageScope,
     recombine_atoms, system_clock_ms,
 };
@@ -70,6 +70,11 @@ const TOTALS_COLUMNS: &str = r#"
     COALESCE(SUM(a.output_tokens), 0) AS output,
     COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning,
     COUNT(a.id) - COUNT(a.effective_input_tokens) AS unknown_input,
+    COUNT(a.id) - COUNT(a.output_tokens) AS unknown_output,
+    COALESCE(SUM(CASE WHEN a.id IS NOT NULL
+                           AND (a.effective_input_tokens IS NULL
+                                OR a.cache_read_input_tokens IS NULL)
+        THEN 1 ELSE 0 END), 0) AS unknown_cache,
     COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
         THEN a.cost_atoms / 1000000 ELSE 0 END), 0) AS complete_high,
     COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
@@ -174,14 +179,15 @@ impl UsageQuery for SqliteUsageRepository {
                 a.account_id,
                 COUNT(DISTINCT l.request_id) AS requests,
                 SUM(CASE WHEN l.logical_status = 'succeeded' THEN 1 ELSE 0 END) AS successes,
-                SUM(CASE WHEN l.logical_status = 'failed' THEN 1 ELSE 0 END) AS failures
+                SUM(CASE WHEN l.logical_status IN ('failed', 'incomplete')
+                    THEN 1 ELSE 0 END) AS failures
             FROM usage_logical_requests AS l
             INNER JOIN usage_attempts AS a
                 ON a.id = l.final_attempt_id
             WHERE a.account_id IN ({placeholders})
               AND l.completed_at_ms >= ?
               AND l.completed_at_ms < ?
-              AND l.logical_status IN ('succeeded', 'failed')
+              AND l.logical_status IN ('succeeded', 'failed', 'incomplete')
             GROUP BY a.account_id
             ORDER BY a.account_id
             "#,
@@ -281,20 +287,15 @@ impl UsageQuery for SqliteUsageRepository {
     ) -> Result<Option<Vec<AttemptFacts>>, UsageRepositoryError> {
         // The owner check is part of the lookup, so another user's request is
         // indistinguishable from one that does not exist.
-        let owned: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT 1 FROM usage_logical_requests
-            WHERE request_id = ? AND owner_user_id = ?
-              AND (? IS NULL OR api_key_id = ?)
-            "#,
-        )
-        .bind(request_id)
-        .bind(&scope.owner_user_id)
-        .bind(scope.api_key_id.as_deref())
-        .bind(scope.api_key_id.as_deref())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to check usage request owner", error))?;
+        let sql = format!(
+            "SELECT 1 {} AND l.request_id = ? LIMIT 1",
+            scoped_from(scope.basis)
+        );
+        let owned = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to check usage request scope", error))?;
         if owned.is_none() {
             return Ok(None);
         }
@@ -324,13 +325,14 @@ impl SqliteUsageRepository {
             r#"
             SELECT COALESCE(SUM(count), 0) FROM usage_tracking_gaps
             WHERE owner_user_id = ?
-              AND bucket_start_ms >= ?
               AND bucket_start_ms < ?
+              AND bucket_start_ms + ? > ?
             "#,
         )
         .bind(&scope.owner_user_id)
-        .bind(scope.range.from_ms)
         .bind(scope.range.to_ms)
+        .bind(GAP_BUCKET_MS)
+        .bind(scope.range.from_ms)
         .fetch_one(&self.pool)
         .await
         .map_err(|error| usage_error("failed to read usage tracking gaps", error))?;
@@ -372,6 +374,8 @@ fn token_totals(row: &SqliteRow) -> Result<TokenTotals, UsageRepositoryError> {
         output: count(row, "output")?,
         reasoning: count(row, "reasoning")?,
         attempts_with_unknown_input: count(row, "unknown_input")?,
+        attempts_with_unknown_output: count(row, "unknown_output")?,
+        attempts_with_unknown_cache: count(row, "unknown_cache")?,
     })
 }
 
@@ -445,7 +449,7 @@ mod tests {
         AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices, CostStatus, DeliveryOutcome,
         DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
         LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution,
-        TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
+        TimeRange, TrackingGapReason, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
     };
 
     use super::*;
@@ -532,6 +536,7 @@ mod tests {
         cache_read: TokenMetric,
         cache_reporting: CacheReportingExpectation,
         attempts: u32,
+        status: LogicalStatus,
     }
 
     impl Written {
@@ -551,6 +556,7 @@ mod tests {
                 cache_read: TokenMetric::ProviderReported { value: 100 },
                 cache_reporting: CacheReportingExpectation::Expected,
                 attempts: 1,
+                status: LogicalStatus::Succeeded,
             }
         }
     }
@@ -605,7 +611,7 @@ mod tests {
             .complete_logical_request(&LogicalRequestTerminal {
                 request_id: spec.request_id.clone(),
                 completed_at_ms: spec.completed_at_ms,
-                status: LogicalStatus::Succeeded,
+                status: spec.status,
                 execution: Some(ExecutionOutcome::StableSuccessTerminal),
                 delivery: Some(DeliveryOutcome::CleanEof),
                 final_attempt_id: Some(final_attempt),
@@ -699,6 +705,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_details_obey_the_complete_scope() {
+        let repository = repository().await;
+        write(&repository, &Written::new("inside", "user-1", T0 + HOUR)).await;
+
+        let mut outside_range = scope("user-1", AttributionBasis::UserFinalAttempt);
+        outside_range.range = TimeRange::new(T0 + 2 * HOUR, T0 + 3 * HOUR).expect("range");
+        assert!(
+            repository
+                .request_attempts(&outside_range, "inside")
+                .await
+                .expect("outside range lookup")
+                .is_none()
+        );
+
+        let mut wrong_model = scope("user-1", AttributionBasis::UserFinalAttempt);
+        wrong_model.client_model = Some("another-model".to_owned());
+        assert!(
+            repository
+                .request_attempts(&wrong_model, "inside")
+                .await
+                .expect("wrong model lookup")
+                .is_none()
+        );
+
+        let mut wrong_group = scope("user-1", AttributionBasis::UserFinalAttempt);
+        wrong_group.group_label = Some("another-group".to_owned());
+        assert!(
+            repository
+                .request_attempts(&wrong_group, "inside")
+                .await
+                .expect("wrong group lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn a_key_filter_narrows_without_widening() {
         let repository = repository().await;
         let mut other_key = Written::new("other", "user-1", T0 + HOUR);
@@ -749,6 +791,34 @@ mod tests {
         assert_eq!(resource.attempts, 3, "the provider served three calls");
         assert_eq!(resource.tokens.effective_input, 360);
         assert_eq!(resource.logical_requests, 1, "still one request");
+    }
+
+    #[tokio::test]
+    async fn provider_health_counts_incomplete_as_failure_and_excludes_cancellation() {
+        let repository = repository().await;
+        let succeeded = Written::new("health-success", "user-1", T0 + HOUR);
+        let mut failed = Written::new("health-failed", "user-1", T0 + HOUR);
+        failed.status = LogicalStatus::Failed;
+        let mut incomplete = Written::new("health-incomplete", "user-1", T0 + HOUR);
+        incomplete.status = LogicalStatus::Incomplete;
+        let mut canceled = Written::new("health-canceled", "user-1", T0 + HOUR);
+        canceled.status = LogicalStatus::Canceled;
+        for spec in [&succeeded, &failed, &incomplete, &canceled] {
+            write(&repository, spec).await;
+        }
+
+        let health = repository
+            .provider_health(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("provider health");
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].requests, 3);
+        assert_eq!(health[0].successes, 1);
+        assert_eq!(health[0].failures, 2);
     }
 
     #[tokio::test]
@@ -898,6 +968,20 @@ mod tests {
             .await
             .expect("overview");
         assert_eq!(overview.logical_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_tracking_gap_counts_when_its_bucket_overlaps_the_range() {
+        let repository = repository().await;
+        repository
+            .record_tracking_gap("user-1", TrackingGapReason::WriteFailed, T0, 2)
+            .await
+            .expect("record gap");
+
+        let mut scoped = scope("user-1", AttributionBasis::UserFinalAttempt);
+        scoped.range = TimeRange::new(T0 + 1, T0 + HOUR).expect("range");
+        let overview = repository.overview(&scoped).await.expect("overview");
+        assert_eq!(overview.tracking_gaps, 2);
     }
 
     #[tokio::test]

@@ -167,7 +167,6 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
             &grant.user.id,
             "default".to_owned(),
             "test".to_owned(),
-            Some(SecretString::from("test-api-key-123".to_owned())),
             None,
             None,
             now,

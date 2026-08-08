@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex as StdMutex, PoisonError, RwLock},
+    sync::{Arc, PoisonError, RwLock},
 };
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::Mutex;
 
 use crate::{
     ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
@@ -292,12 +292,11 @@ impl AuthService {
         let password_hash = password_hash(password).await?;
         if !self
             .repository
-            .update_user_password(user_id, password_hash, now)
+            .reset_user_password(user_id, password_hash, now)
             .await?
         {
             return Err(AuthError::NotFound);
         }
-        self.repository.revoke_user_sessions(user_id, now).await?;
         let user = self
             .repository
             .load_user(user_id)
@@ -341,13 +340,9 @@ pub struct ApiKeyAuthenticator {
     active: Arc<RwLock<HashMap<[u8; 32], ActiveApiKey>>>,
     mutation: Arc<Mutex<()>>,
     quota_spent: Arc<RwLock<HashMap<ApiKeyId, QuotaSpend>>>,
-    quota_gates: Arc<StdMutex<HashMap<ApiKeyId, Arc<Mutex<()>>>>>,
 }
 
-/// Holds the single in-flight request slot for a quota-limited API key.
-pub struct ApiKeyQuotaLease {
-    _guard: Option<OwnedMutexGuard<()>>,
-}
+pub struct ApiKeyQuotaLease;
 
 #[derive(Clone)]
 struct ActiveApiKey {
@@ -371,14 +366,22 @@ impl ApiKeyAuthenticator {
         let quota_spent = keys
             .iter()
             .filter(|key| key.quota_limit_atoms.is_some())
-            .map(|key| (key.id.clone(), quota_spend(&key.spent_atoms)))
+            .map(|key| {
+                (
+                    key.id.clone(),
+                    if key.quota_accounting_ready {
+                        quota_spend(&key.spent_atoms)
+                    } else {
+                        QuotaSpend::Unavailable
+                    },
+                )
+            })
             .collect();
         Ok(Self {
             repository,
             active: Arc::new(RwLock::new(active_key_map(keys))),
             mutation: Arc::new(Mutex::new(())),
             quota_spent: Arc::new(RwLock::new(quota_spent)),
-            quota_gates: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -403,7 +406,6 @@ impl ApiKeyAuthenticator {
         owner_user_id: &UserId,
         group_label: String,
         label: String,
-        custom: Option<SecretString>,
         expires_at: Option<i64>,
         quota_limit_usd: Option<String>,
         now: i64,
@@ -419,13 +421,13 @@ impl ApiKeyAuthenticator {
                 Some(parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?)
             }
         };
-        let issued = issue_api_key(custom)?;
+        let issued = issue_api_key()?;
         let key = NewApiKey {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
             group_label: group_label.clone(),
             label,
-            key: issued.secret.clone(),
+            key_digest: issued.digest,
             enabled: true,
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
@@ -436,11 +438,11 @@ impl ApiKeyAuthenticator {
             owner_user_id: key.owner_user_id.clone(),
             group_label: group_label.clone(),
             label: key.label.clone(),
-            key: mask_api_key(key.key.expose_secret()),
             enabled: true,
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
             spent_atoms: "0".to_owned(),
+            quota_accounting_ready: true,
             last_used_at: None,
             created_at: now,
             updated_at: now,
@@ -490,17 +492,6 @@ impl ApiKeyAuthenticator {
             .iter()
             .map(api_key_summary)
             .collect())
-    }
-
-    pub async fn get(
-        &self,
-        owner_user_id: &UserId,
-        key_id: &ApiKeyId,
-    ) -> Result<StoredApiKey, AuthError> {
-        self.repository
-            .load_api_key(owner_user_id, key_id)
-            .await?
-            .ok_or(AuthError::NotFound)
     }
 
     pub async fn update(
@@ -585,7 +576,7 @@ impl ApiKeyAuthenticator {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(
-                    digest_secret(updated.key.expose_secret()),
+                    updated.key_digest,
                     ActiveApiKey {
                         id: updated.id.clone(),
                         owner_user_id: updated.owner_user_id.clone(),
@@ -623,11 +614,14 @@ impl ApiKeyAuthenticator {
         let Some(limit) = key.quota_limit_atoms.as_deref() else {
             return Ok(());
         };
-        let persisted = self
+        let (persisted, accounting_ready) = self
             .repository
             .load_api_key_spent_atoms(&key.key_id)
             .await?
             .ok_or(AuthError::QuotaLedgerUnavailable)?;
+        if !accounting_ready {
+            return Err(AuthError::QuotaLedgerUnavailable);
+        }
         let persisted = match quota_spend(&persisted) {
             QuotaSpend::Known(value) => value,
             QuotaSpend::Unavailable => return Err(AuthError::QuotaLedgerUnavailable),
@@ -657,42 +651,28 @@ impl ApiKeyAuthenticator {
         Ok(())
     }
 
-    /// Acquire the only in-flight slot for a quota-limited key and check its
-    /// current spend while that slot is held.
+    /// Check the authoritative ledger without serializing normal concurrent
+    /// requests. A request that crosses the limit is charged in full and makes
+    /// later admissions fail.
     pub async fn acquire_quota(
         &self,
         key: &AuthenticatedApiKey,
     ) -> Result<ApiKeyQuotaLease, AuthError> {
-        if key.quota_limit_atoms.is_none() {
-            return Ok(ApiKeyQuotaLease { _guard: None });
-        }
-        let gate = {
-            let mut gates = self
-                .quota_gates
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(
-                gates
-                    .entry(key.key_id.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
-        let guard = gate
-            .try_lock_owned()
-            .map_err(|_| AuthError::QuotaInFlight)?;
-        if let Err(error) = self.ensure_quota_available(key).await {
-            drop(guard);
-            return Err(error);
-        }
-        Ok(ApiKeyQuotaLease {
-            _guard: Some(guard),
-        })
+        self.ensure_quota_available(key).await?;
+        Ok(ApiKeyQuotaLease)
     }
 
     /// Record known cost immediately for admission checks. The durable writer
     /// records the same amount transactionally; keeping the high-water mark in
     /// memory closes the gap between response completion and database commit.
-    pub fn record_spend(&self, api_key_id: &ApiKeyId, atoms: i128) {
+    pub fn record_quota_result(&self, api_key_id: &ApiKeyId, atoms: Option<i128>) {
+        let Some(atoms) = atoms else {
+            self.quota_spent
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(api_key_id.clone(), QuotaSpend::Unavailable);
+            return;
+        };
         if atoms <= 0 {
             return;
         }
@@ -719,6 +699,29 @@ impl ApiKeyAuthenticator {
             .repository
             .list_visible_account_ids_by_group_label(owner_user_id, group_label)
             .await?)
+    }
+
+    pub async fn quota_ledger_ready(&self) -> Result<(), AuthError> {
+        Ok(self.repository.quota_ledger_ready().await?)
+    }
+
+    pub fn revoke_owner(&self, owner_user_id: &UserId) {
+        self.active
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, key| key.owner_user_id != *owner_user_id);
+    }
+
+    pub async fn reload_owner(&self, owner_user_id: &UserId) -> Result<(), AuthError> {
+        let keys = self.repository.load_active_api_keys().await?;
+        let mut active = self.active.write().unwrap_or_else(PoisonError::into_inner);
+        active.retain(|_, key| key.owner_user_id != *owner_user_id);
+        active.extend(active_key_map(
+            keys.into_iter()
+                .filter(|key| key.owner_user_id == *owner_user_id)
+                .collect(),
+        ));
+        Ok(())
     }
 
     fn remove_active(
@@ -774,10 +777,6 @@ impl ApiKeyAuthenticator {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(api_key_id);
-        self.quota_gates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(api_key_id);
     }
 }
 
@@ -793,7 +792,7 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
     keys.into_iter()
         .map(|key| {
             (
-                digest_secret(key.key.expose_secret()),
+                key.key_digest,
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
@@ -813,11 +812,11 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
         owner_user_id: key.owner_user_id.clone(),
         group_label: key.group_label.clone(),
         label: key.label.clone(),
-        key: mask_api_key(key.key.expose_secret()),
         enabled: key.enabled,
         expires_at: key.expires_at,
         quota_limit_atoms: key.quota_limit_atoms.clone(),
         spent_atoms: key.spent_atoms.clone(),
+        quota_accounting_ready: key.quota_accounting_ready,
         last_used_at: key.last_used_at,
         created_at: key.created_at,
         updated_at: key.updated_at,
@@ -830,19 +829,6 @@ fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
         return Err(AuthError::InvalidGroup);
     }
     Ok(group_label)
-}
-
-fn mask_api_key(key: &str) -> String {
-    let characters = key.chars().collect::<Vec<_>>();
-    if characters.len() <= 6 {
-        return "*".repeat(characters.len());
-    }
-    let prefix = characters[..3].iter().collect::<String>();
-    let suffix = characters[characters.len() - 3..]
-        .iter()
-        .collect::<String>();
-    let masked = "*".repeat(characters.len() - 6);
-    format!("{prefix}{masked}{suffix}")
 }
 
 fn normalize_username(username: String) -> Result<String, AuthError> {
@@ -966,8 +952,6 @@ pub enum AuthError {
     InvalidQuotaLimit,
     #[error("API key USD quota has been exhausted")]
     QuotaExceeded,
-    #[error("API key already has a request in flight")]
-    QuotaInFlight,
     #[error("API key quota ledger is unavailable")]
     QuotaLedgerUnavailable,
     #[error("provider group label was not found on any visible account")]

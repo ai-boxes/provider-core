@@ -27,6 +27,8 @@ use crate::{
     price::{ComponentPrices, ContextPriceTier},
 };
 
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// Largest catalog body accepted, before parsing. The real document is a couple
 /// of megabytes; this bounds what an unexpected response can cost us.
 pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -253,6 +255,9 @@ pub fn context_price_tiers_from_model_pricing(
     let mut previous_threshold = None;
     let mut tiers = Vec::with_capacity(pricing.tiers.len());
     for tier in &pricing.tiers {
+        if tier.threshold_tokens > MAX_SAFE_INTEGER {
+            return None;
+        }
         if previous_threshold.is_some_and(|previous| tier.threshold_tokens <= previous) {
             return None;
         }
@@ -282,7 +287,23 @@ fn component_prices_from_model_tier(tier: &ProviderModelPricingTier) -> Option<C
 
 #[must_use]
 pub fn canonical_model_pricing(pricing: &ProviderModelPricing) -> Option<ProviderModelPricing> {
-    component_prices_from_model_pricing(pricing).map(model_pricing_from_components)
+    let prices = component_prices_from_model_pricing(pricing)?;
+    let tiers = context_price_tiers_from_model_pricing(pricing)?;
+    let mut canonical = model_pricing_from_components(prices);
+    canonical.tiers = tiers
+        .into_iter()
+        .map(|tier| ProviderModelPricingTier {
+            threshold_tokens: tier.threshold_tokens,
+            input: decimal_price(tier.prices.uncached_input_per_million),
+            output: decimal_price(tier.prices.output_per_million),
+            cache_read: decimal_price(tier.prices.cache_read_per_million),
+            cache_write: decimal_price(tier.prices.cache_write_per_million),
+            reasoning: decimal_price(tier.prices.reasoning_per_million),
+            input_audio: decimal_price(tier.prices.input_audio_per_million),
+            output_audio: decimal_price(tier.prices.output_audio_per_million),
+        })
+        .collect();
+    Some(canonical)
 }
 
 fn parse_optional_price(value: Option<&str>) -> Option<Option<UnitPrice>> {
@@ -790,5 +811,44 @@ mod tests {
         )
         .expect("catalog document parses");
         assert_eq!(duplicate_tier.exact_model_pricing("grok-4.5"), None);
+    }
+
+    #[test]
+    fn canonical_manual_pricing_preserves_and_validates_context_tiers() {
+        let pricing = ProviderModelPricing {
+            input: Some("1.5".to_owned()),
+            output: Some("2".to_owned()),
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            input_audio: None,
+            output_audio: None,
+            tiers: vec![ProviderModelPricingTier {
+                threshold_tokens: 200_000,
+                input: Some("3".to_owned()),
+                output: Some("4.25".to_owned()),
+                cache_read: None,
+                cache_write: None,
+                reasoning: None,
+                input_audio: None,
+                output_audio: None,
+            }],
+        };
+
+        let canonical = canonical_model_pricing(&pricing).expect("valid pricing");
+        assert_eq!(canonical.input.as_deref(), Some("1.50000000"));
+        assert_eq!(canonical.tiers.len(), 1);
+        assert_eq!(canonical.tiers[0].threshold_tokens, 200_000);
+        assert_eq!(canonical.tiers[0].output.as_deref(), Some("4.25000000"));
+
+        let mut invalid = pricing;
+        invalid.tiers.push(invalid.tiers[0].clone());
+        assert_eq!(canonical_model_pricing(&invalid), None);
+
+        invalid.tiers = vec![ProviderModelPricingTier {
+            threshold_tokens: MAX_SAFE_INTEGER + 1,
+            ..invalid.tiers[0].clone()
+        }];
+        assert_eq!(canonical_model_pricing(&invalid), None);
     }
 }

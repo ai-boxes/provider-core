@@ -23,9 +23,9 @@ use axum::{
 use provider_auth::AuthenticatedSession;
 use provider_usage::{
     AttemptFacts, AttributionBasis, CacheTotals, CatalogPrices, ComponentPrices, CostStatus,
-    CostTotals, RequestCursor, RequestSummary, TimeRange, TimeRangeError, TokenTotals, UnitPrice,
-    UsageOverview, UsageQuery, UsageRepository, UsageScope, UsageWriter, component_cost_atoms,
-    system_clock_ms,
+    CostTotals, InlinePriceRecord, RequestCursor, RequestSummary, TimeRange, TimeRangeError,
+    TokenTotals, UnitPrice, UsageOverview, UsageQuery, UsageRepository, UsageScope, UsageWriter,
+    component_cost_atoms, system_clock_ms,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -256,6 +256,8 @@ fn tokens_json(tokens: &TokenTotals) -> Value {
         // Attempts that contributed nothing to `effective_input` because the
         // provider never reported it. Not zeroes.
         "attempts_with_unknown_input": tokens.attempts_with_unknown_input,
+        "attempts_with_unknown_output": tokens.attempts_with_unknown_output,
+        "attempts_with_unknown_cache": tokens.attempts_with_unknown_cache,
     })
 }
 
@@ -312,6 +314,11 @@ fn normalized_filter(
 fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
     let observation = &attempt.observation;
     let prices = selected_prices(attempt);
+    let reasoning_tokens = if attempt.contract.inclusion.reasoning_included_in_output {
+        provider_core::usage::TokenMetric::NotApplicable
+    } else {
+        observation.reasoning_tokens
+    };
     json!({
         "attempt_id": attempt.attempt_id,
         "attributed": attributed,
@@ -356,6 +363,22 @@ fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
                     observation.cache_read_input_tokens,
                     prices.and_then(|prices| prices.cache_read_per_million),
                 ),
+                "cache_write_usd": component_cost_json(
+                    observation.cache_write_input_tokens,
+                    prices.and_then(|prices| prices.cache_write_per_million),
+                ),
+                "reasoning_usd": component_cost_json(
+                    reasoning_tokens,
+                    prices.and_then(|prices| prices.reasoning_per_million),
+                ),
+                "input_audio_usd": component_cost_json(
+                    observation.input_audio_tokens,
+                    prices.and_then(|prices| prices.input_audio_per_million),
+                ),
+                "output_audio_usd": component_cost_json(
+                    observation.output_audio_tokens,
+                    prices.and_then(|prices| prices.output_audio_per_million),
+                ),
             }),
         }),
         "price": json!({
@@ -370,6 +393,8 @@ fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
                 .and_then(|record| record.catalog_model_id().map(ToOwned::to_owned)),
             "source": attempt.price.resolved()
                 .and_then(|record| record.source().map(|source| source.as_str())),
+            "pricing_context_tokens": observation.pricing_context_tokens.known_value(),
+            "tier_threshold_tokens": selected_tier_threshold(attempt),
             "input_per_million_usd": price_json(
                 prices.and_then(|prices| prices.uncached_input_per_million),
             ),
@@ -378,6 +403,18 @@ fn attempt_json(attempt: &AttemptFacts, attributed: bool) -> Value {
             ),
             "cache_read_per_million_usd": price_json(
                 prices.and_then(|prices| prices.cache_read_per_million),
+            ),
+            "cache_write_per_million_usd": price_json(
+                prices.and_then(|prices| prices.cache_write_per_million),
+            ),
+            "reasoning_per_million_usd": price_json(
+                prices.and_then(|prices| prices.reasoning_per_million),
+            ),
+            "input_audio_per_million_usd": price_json(
+                prices.and_then(|prices| prices.input_audio_per_million),
+            ),
+            "output_audio_per_million_usd": price_json(
+                prices.and_then(|prices| prices.output_audio_per_million),
             ),
         }),
     })
@@ -399,6 +436,22 @@ fn is_attributed_attempt(
 fn selected_prices(attempt: &AttemptFacts) -> Option<ComponentPrices> {
     let record = attempt.price.resolved()?;
     Some(record.prices_for_context(attempt.observation.pricing_context_tokens.known_value()))
+}
+
+fn selected_tier_threshold(attempt: &AttemptFacts) -> Option<u64> {
+    let context_tokens = attempt.observation.pricing_context_tokens.known_value()?;
+    match attempt.price.resolved()? {
+        InlinePriceRecord::CatalogV1(record) => record
+            .context_tier
+            .filter(|tier| context_tokens > tier.threshold_tokens)
+            .map(|tier| tier.threshold_tokens),
+        InlinePriceRecord::ModelV2(record) => record
+            .tiers
+            .iter()
+            .take_while(|tier| context_tokens > tier.threshold_tokens)
+            .last()
+            .map(|tier| tier.threshold_tokens),
+    }
 }
 
 fn component_cost_json(
@@ -610,6 +663,8 @@ mod tests {
         assert_eq!(value["attributed"], true);
         assert_eq!(value["price"]["input_per_million_usd"], "5.00000000");
         assert_eq!(value["price"]["output_per_million_usd"], "30.00000000");
+        assert_eq!(value["price"]["pricing_context_tokens"], 201);
+        assert_eq!(value["price"]["tier_threshold_tokens"], 200);
         assert_eq!(value["cost"]["components"]["input_usd"], "0.00050000000000");
         assert_eq!(
             value["cost"]["components"]["output_usd"],

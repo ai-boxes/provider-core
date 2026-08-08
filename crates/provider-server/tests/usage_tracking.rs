@@ -249,7 +249,6 @@ async fn deployment_with_pricing(
             &grant.user.id,
             "default".to_owned(),
             "test".to_owned(),
-            Some(SecretString::from("test-api-key-123".to_owned())),
             None,
             None,
             now,
@@ -758,6 +757,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         deployment.auth.clone(),
         deployment.api_keys.clone(),
         Some(services),
+        None,
     ))
     .await;
 
@@ -888,6 +888,7 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         deployment.auth.clone(),
         deployment.api_keys.clone(),
         Some(services),
+        None,
     ))
     .await;
 

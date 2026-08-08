@@ -11,7 +11,8 @@ use crate::{
     attempt::TrackingGapReason,
     repository::{
         AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
-        StoredCatalog, StoredLogicalRequest, UsageRepository, UsageRepositoryError,
+        QuotaLedgerEntry, StoredCatalog, StoredLogicalRequest, UsageRepository,
+        UsageRepositoryError,
     },
 };
 
@@ -22,11 +23,14 @@ pub(crate) struct TestRepository {
     pub attempts: Mutex<Vec<AttemptFacts>>,
     pub terminals: Mutex<Vec<LogicalRequestTerminal>>,
     pub gaps: Mutex<Vec<(String, TrackingGapReason, i64, u64)>>,
+    pub quota_entries: Mutex<Vec<QuotaLedgerEntry>>,
     pub catalog: Mutex<Option<StoredCatalog>>,
     /// The logical start write fails, as a full or read-only database would.
     pub fail_start: bool,
     /// Attempt and terminal writes fail.
     pub fail_facts: bool,
+    /// Quota persistence panics so tests can verify worker-loss readiness.
+    pub panic_quota: bool,
     /// Even the gap write fails, leaving nothing but an in-memory count.
     pub fail_gaps: bool,
     /// Report a terminal whose logical start never landed.
@@ -39,6 +43,10 @@ pub(crate) struct TestRepository {
     pub fail_deletes: bool,
     /// Terminal times of requests retention may remove.
     pub expired_requests: Mutex<Vec<i64>>,
+    /// Bucket times of tracking gaps retention may remove.
+    pub expired_gap_buckets: Mutex<Vec<i64>>,
+    /// Batch sizes passed to retention delete calls.
+    pub retention_batches: Mutex<Vec<u32>>,
 }
 
 impl TestRepository {
@@ -52,6 +60,10 @@ impl TestRepository {
 
     pub(crate) fn gaps(&self) -> Vec<(String, TrackingGapReason, i64, u64)> {
         guard(&self.gaps).clone()
+    }
+
+    pub(crate) fn quota_entries(&self) -> Vec<QuotaLedgerEntry> {
+        guard(&self.quota_entries).clone()
     }
 
     pub(crate) fn gap_count(&self, reason: TrackingGapReason) -> u64 {
@@ -118,6 +130,19 @@ impl UsageRepository for TestRepository {
         Ok(())
     }
 
+    async fn record_quota_ledger_entry(
+        &self,
+        entry: &crate::repository::QuotaLedgerEntry,
+    ) -> Result<(), UsageRepositoryError> {
+        assert!(!self.panic_quota, "quota worker test panic");
+        self.hold().await;
+        if self.fail_facts {
+            return Err(unavailable());
+        }
+        guard(&self.quota_entries).push(entry.clone());
+        Ok(())
+    }
+
     async fn record_tracking_gap(
         &self,
         owner_user_id: &str,
@@ -158,6 +183,7 @@ impl UsageRepository for TestRepository {
         if self.fail_deletes {
             return Err(unavailable());
         }
+        guard(&self.retention_batches).push(batch);
         let mut expired = guard(&self.expired_requests);
         let deletable = expired
             .iter()
@@ -178,13 +204,30 @@ impl UsageRepository for TestRepository {
 
     async fn delete_tracking_gaps_before(
         &self,
-        _cutoff_ms: i64,
-        _batch: u32,
+        cutoff_ms: i64,
+        batch: u32,
     ) -> Result<u64, UsageRepositoryError> {
         if self.fail_deletes {
             return Err(unavailable());
         }
-        Ok(0)
+        guard(&self.retention_batches).push(batch);
+        let mut expired = guard(&self.expired_gap_buckets);
+        let last_expired_bucket = cutoff_ms.saturating_sub(crate::GAP_BUCKET_MS);
+        let deletable = expired
+            .iter()
+            .filter(|bucket_start_ms| **bucket_start_ms <= last_expired_bucket)
+            .count()
+            .min(batch as usize);
+        let mut deleted = 0;
+        expired.retain(|bucket_start_ms| {
+            if *bucket_start_ms <= last_expired_bucket && deleted < deletable {
+                deleted += 1;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(deleted as u64)
     }
 
     async fn load_catalog(&self) -> Result<Option<StoredCatalog>, UsageRepositoryError> {

@@ -35,7 +35,10 @@ use crate::{
         AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
         UsageRepository,
     },
-    writer::{UsageFact, UsageWrite, UsageWriter},
+    writer::{
+        QuotaLedgerPermit, QuotaLedgerReceipt, QuotaLedgerWriter, UsageFact, UsageWrite,
+        UsageWriter,
+    },
 };
 
 /// Wall-clock source. A function pointer rather than a trait object: the only
@@ -43,7 +46,7 @@ use crate::{
 pub type ClockMs = fn() -> i64;
 
 /// Receives known attempt cost before the asynchronous usage writer persists it.
-pub type SpendObserver = Arc<dyn Fn(&str, i128) + Send + Sync>;
+pub type SpendObserver = Arc<dyn Fn(&str, Option<i128>) + Send + Sync>;
 
 /// Reads the system clock as unix milliseconds.
 #[must_use]
@@ -60,6 +63,7 @@ pub fn system_clock_ms() -> i64 {
 pub struct UsageTracking {
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
+    quota_writer: Option<Arc<QuotaLedgerWriter>>,
     spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
 }
@@ -67,18 +71,20 @@ pub struct UsageTracking {
 impl UsageTracking {
     #[must_use]
     pub fn new(repository: Arc<dyn UsageRepository>, writer: Arc<UsageWriter>) -> Self {
-        Self::with_clock_and_spend_observer(repository, writer, system_clock_ms, None)
+        Self::with_clock_and_spend_observer(repository, writer, None, system_clock_ms, None)
     }
 
     #[must_use]
     pub fn with_spend_observer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
+        quota_writer: Arc<QuotaLedgerWriter>,
         spend_observer: SpendObserver,
     ) -> Self {
         Self::with_clock_and_spend_observer(
             repository,
             writer,
+            Some(quota_writer),
             system_clock_ms,
             Some(spend_observer),
         )
@@ -90,19 +96,21 @@ impl UsageTracking {
         writer: Arc<UsageWriter>,
         now_ms: ClockMs,
     ) -> Self {
-        Self::with_clock_and_spend_observer(repository, writer, now_ms, None)
+        Self::with_clock_and_spend_observer(repository, writer, None, now_ms, None)
     }
 
     #[must_use]
     fn with_clock_and_spend_observer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
+        quota_writer: Option<Arc<QuotaLedgerWriter>>,
         now_ms: ClockMs,
         spend_observer: Option<SpendObserver>,
     ) -> Self {
         Self {
             repository,
             writer,
+            quota_writer,
             spend_observer,
             now_ms,
         }
@@ -125,6 +133,7 @@ impl UsageTracking {
         Arc::new(LogicalTracker {
             start,
             writer: Arc::clone(&self.writer),
+            quota_writer: self.quota_writer.clone(),
             spend_observer: self.spend_observer.clone(),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
@@ -135,9 +144,19 @@ impl UsageTracking {
                 final_attempt_execution: None,
                 execution: None,
                 delivery: None,
+                quota_permit: None,
+                quota_atoms: 0,
+                quota_indeterminate: false,
                 finished: false,
             }),
         })
+    }
+
+    #[must_use]
+    pub fn quota_ledger_ready(&self) -> bool {
+        self.quota_writer
+            .as_ref()
+            .is_none_or(|writer| writer.is_ready())
     }
 }
 
@@ -164,12 +183,16 @@ struct LogicalState {
     final_attempt_execution: Option<ExecutionOutcome>,
     execution: Option<ExecutionOutcome>,
     delivery: Option<DeliveryOutcome>,
+    quota_permit: Option<QuotaLedgerPermit>,
+    quota_atoms: i128,
+    quota_indeterminate: bool,
     finished: bool,
 }
 
 pub struct LogicalTracker {
     start: LogicalRequestStart,
     writer: Arc<UsageWriter>,
+    quota_writer: Option<Arc<QuotaLedgerWriter>>,
     spend_observer: Option<SpendObserver>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
@@ -191,6 +214,17 @@ impl LogicalTracker {
     #[must_use]
     pub fn request_tracking(self: &Arc<Self>) -> Arc<dyn RequestTracking> {
         Arc::new(RequestTrackingHandle(Arc::clone(self)))
+    }
+
+    /// Reserve bounded quota-ledger capacity before dispatch. Holding the permit
+    /// makes the eventual terminal enqueue infallible, including on client drop.
+    pub async fn reserve_quota(&self) -> Result<(), ()> {
+        let Some(writer) = self.quota_writer.as_ref() else {
+            return Ok(());
+        };
+        let permit = writer.reserve().await.ok_or(())?;
+        self.lock().quota_permit = Some(permit);
+        Ok(())
     }
 
     /// Allocate the next attempt. Nothing is persisted yet; an attempt is written
@@ -245,11 +279,11 @@ impl LogicalTracker {
     ///
     /// Safe to call from both the normal end of a response and a drop; only the
     /// first call writes.
-    pub fn finish(&self) {
-        let terminal = {
+    pub fn finish(&self) -> Option<QuotaLedgerReceipt> {
+        let (terminal, quota) = {
             let mut state = self.lock();
             if state.finished {
-                return;
+                return None;
             }
             state.finished = true;
 
@@ -261,7 +295,7 @@ impl LogicalTracker {
                 .or(state.final_attempt_execution)
                 .unwrap_or(ExecutionOutcome::EofWithoutSuccessTerminal);
             let delivery = state.delivery.unwrap_or(DeliveryOutcome::Unknown);
-            LogicalRequestTerminal {
+            let terminal = LogicalRequestTerminal {
                 request_id: self.start.request_id.clone(),
                 completed_at_ms: (self.now_ms)(),
                 status: merge_logical_terminal(execution, delivery),
@@ -274,14 +308,31 @@ impl LogicalTracker {
                 },
                 // The start row is version 0, so any terminal is newer.
                 state_version: 1,
-            }
+            };
+            let quota = state.quota_permit.take().map(|permit| {
+                let entry = crate::repository::QuotaLedgerEntry {
+                    entry_id: self.start.request_id.clone(),
+                    api_key_id: self
+                        .start
+                        .api_key_id
+                        .clone()
+                        .expect("a reserved quota entry must belong to an API key"),
+                    cost_atoms: (!state.quota_indeterminate).then(|| state.quota_atoms.to_string()),
+                    recorded_at_ms: terminal.completed_at_ms,
+                };
+                (permit, entry)
+            });
+            (terminal, quota)
         };
+
+        let receipt = quota.map(|(permit, entry)| permit.submit(entry));
 
         self.writer.submit(UsageWrite {
             owner_user_id: self.start.owner_user_id.clone(),
             at_ms: terminal.completed_at_ms,
             fact: UsageFact::LogicalTerminal(terminal),
         });
+        receipt
     }
 
     /// The highest-numbered attempt is the one the user's response came from, so
@@ -301,6 +352,27 @@ impl LogicalTracker {
             state.final_attempt_sequence = Some(sequence);
             state.final_attempt_id = Some(attempt_id.to_owned());
             state.final_attempt_execution = Some(execution);
+        }
+    }
+
+    fn note_quota_result(&self, facts: &AttemptFacts) {
+        let mut state = self.lock();
+        if !facts.dispatch_evidence.is_confirmed_dispatch() {
+            return;
+        }
+        if matches!(
+            facts.cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        ) {
+            match state
+                .quota_atoms
+                .checked_add(facts.cost.total_known.as_atoms())
+            {
+                Some(total) => state.quota_atoms = total,
+                None => state.quota_indeterminate = true,
+            }
+        } else {
+            state.quota_indeterminate = true;
         }
     }
 
@@ -457,16 +529,16 @@ impl AttemptTracker {
 
         self.logical
             .note_final_attempt(&self.attempt_id, self.sequence, execution);
-        if matches!(
-            facts.cost.status,
-            CostStatus::CompleteForObservedCatalogComponents
-        ) && let (Some(observer), Some(api_key_id), atoms) = (
-            self.logical.spend_observer.as_ref(),
-            self.logical.start.api_key_id.as_deref(),
-            facts.cost.total_known.as_atoms(),
-        ) && atoms > 0
-        {
-            observer(api_key_id, atoms);
+        self.logical.note_quota_result(&facts);
+        if let Some(api_key_id) = self.logical.start.api_key_id.as_deref() {
+            let atoms = matches!(
+                facts.cost.status,
+                CostStatus::CompleteForObservedCatalogComponents
+            )
+            .then(|| facts.cost.total_known.as_atoms());
+            if let Some(observer) = self.logical.spend_observer.as_ref() {
+                observer(api_key_id, atoms);
+            }
         }
         self.logical.writer.submit(UsageWrite {
             owner_user_id: self.logical.start.owner_user_id.clone(),
@@ -826,7 +898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_cost_does_not_notify_the_quota_ledger() {
+    async fn partial_cost_marks_the_in_memory_quota_state_unavailable() {
         let repository = Arc::new(crate::tests_support::TestRepository::default());
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -840,6 +912,7 @@ mod tests {
         let tracking = UsageTracking::with_clock_and_spend_observer(
             repository,
             writer.clone(),
+            None,
             ticking_clock,
             Some(observer),
         );
@@ -851,7 +924,40 @@ mod tests {
         attempt.close();
         logical.finish();
         assert!(writer.drain(Duration::from_secs(5)).await);
-        assert!(observed.lock().expect("quota observer lock").is_empty());
+        assert_eq!(
+            observed.lock().expect("quota observer lock").as_slice(),
+            &[None]
+        );
+    }
+
+    #[tokio::test]
+    async fn client_drop_with_partial_attempt_persists_indeterminate_quota() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
+        let tracking = UsageTracking::with_clock_and_spend_observer(
+            repository.clone(),
+            writer,
+            Some(quota_writer),
+            ticking_clock,
+            Some(Arc::new(|_, _| {})),
+        );
+        let logical = tracking.begin_request(start("req-client-drop")).await;
+        logical.reserve_quota().await.expect("quota permit");
+
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.record_provider_model("gpt-4o-mini");
+        attempt.finished(Some(codex_usage()));
+        logical.record_delivery(DeliveryOutcome::ClientDrop);
+
+        let receipt = logical.finish().expect("quota receipt");
+        assert!(receipt.persisted().await);
+        let entries = repository.quota_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_id, "req-client-drop");
+        assert_eq!(entries[0].api_key_id, "key-1");
+        assert_eq!(entries[0].cost_atoms, None);
     }
 
     #[tokio::test]
