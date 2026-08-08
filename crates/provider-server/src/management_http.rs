@@ -17,8 +17,9 @@ use provider_core::{
 };
 use provider_drivers::compatible_api_key_credential;
 use provider_management::{
-    CreatedProviderAccount, DirectProviderAccountInput, ModelCatalogSnapshot, OAuthSessionSnapshot,
-    OAuthSessionStatus, ProviderCredentialReplacement, ProviderManager, ProviderManagerError,
+    CreatedProviderAccount, DirectProviderAccountInput, ModelCatalogError, ModelCatalogSnapshot,
+    OAuthSessionSnapshot, OAuthSessionStatus, ProviderCredentialReplacement, ProviderManager,
+    ProviderManagerError,
 };
 use provider_usage::{
     ProviderHealthSummary, TimeRange, TimeRangeError, canonical_model_pricing, system_clock_ms,
@@ -854,8 +855,13 @@ impl From<ProviderManagerError> for ApiError {
                 error_type: "upstream_error",
                 message: error.to_string(),
             },
+            ProviderManagerError::ModelCatalog(ModelCatalogError::Discovery(_)) => Self {
+                status: StatusCode::BAD_GATEWAY,
+                error_type: "upstream_error",
+                message: error.to_string(),
+            },
             ProviderManagerError::Repository(_)
-            | ProviderManagerError::ModelCatalog(_)
+            | ProviderManagerError::ModelCatalog(ModelCatalogError::Repository(_))
             | ProviderManagerError::MissingOwner => Self::internal(),
         }
     }
@@ -1284,7 +1290,7 @@ mod tests {
             .send()
             .await
             .expect("fail account model discovery");
-        assert!(failed_discovery.status().is_server_error());
+        assert_eq!(failed_discovery.status(), StatusCode::BAD_GATEWAY);
         let accounts_after_failure = client
             .get(&endpoint)
             .bearer_auth(&access_token)
