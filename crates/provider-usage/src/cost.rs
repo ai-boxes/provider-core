@@ -398,6 +398,7 @@ mod tests {
                 reasoning_applicable: true,
                 audio_applicable: false,
                 cache_write_applicable: true,
+                missing_cache_read_means_zero: false,
                 total_source: TotalSource::Reported,
             },
             cache_capability: CacheCapability::Supported,
@@ -445,6 +446,70 @@ mod tests {
             billable: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn omitted_cache_read_can_be_zero_by_contract_and_cost_completely() {
+        let usage_contract = UsageContractSnapshot {
+            contract_version: 2,
+            normalization_version: 2,
+            inclusion: TokenInclusionRules {
+                input_includes_cache: true,
+                input_categories_mutually_exclusive: false,
+                reasoning_included_in_output: true,
+                reasoning_applicable: true,
+                audio_applicable: true,
+                cache_write_applicable: false,
+                missing_cache_read_means_zero: true,
+                total_source: TotalSource::Reported,
+            },
+            cache_capability: CacheCapability::Unknown,
+            cache_eligibility: CacheEligibility::Unknown,
+            cache_reporting_expectation: CacheReportingExpectation::Unknown,
+            pricing_context_basis: PricingContextBasis::EffectiveInput,
+            pricing_mode: PricingMode::Default,
+        };
+        let observation = normalize_usage(
+            Some(RawUsageFields {
+                input: Some(2_534),
+                output: Some(768),
+                total: Some(3_302),
+                ..RawUsageFields::default()
+            }),
+            &usage_contract,
+        );
+        assert_eq!(
+            observation.uncached_input_tokens,
+            TokenMetric::DerivedFromReported {
+                value: 2_534,
+                rule_version: 2,
+            }
+        );
+        assert_eq!(
+            observation.cache_read_input_tokens,
+            TokenMetric::DerivedFromReported {
+                value: 0,
+                rule_version: 2,
+            }
+        );
+
+        let cost = compute_observed_catalog_cost(
+            &observation,
+            &usage_contract,
+            &record(ComponentPrices {
+                uncached_input_per_million: Some(UnitPrice::from_scaled(PER_MILLION)),
+                cache_read_per_million: Some(UnitPrice::from_scaled(PER_MILLION / 10)),
+                output_per_million: Some(UnitPrice::from_scaled(10 * PER_MILLION)),
+                ..ComponentPrices::default()
+            }),
+        );
+
+        assert_eq!(
+            cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        );
+        assert!(cost.reasons.is_empty());
+        assert_eq!(cost.total_known.to_decimal_string(), "0.01021400000000");
     }
 
     #[test]

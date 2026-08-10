@@ -163,7 +163,18 @@ pub fn normalize_usage(
 
     let cache_readable = !matches!(contract.cache_capability, CacheCapability::Unsupported);
     let reported_input = classify(fields.input, true, &mut warnings);
-    let cache_read = classify(fields.cache_read, cache_readable, &mut warnings);
+    let cache_read = if cache_readable
+        && fields.cache_read.is_none()
+        && reported_input.known_value().is_some()
+        && inclusion.missing_cache_read_means_zero
+    {
+        TokenMetric::DerivedFromReported {
+            value: 0,
+            rule_version,
+        }
+    } else {
+        classify(fields.cache_read, cache_readable, &mut warnings)
+    };
     let cache_write = classify(
         fields.cache_write,
         cache_readable && inclusion.cache_write_applicable,

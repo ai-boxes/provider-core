@@ -32,10 +32,7 @@ use provider_core::{
     AccountId, ProviderError, ProviderKind, ProviderModel, ProviderModelPricingSource,
     ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
     ProviderVisibility, ProxyService, RoutableProviderModel, WireFormat,
-    usage::{
-        CacheEligibility, PricingMode, ProviderUsageProfile, RequestTracking, TokenMetric,
-        TokenUnknownReason,
-    },
+    usage::{ProviderUsageProfile, RequestTracking, TokenMetric, TokenUnknownReason},
 };
 use provider_drivers::codex::CodexDriver;
 use provider_management::{CredentialProviderAccountInput, ProviderManager};
@@ -159,10 +156,7 @@ impl ProviderRoute for ChatLengthRouter {
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
         Some(ProviderUsageProfile {
             provider: ProviderKind::OpenAiCompatible,
-            contract: provider_drivers::codex::codex_usage_contract(
-                CacheEligibility::Eligible,
-                PricingMode::Default,
-            ),
+            contract: provider_drivers::openai_compatible::openai_compatible_usage_contract(),
         })
     }
 
@@ -588,6 +582,27 @@ async fn chat_length_translated_to_response_incomplete_is_retained_as_an_outcome
         .expect("load logical")
         .expect("logical present");
     assert_eq!(stored.status, LogicalStatus::Incomplete);
+
+    let attempts = harness
+        .usage
+        .load_attempts(&request_id)
+        .await
+        .expect("load attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].observation.cache_read_input_tokens,
+        TokenMetric::DerivedFromReported {
+            value: 0,
+            rule_version: 2,
+        }
+    );
+    assert_eq!(
+        attempts[0].observation.uncached_input_tokens,
+        TokenMetric::DerivedFromReported {
+            value: 2,
+            rule_version: 2,
+        }
+    );
 }
 
 #[tokio::test]

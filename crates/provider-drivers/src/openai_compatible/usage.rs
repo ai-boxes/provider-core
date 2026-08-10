@@ -5,8 +5,8 @@ use provider_core::usage::{
     TokenInclusionRules, TotalSource, UsageContractSnapshot,
 };
 
-pub const OPENAI_COMPATIBLE_CONTRACT_VERSION: u16 = 1;
-pub const OPENAI_COMPATIBLE_NORMALIZATION_VERSION: u16 = 1;
+pub const OPENAI_COMPATIBLE_CONTRACT_VERSION: u16 = 2;
+pub const OPENAI_COMPATIBLE_NORMALIZATION_VERSION: u16 = 2;
 
 #[must_use]
 pub const fn openai_compatible_usage_contract() -> UsageContractSnapshot {
@@ -20,6 +20,7 @@ pub const fn openai_compatible_usage_contract() -> UsageContractSnapshot {
             reasoning_applicable: true,
             audio_applicable: true,
             cache_write_applicable: false,
+            missing_cache_read_means_zero: true,
             total_source: TotalSource::Reported,
         },
         cache_capability: CacheCapability::Unknown,
@@ -55,6 +56,20 @@ mod tests {
         assert_eq!(
             observation.total_tokens,
             TokenMetric::ProviderReported { value: 27 }
+        );
+        assert_eq!(
+            observation.cache_read_input_tokens,
+            TokenMetric::DerivedFromReported {
+                value: 0,
+                rule_version: super::OPENAI_COMPATIBLE_NORMALIZATION_VERSION,
+            }
+        );
+        assert_eq!(
+            observation.uncached_input_tokens,
+            TokenMetric::DerivedFromReported {
+                value: 20,
+                rule_version: super::OPENAI_COMPATIBLE_NORMALIZATION_VERSION,
+            }
         );
     }
 }

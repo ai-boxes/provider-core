@@ -48,6 +48,7 @@ pub const fn codex_usage_contract(
             reasoning_applicable: true,
             audio_applicable: false,
             cache_write_applicable: false,
+            missing_cache_read_means_zero: false,
             total_source: TotalSource::Reported,
         },
         cache_capability: CacheCapability::Supported,
