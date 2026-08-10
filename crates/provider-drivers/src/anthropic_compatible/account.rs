@@ -278,7 +278,7 @@ impl ProviderAccount for AnthropicCompatibleAccount {
 impl AnthropicCompatibleAccount {
     async fn http_client(&self) -> Result<&reqwest::Client, ProviderError> {
         self.http
-            .get_or_try_init(|| self.config.pinned_client())
+            .get_or_try_init(|| async { self.config.build_client() })
             .await
     }
 }

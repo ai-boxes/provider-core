@@ -8,6 +8,7 @@
 //! another owner's usage.
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     future::IntoFuture,
     sync::{
@@ -17,6 +18,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -25,24 +27,32 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
 use provider_core::{
-    AccountId, ProviderKind, ProviderModelPricingSource, ProviderVisibility, ProxyService,
-    usage::{TokenMetric, TokenUnknownReason},
+    AccountId, ProviderError, ProviderKind, ProviderModel, ProviderModelPricingSource,
+    ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
+    ProviderVisibility, ProxyService, RoutableProviderModel, WireFormat,
+    usage::{
+        CacheEligibility, PricingMode, ProviderUsageProfile, RequestTracking, TokenMetric,
+        TokenUnknownReason,
+    },
 };
 use provider_drivers::codex::CodexDriver;
 use provider_management::{CredentialProviderAccountInput, ProviderManager};
-use provider_protocol::DefaultProtocolBridge;
+use provider_protocol::{DefaultProtocolBridge, observe_chat_completions_usage};
 use provider_runtime::ProviderRuntimeCatalog;
+use provider_server::ManagementOrigin;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, CostReason, CostStatus, DEFAULT_WRITE_QUEUE, DeliveryOutcome,
     DispatchEvidence, ExecutionOutcome, LogicalStatus, PriceResolution, RefreshOutcome,
-    TrackingState, UsageRepository, UsageTracking, UsageWriter,
+    TrackingGapReason, TrackingState, UsageRepository, UsageTracking, UsageWriter,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
+const TEST_MANAGEMENT_ORIGIN: &str = "https://admin.example.com";
 
 /// A Codex `response.completed` reporting input and output but no cache details
 /// and no total, which is exactly the shape that must not become zeroes. It names
@@ -52,6 +62,10 @@ const COMPLETED_STREAM: &[u8] = b"event: response.completed\ndata: {\"type\":\"r
 /// The shape Codex actually sends: the cached portion of the input is broken out,
 /// which is what makes the two input rates separable.
 const COMPLETED_WITH_CACHE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":8,\"total_tokens\":128}}}\n\n";
+
+const INCOMPLETE_WITH_USAGE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
+
+const CHAT_LENGTH_WITH_USAGE: &[u8] = b"data: {\"id\":\"chat_1\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
 
 const PARTIAL_STREAM: &[u8] =
     b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
@@ -64,6 +78,8 @@ struct Upstream {
     with_cache_details: bool,
     /// Send one content event and then wait, so a test can disconnect mid-stream.
     stall_after_chunk: bool,
+    /// End with positive usage but an explicitly unsuccessful Responses terminal.
+    incomplete_with_usage: bool,
     calls: Arc<AtomicUsize>,
 }
 
@@ -89,7 +105,9 @@ async fn responses(State(state): State<Upstream>, _request: Request) -> Response
             .body(Body::from_stream(body))
             .expect("partial stream response");
     }
-    let stream = if state.with_cache_details {
+    let stream = if state.incomplete_with_usage {
+        INCOMPLETE_WITH_USAGE
+    } else if state.with_cache_details {
         COMPLETED_WITH_CACHE
     } else {
         COMPLETED_STREAM
@@ -126,6 +144,85 @@ struct Harness {
     upstream_calls: Arc<AtomicUsize>,
 }
 
+struct ChatLengthRouter;
+
+#[async_trait]
+impl ProviderRoute for ChatLengthRouter {
+    fn provider_name(&self) -> &'static str {
+        "openai_compatible"
+    }
+
+    fn native_format(&self) -> WireFormat {
+        WireFormat::OpenAiChatCompletions
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::OpenAiCompatible,
+            contract: provider_drivers::codex::codex_usage_contract(
+                CacheEligibility::Eligible,
+                PricingMode::Default,
+            ),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn RequestTracking>>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let attempt = tracking
+            .zip(self.usage_profile())
+            .and_then(|(tracking, profile)| {
+                tracking.begin_attempt(profile, "chat-account", Some(&request.model), pricing)
+            });
+        let upstream: ProviderStream = Box::pin(stream::iter([Ok(Bytes::from_static(
+            CHAT_LENGTH_WITH_USAGE,
+        ))]));
+        let Some(attempt) = attempt else {
+            return Ok(upstream);
+        };
+        attempt.stream_opened();
+        Ok(observe_chat_completions_usage(upstream, attempt))
+    }
+
+    async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
+        Ok(1)
+    }
+}
+
+impl ProviderRouter for ChatLengthRouter {
+    fn models(
+        &self,
+        _user_id: &str,
+        _account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel> {
+        vec![RoutableProviderModel {
+            model: ProviderModel::new("gpt-5.5", "openai_compatible"),
+            native_formats: vec![WireFormat::OpenAiChatCompletions],
+        }]
+    }
+
+    fn routes(
+        &self,
+        _user_id: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        _session_id: Option<&str>,
+        _account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<ProviderRouteCandidate> {
+        if model != "gpt-5.5" || !native_formats.contains(&WireFormat::OpenAiChatCompletions) {
+            return Vec::new();
+        }
+        vec![ProviderRouteCandidate {
+            upstream_model: model.to_owned(),
+            pricing: None,
+            route: Arc::new(Self),
+        }]
+    }
+}
+
 /// Everything below the HTTP router: storage, runtime, one Codex account and one
 /// API key. Tests compose their own tracking on top so they can choose how prices
 /// are resolved.
@@ -146,10 +243,19 @@ async fn harness(always_unauthorized: bool) -> Harness {
 }
 
 async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool) -> Harness {
+    harness_with_terminal(always_unauthorized, stall_after_chunk, false).await
+}
+
+async fn harness_with_terminal(
+    always_unauthorized: bool,
+    stall_after_chunk: bool,
+    incomplete_with_usage: bool,
+) -> Harness {
     let upstream_state = Upstream {
         always_unauthorized,
         with_cache_details: false,
         stall_after_chunk,
+        incomplete_with_usage,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_calls = upstream_state.calls.clone();
@@ -180,6 +286,37 @@ async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool
         usage: deployment.usage,
         writer: deployment.writer,
         upstream_calls,
+    }
+}
+
+async fn chat_length_harness() -> Harness {
+    let upstream_url = spawn(
+        Router::new()
+            .route("/codex/models", get(models))
+            .route("/codex/responses", post(responses))
+            .route("/oauth/token", post(refresh))
+            .with_state(Upstream::default()),
+    )
+    .await;
+    let deployment = deployment(&upstream_url).await;
+    let tracking = Arc::new(UsageTracking::new(
+        deployment.usage.clone(),
+        deployment.writer.clone(),
+    ));
+    let service =
+        ProxyService::with_router(Arc::new(ChatLengthRouter), Arc::new(DefaultProtocolBridge));
+    let server_url = spawn(provider_server::router_with_usage(
+        service,
+        deployment.api_keys,
+        Some(tracking),
+    ))
+    .await;
+    Harness {
+        server_url,
+        api_key: deployment.api_key,
+        usage: deployment.usage,
+        writer: deployment.writer,
+        upstream_calls: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -247,15 +384,15 @@ async fn deployment_with_pricing(
         .await
         .expect("API key index");
     let created_key = api_keys
-        .create(
-            &grant.user.id,
-            SecretString::from("test-api-key"),
-            "default".to_owned(),
-            "test".to_owned(),
-            None,
-            None,
+        .create(CreateApiKeyInput {
+            owner_user_id: &grant.user.id,
+            secret: SecretString::from("test-api-key"),
+            group_label: "default".to_owned(),
+            label: "test".to_owned(),
+            expires_at: None,
+            quota_limit_usd: None,
             now,
-        )
+        })
         .await
         .expect("create API key");
 
@@ -394,6 +531,66 @@ async fn a_successful_response_records_what_the_provider_actually_reported() {
 }
 
 #[tokio::test]
+async fn an_incomplete_response_with_positive_usage_is_retained_as_an_outcome() {
+    let harness = harness_with_terminal(false, false, true).await;
+    let body = harness
+        .post_responses()
+        .await
+        .text()
+        .await
+        .expect("response body");
+    assert!(
+        body.contains("response.incomplete"),
+        "the proxy response is unchanged"
+    );
+
+    assert!(harness.writer.drain(Duration::from_secs(10)).await);
+    let request_id = harness
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("incomplete operational outcome retained");
+    let stored = harness
+        .usage
+        .load_logical_request(&request_id)
+        .await
+        .expect("load logical")
+        .expect("logical present");
+    assert_eq!(stored.status, LogicalStatus::Incomplete);
+}
+
+#[tokio::test]
+async fn chat_length_translated_to_response_incomplete_is_retained_as_an_outcome() {
+    let harness = chat_length_harness().await;
+    let body = harness
+        .post_responses()
+        .await
+        .text()
+        .await
+        .expect("response body");
+    assert!(
+        body.contains("response.incomplete"),
+        "the Chat length terminal must remain incomplete after Responses translation"
+    );
+
+    assert!(harness.writer.drain(Duration::from_secs(10)).await);
+    let request_id = harness
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("incomplete operational outcome retained");
+    let stored = harness
+        .usage
+        .load_logical_request(&request_id)
+        .await
+        .expect("load logical")
+        .expect("logical present");
+    assert_eq!(stored.status, LogicalStatus::Incomplete);
+}
+
+#[tokio::test]
 async fn an_authenticated_invalid_request_is_recorded_without_an_attempt() {
     let harness = harness(false).await;
     let status = reqwest::Client::new()
@@ -482,6 +679,12 @@ async fn a_client_drop_closes_the_attempt_before_the_logical_request() {
         stored.final_attempt_id.as_deref(),
         Some(attempts[0].attempt_id.as_str()),
         "the attempt must close before logical terminal snapshots final_attempt_id"
+    );
+    assert_eq!(
+        attempts[0].tracking,
+        TrackingState::Gap {
+            reason: TrackingGapReason::AmbiguousCancel,
+        }
     );
 }
 
@@ -577,6 +780,7 @@ async fn a_priced_response_records_an_exact_cost() {
         always_unauthorized: false,
         with_cache_details: true,
         stall_after_chunk: false,
+        incomplete_with_usage: false,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
@@ -694,7 +898,7 @@ async fn a_priced_response_records_an_exact_cost() {
 async fn login(server_url: &str, username: &str, password: &str) -> String {
     let response = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/auth/login"))
-        .header(reqwest::header::ORIGIN, "https://admin.example.com")
+        .header(reqwest::header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": username, "password": password }).to_string())
         .send()
@@ -732,6 +936,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         always_unauthorized: false,
         with_cache_details: true,
         stall_after_chunk: false,
+        incomplete_with_usage: false,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
@@ -759,6 +964,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         deployment.api_keys.clone(),
         Some(services),
         None,
+        ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN).expect("test management origin"),
     ))
     .await;
 
@@ -786,7 +992,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let created_text = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/users"))
         .header(reqwest::header::COOKIE, &admin_cookie)
-        .header(reqwest::header::ORIGIN, "https://admin.example.com")
+        .header(reqwest::header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": "other", "password": "other-secret" }).to_string())
         .send()
@@ -868,6 +1074,7 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         deployment.api_keys.clone(),
         Some(services),
         None,
+        ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN).expect("test management origin"),
     ))
     .await;
 

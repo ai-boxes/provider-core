@@ -984,7 +984,8 @@ mod tests {
     };
 
     use crate::{
-        auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES, router_with_management,
+        ManagementOrigin, auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES,
+        router_with_management,
     };
 
     use super::{
@@ -1455,7 +1456,14 @@ mod tests {
         let server = tokio::spawn(
             axum::serve(
                 listener,
-                router_with_management(service, manager, auth, api_keys),
+                router_with_management(
+                    service,
+                    manager,
+                    auth,
+                    api_keys,
+                    ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN)
+                        .expect("test management origin"),
+                ),
             )
             .into_future(),
         );
@@ -2077,7 +2085,14 @@ mod tests {
         let management_server = tokio::spawn(
             axum::serve(
                 management_listener,
-                router_with_management(service, manager.clone(), auth, api_keys),
+                router_with_management(
+                    service,
+                    manager.clone(),
+                    auth,
+                    api_keys,
+                    ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN)
+                        .expect("test management origin"),
+                ),
             )
             .into_future(),
         );

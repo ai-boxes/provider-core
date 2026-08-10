@@ -18,17 +18,25 @@ use axum::{
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthError, AuthService,
-    AuthenticatedSession, CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant,
-    UserId, UserSummary,
+    AuthenticatedSession, CreateApiKeyInput, CreatedApiKey, CreatedRegistrationCode,
+    CredentialError, SessionGrant, UserId, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-const MANAGEMENT_ORIGIN_ENV: &str = "PODE_MANAGEMENT_ORIGIN";
 const SESSION_COOKIE: &str = "pode_session";
 pub(crate) const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
+
+#[derive(Clone)]
+pub struct ManagementOrigin(HeaderValue);
+
+impl ManagementOrigin {
+    pub fn try_new(origin: &str) -> Result<Self, &'static str> {
+        parse_management_origin(origin).map(Self)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AuthHttpState {
@@ -47,11 +55,8 @@ impl AuthHttpState {
         api_keys: ApiKeyAuthenticator,
         manager: ProviderManager,
         trusted_proxy_ip: Option<IpAddr>,
+        management_origin: ManagementOrigin,
     ) -> Self {
-        let management_origin = std::env::var(MANAGEMENT_ORIGIN_ENV)
-            .unwrap_or_else(|_| panic!("{MANAGEMENT_ORIGIN_ENV} must be configured"));
-        let management_origin = parse_management_origin(&management_origin)
-            .unwrap_or_else(|message| panic!("{MANAGEMENT_ORIGIN_ENV} {message}"));
         Self {
             auth,
             api_keys,
@@ -60,7 +65,7 @@ impl AuthHttpState {
                 trusted_proxy_ip,
                 ..AuthRateLimits::default()
             }),
-            management_origin,
+            management_origin: management_origin.0,
             secure_cookie: true,
         }
     }
@@ -136,15 +141,15 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .with_state(state)
 }
 
-pub(crate) fn protect(router: Router, auth: AuthService) -> Router {
-    let origin = std::env::var(MANAGEMENT_ORIGIN_ENV)
-        .unwrap_or_else(|_| panic!("{MANAGEMENT_ORIGIN_ENV} must be configured"));
-    let management_origin = parse_management_origin(&origin)
-        .unwrap_or_else(|message| panic!("{MANAGEMENT_ORIGIN_ENV} {message}"));
+pub(crate) fn protect(
+    router: Router,
+    auth: AuthService,
+    management_origin: ManagementOrigin,
+) -> Router {
     router.route_layer(middleware::from_fn_with_state(
         SessionGuardState {
             auth,
-            management_origin,
+            management_origin: management_origin.0,
         },
         require_session,
     ))
@@ -332,15 +337,15 @@ async fn create_key(
     let request = json_request(request)?;
     let key = state
         .api_keys
-        .create(
-            &session.user.id,
-            SecretString::from(request.key),
-            request.group_label,
-            request.label,
-            request.expires_at,
-            request.quota_limit_usd,
-            unix_timestamp(),
-        )
+        .create(CreateApiKeyInput {
+            owner_user_id: &session.user.id,
+            secret: SecretString::from(request.key),
+            group_label: request.group_label,
+            label: request.label,
+            expires_at: request.expires_at,
+            quota_limit_usd: request.quota_limit_usd,
+            now: unix_timestamp(),
+        })
         .await?;
     Ok((StatusCode::CREATED, data(created_api_key_json(&key)?)))
 }

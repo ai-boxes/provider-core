@@ -26,7 +26,7 @@ use provider_usage::{
     ExecutionOutcome, InlinePriceRecord, LogicalRequestStart, LogicalRequestTerminal,
     LogicalStatus, LogicalWriteOutcome, ObservedCatalogCost, PriceResolution, StoredCatalog,
     StoredLogicalRequest, TrackingGapReason, TrackingState, UsageRepository, UsageRepositoryError,
-    UsdAtoms,
+    UsdAtoms, gap_bucket,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
@@ -120,11 +120,8 @@ impl UsageRepository for SqliteUsageRepository {
                 "refusing to store a non-terminal logical status as terminal",
             ));
         }
-        let (tracking_state, gap_reason) = tracking_columns(terminal.tracking);
         let state_version = i64::from(terminal.state_version);
-
-        // The guard makes a late or duplicated event a no-op instead of a
-        // rollback to older state.
+        let (tracking_state, gap_reason) = tracking_columns(terminal.tracking);
         let result = sqlx::query(
             r#"
             UPDATE usage_logical_requests
@@ -158,10 +155,6 @@ impl UsageRepository for SqliteUsageRepository {
             return Ok(LogicalWriteOutcome::Written);
         }
 
-        // Nothing changed: either the start row was never persisted, or a newer
-        // state is already stored. The two mean different things to the caller.
-        // The follow-up read is safe because the bounded writer is the only
-        // writer, so no concurrent insert can land between the two statements.
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM usage_logical_requests WHERE request_id = ?")
                 .bind(&terminal.request_id)
@@ -543,27 +536,60 @@ impl UsageRepository for SqliteUsageRepository {
     }
 
     async fn recover_in_flight_requests(&self, now_ms: i64) -> Result<u64, UsageRepositoryError> {
-        // A request a previous run left in flight has no knowable terminal. It
-        // becomes `incomplete` with a gap, never a guessed success or failure.
-        let result = sqlx::query(
+        let mut connection = self.pool.acquire().await.map_err(|error| {
+            usage_error(
+                "failed to acquire in-flight usage recovery connection",
+                error,
+            )
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to start in-flight usage recovery", error))?;
+        let rows = sqlx::query(
             r#"
-            UPDATE usage_logical_requests
-            SET
-                completed_at_ms = ?,
-                logical_status = 'incomplete',
-                execution_outcome = 'recovered_old_run_active',
-                delivery_outcome = 'unknown',
-                tracking_state = 'gap',
-                tracking_gap_reason = 'recovered_in_flight',
-                state_version = state_version + 1
+            SELECT owner_user_id, COUNT(*) AS request_count
+            FROM usage_logical_requests
             WHERE logical_status = 'in_progress'
+            GROUP BY owner_user_id
             "#,
         )
-        .bind(now_ms)
-        .execute(&self.pool)
+        .fetch_all(&mut *connection)
         .await
-        .map_err(|error| usage_error("failed to recover in-flight usage requests", error))?;
-        Ok(result.rows_affected())
+        .map_err(|error| usage_error("failed to group in-flight usage requests", error))?;
+        let mut recovered = 0u64;
+        for row in rows {
+            let owner_user_id: String = row.get("owner_user_id");
+            let count: i64 = row.get("request_count");
+            let count = u64::try_from(count)
+                .map_err(|_| UsageRepositoryError::new("invalid in-flight usage count"))?;
+            recovered = recovered
+                .checked_add(count)
+                .ok_or_else(|| UsageRepositoryError::new("in-flight usage count overflowed"))?;
+            sqlx::query(
+                r#"
+                INSERT INTO usage_tracking_gaps (owner_user_id, reason, bucket_start_ms, count)
+                VALUES (?, 'recovered_in_flight', ?, ?)
+                ON CONFLICT (owner_user_id, reason, bucket_start_ms) DO UPDATE SET
+                    count = count + excluded.count
+                "#,
+            )
+            .bind(owner_user_id)
+            .bind(gap_bucket(now_ms))
+            .bind(i64::try_from(count).expect("SQLite count already fits i64"))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to record recovered usage gap", error))?;
+        }
+        sqlx::query("DELETE FROM usage_logical_requests WHERE logical_status = 'in_progress'")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to discard in-flight usage requests", error))?;
+        sqlx::query("COMMIT")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to commit in-flight usage recovery", error))?;
+        Ok(recovered)
     }
 
     async fn load_logical_request(
@@ -1620,7 +1646,7 @@ fn unknown_value(field: &str, value: &str) -> UsageRepositoryError {
 mod tests {
     use std::sync::Arc;
 
-    use provider_auth::{AccountRepository, ApiKeyId, QuotaReservationOutcome};
+    use provider_auth::{ApiKeyId, AuthRepository, QuotaReservationOutcome};
     use provider_usage::{
         CatalogInlinePriceRecordV1, ComponentPrices, PRICE_SCALE, QuotaLedgerWriter, UnitPrice,
     };
@@ -1697,6 +1723,23 @@ mod tests {
                 quantity: 42,
             }],
             warnings: vec![NormalizationWarning::FieldConflict],
+        }
+    }
+
+    fn zero_observation() -> ProviderUsageObservation {
+        ProviderUsageObservation {
+            uncached_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_read_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_write_input_tokens: TokenMetric::NotApplicable,
+            effective_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            output_tokens: TokenMetric::ProviderReported { value: 0 },
+            reasoning_tokens: TokenMetric::ProviderReported { value: 0 },
+            input_audio_tokens: TokenMetric::NotApplicable,
+            output_audio_tokens: TokenMetric::NotApplicable,
+            total_tokens: TokenMetric::ProviderReported { value: 0 },
+            pricing_context_tokens: TokenMetric::ProviderReported { value: 0 },
+            billable: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1963,17 +2006,15 @@ mod tests {
         insert_reservation(&repository, "req-over-reservation", "key-1", "50").await;
 
         let writer = QuotaLedgerWriter::spawn(repository.clone(), 1);
-        let receipt = writer
-            .reserve()
-            .await
-            .expect("quota writer permit")
-            .submit(provider_usage::QuotaLedgerEntry {
+        let receipt = writer.reserve().await.expect("quota writer permit").submit(
+            provider_usage::QuotaLedgerEntry {
                 entry_id: "req-over-reservation".to_owned(),
                 api_key_id: "key-1".to_owned(),
                 dispatched: true,
                 cost_atoms: Some("140".to_owned()),
                 resolved_at_ms: 10,
-            });
+            },
+        );
 
         assert!(receipt.persisted().await);
         assert!(writer.drain().await);
@@ -2324,6 +2365,10 @@ mod tests {
             .await
             .expect("begin");
         repository
+            .record_attempt(&attempt("req-1", "att-2", 2))
+            .await
+            .expect("record final attempt");
+        repository
             .complete_logical_request(&terminal("req-1", "att-2", 2))
             .await
             .expect("newer");
@@ -2348,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_closes_in_flight_requests_as_incomplete_with_a_gap() {
+    async fn recovery_discards_in_flight_requests_and_keeps_a_gap() {
         let repository = repository().await;
         repository
             .begin_logical_request(&start("req-live"))
@@ -2358,6 +2403,10 @@ mod tests {
             .begin_logical_request(&start("req-done"))
             .await
             .expect("begin");
+        repository
+            .record_attempt(&attempt("req-done", "att-1", 1))
+            .await
+            .expect("record completed request attempt");
         repository
             .complete_logical_request(&terminal("req-done", "att-1", 1))
             .await
@@ -2372,24 +2421,21 @@ mod tests {
             "only what a previous run left running is closed"
         );
 
-        let recovered = repository
-            .load_logical_request("req-live")
-            .await
-            .expect("load")
-            .expect("present");
-        assert_eq!(recovered.status, LogicalStatus::Incomplete);
-        assert_eq!(recovered.completed_at_ms, Some(1_700_000_009_000));
-        assert_eq!(
-            recovered.tracking,
-            TrackingState::Gap {
-                reason: TrackingGapReason::RecoveredInFlight
-            },
-            "an unknowable terminal is admitted, not guessed"
+        assert!(
+            repository
+                .load_logical_request("req-live")
+                .await
+                .expect("load")
+                .is_none(),
+            "an unknowable request is not retained as Usage"
         );
-        assert_eq!(
-            recovered.execution,
-            Some(ExecutionOutcome::RecoveredOldRunActive)
-        );
+        let recovered_gaps: i64 = sqlx::query_scalar(
+            "SELECT count FROM usage_tracking_gaps WHERE owner_user_id = 'user-1' AND reason = 'recovered_in_flight'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load recovered tracking gap");
+        assert_eq!(recovered_gaps, 1, "recovery still admits the tracking gap");
 
         let untouched = repository
             .load_logical_request("req-done")
@@ -2397,6 +2443,143 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(untouched.status, LogicalStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn failed_request_and_attempt_gap_are_retained_without_changing_exact_spend() {
+        let repository = repository().await;
+        insert_api_key(&repository, "key-1", None).await;
+        repository
+            .begin_logical_request(&start("req-failed"))
+            .await
+            .expect("begin");
+        let mut facts = attempt("req-failed", "att-failed", 1);
+        facts.tracking = TrackingState::Gap {
+            reason: TrackingGapReason::ObservationLost,
+        };
+        facts.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(40),
+            status: CostStatus::CompleteForObservedCatalogComponents,
+            reasons: Vec::new(),
+            calculator_version: 1,
+        };
+        repository
+            .record_attempt(&facts)
+            .await
+            .expect("record attempt");
+        let mut failed = terminal("req-failed", "att-failed", 1);
+        failed.status = LogicalStatus::Failed;
+        failed.execution = Some(ExecutionOutcome::StableFailure);
+        assert_eq!(
+            repository
+                .complete_logical_request(&failed)
+                .await
+                .expect("complete failed request"),
+            LogicalWriteOutcome::Written
+        );
+
+        let logicals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logical_requests")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count logical requests");
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_attempts")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count attempts");
+        let spent: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load exact spend");
+        let attempt_gap: String = sqlx::query_scalar(
+            "SELECT tracking_gap_reason FROM usage_attempts WHERE id = 'att-failed'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load attempt gap");
+        assert_eq!((logicals, attempts), (1, 1));
+        assert_eq!(attempt_gap, "observation_lost");
+        assert_eq!(spent, "40", "retention must not change exact spend");
+    }
+
+    #[tokio::test]
+    async fn succeeded_request_with_only_zero_tokens_is_retained_as_an_outcome() {
+        let repository = repository().await;
+        repository
+            .begin_logical_request(&start("req-zero"))
+            .await
+            .expect("begin");
+        let mut facts = attempt("req-zero", "att-zero", 1);
+        facts.observation = zero_observation();
+        repository
+            .record_attempt(&facts)
+            .await
+            .expect("record attempt");
+        assert_eq!(
+            repository
+                .complete_logical_request(&terminal("req-zero", "att-zero", 1))
+                .await
+                .expect("complete zero-token request"),
+            LogicalWriteOutcome::Written
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logical_requests")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count logical requests");
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn succeeded_request_without_a_final_attempt_is_retained_as_an_outcome() {
+        let repository = repository().await;
+        repository
+            .begin_logical_request(&start("req-no-attempt"))
+            .await
+            .expect("begin");
+        let terminal = LogicalRequestTerminal {
+            final_attempt_id: None,
+            ..terminal("req-no-attempt", "unused", 1)
+        };
+        assert_eq!(
+            repository
+                .complete_logical_request(&terminal)
+                .await
+                .expect("complete request without attempt"),
+            LogicalWriteOutcome::Written
+        );
+        let stored = repository
+            .load_logical_request("req-no-attempt")
+            .await
+            .expect("load")
+            .expect("operational outcome remains stored");
+        assert_eq!(stored.status, LogicalStatus::Succeeded);
+        assert!(stored.final_attempt_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn succeeded_request_with_positive_final_tokens_is_retained() {
+        let repository = repository().await;
+        repository
+            .begin_logical_request(&start("req-valid"))
+            .await
+            .expect("begin");
+        repository
+            .record_attempt(&attempt("req-valid", "att-valid", 1))
+            .await
+            .expect("record attempt");
+        assert_eq!(
+            repository
+                .complete_logical_request(&terminal("req-valid", "att-valid", 1))
+                .await
+                .expect("complete valid request"),
+            LogicalWriteOutcome::Written
+        );
+        let stored = repository
+            .load_logical_request("req-valid")
+            .await
+            .expect("load")
+            .expect("valid Usage must remain");
+        assert_eq!(stored.status, LogicalStatus::Succeeded);
     }
 
     #[tokio::test]

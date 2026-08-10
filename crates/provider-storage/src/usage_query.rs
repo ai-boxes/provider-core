@@ -33,10 +33,28 @@ use crate::{
 fn scoped_from() -> &'static str {
     r#"
         FROM usage_logical_requests AS l
-        LEFT JOIN usage_attempts AS a
+        INNER JOIN usage_attempts AS a
           ON a.logical_request_id = l.request_id
          AND a.id = l.final_attempt_id
         WHERE l.owner_user_id = ?
+          AND l.logical_status = 'succeeded'
+          AND (
+              a.uncached_input_tokens > 0
+              OR a.cache_read_input_tokens > 0
+              OR a.cache_write_input_tokens > 0
+              OR a.effective_input_tokens > 0
+              OR a.output_tokens > 0
+              OR a.reasoning_tokens > 0
+              OR a.input_audio_tokens > 0
+              OR a.output_audio_tokens > 0
+              OR a.total_tokens > 0
+              OR EXISTS (
+                  SELECT 1
+                  FROM usage_billable_observations AS billable
+                  WHERE billable.attempt_id = a.id
+                    AND billable.quantity > 0
+              )
+          )
           -- All placeholders are positional. A numbered one here would silently
           -- re-use the owner parameter and shift everything after it.
           AND (? IS NULL OR l.api_key_id = ?)
@@ -144,7 +162,8 @@ impl UsageQuery for SqliteUsageRepository {
                 SUM(CASE WHEN l.logical_status = 'failed' THEN 1 ELSE 0 END) AS failures
             FROM usage_logical_requests AS l
             INNER JOIN usage_attempts AS a
-                ON a.id = l.final_attempt_id
+                ON a.logical_request_id = l.request_id
+               AND a.id = l.final_attempt_id
             WHERE a.account_id IN ({placeholders})
               AND l.completed_at_ms >= ?
               AND l.completed_at_ms < ?
@@ -356,8 +375,9 @@ mod tests {
     use provider_core::{
         ProviderKind,
         usage::{
-            CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
-            PricingMode, ProviderUsageObservation, TokenInclusionRules, TokenMetric, TotalSource,
+            BillableComponentCode, BillableObservation, BillableUnit, CacheCapability,
+            CacheEligibility, CacheReportingExpectation, PricingContextBasis, PricingMode,
+            ProviderUsageObservation, TokenInclusionRules, TokenMetric, TotalSource,
             UsageContractSnapshot,
         },
     };
@@ -415,6 +435,23 @@ mod tests {
             total_tokens: TokenMetric::ProviderReported { value: 128 },
             pricing_context_tokens: TokenMetric::ProviderReported { value: 120 },
             billable: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn zero_observation(billable: Vec<BillableObservation>) -> ProviderUsageObservation {
+        ProviderUsageObservation {
+            uncached_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_read_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_write_input_tokens: TokenMetric::NotApplicable,
+            effective_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            output_tokens: TokenMetric::ProviderReported { value: 0 },
+            reasoning_tokens: TokenMetric::ProviderReported { value: 0 },
+            input_audio_tokens: TokenMetric::NotApplicable,
+            output_audio_tokens: TokenMetric::NotApplicable,
+            total_tokens: TokenMetric::ProviderReported { value: 0 },
+            pricing_context_tokens: TokenMetric::ProviderReported { value: 0 },
+            billable,
             warnings: Vec::new(),
         }
     }
@@ -536,6 +573,73 @@ mod tests {
             })
             .await
             .expect("complete");
+    }
+
+    async fn write_custom_observation(
+        repository: &SqliteUsageRepository,
+        request_id: &str,
+        status: LogicalStatus,
+        observation: ProviderUsageObservation,
+    ) {
+        let completed_at_ms = T0 + HOUR;
+        repository
+            .begin_logical_request(&LogicalRequestStart {
+                request_id: request_id.to_owned(),
+                owner_user_id: "user-1".to_owned(),
+                api_key_id: Some("key-1".to_owned()),
+                api_key_label: None,
+                api_key_group_label: None,
+                client_model_raw: Some("gpt-5-codex".to_owned()),
+                routing_model: Some("gpt-5-codex".to_owned()),
+                reasoning_effort: None,
+                started_at_ms: completed_at_ms - 1000,
+            })
+            .await
+            .expect("begin custom request");
+        let attempt_id = format!("{request_id}#1");
+        repository
+            .record_attempt(&AttemptFacts {
+                attempt_id: attempt_id.clone(),
+                logical_request_id: request_id.to_owned(),
+                sequence: AttemptSequence(1),
+                provider: ProviderKind::Codex,
+                account_id: "account-1".to_owned(),
+                configured_model: Some("gpt-5-codex".to_owned()),
+                provider_reported_model: None,
+                started_at_ms: completed_at_ms - 1000,
+                first_token_at_ms: None,
+                completed_at_ms,
+                dispatch_evidence: DispatchEvidence::ResponseObserved,
+                tracking: TrackingState::Complete,
+                contract: contract(),
+                observation,
+                price: resolved_price(),
+                cost: ObservedCatalogCost {
+                    total_known: UsdAtoms::ZERO,
+                    status: CostStatus::CompleteForObservedCatalogComponents,
+                    reasons: Vec::new(),
+                    calculator_version: 1,
+                },
+            })
+            .await
+            .expect("record custom attempt");
+        repository
+            .complete_logical_request(&LogicalRequestTerminal {
+                request_id: request_id.to_owned(),
+                completed_at_ms,
+                status,
+                execution: Some(if status == LogicalStatus::Succeeded {
+                    ExecutionOutcome::StableSuccessTerminal
+                } else {
+                    ExecutionOutcome::StableFailure
+                }),
+                delivery: Some(DeliveryOutcome::CleanEof),
+                final_attempt_id: Some(attempt_id),
+                tracking: TrackingState::Complete,
+                state_version: 1,
+            })
+            .await
+            .expect("complete custom request");
     }
 
     fn scope(owner: &str) -> UsageScope {
@@ -679,7 +783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_health_counts_only_known_successes_and_failures() {
+    async fn provider_health_counts_retained_successes_and_failures() {
         let repository = repository().await;
         let succeeded = Written::new("health-success", "user-1", T0 + HOUR);
         let mut failed = Written::new("health-failed", "user-1", T0 + HOUR);
@@ -691,6 +795,16 @@ mod tests {
         for spec in [&succeeded, &failed, &incomplete, &canceled] {
             write(&repository, spec).await;
         }
+
+        assert_eq!(
+            repository
+                .overview(&scope("user-1"))
+                .await
+                .expect("usage overview")
+                .logical_requests,
+            1,
+            "only the succeeded request is user-visible Usage"
+        );
 
         let health = repository
             .provider_health(
@@ -788,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_logical_request_without_attempts_is_still_queryable() {
+    async fn a_logical_request_without_attempts_is_not_usage() {
         let repository = repository().await;
         repository
             .begin_logical_request(&LogicalRequestStart {
@@ -820,16 +934,84 @@ mod tests {
 
         let scope = scope("user-1");
         let overview = repository.overview(&scope).await.expect("overview");
-        assert_eq!(overview.logical_requests, 1);
+        assert_eq!(overview.logical_requests, 0);
 
         let page = repository
             .requests(&scope, None, 10)
             .await
             .expect("requests");
-        assert_eq!(page.requests.len(), 1);
-        assert_eq!(page.requests[0].request_id, "preflight-failure");
-        assert_eq!(page.requests[0].tokens, TokenTotals::default());
-        assert_eq!(page.requests[0].cost, CostTotals::default());
+        assert!(page.requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_usage_outcome_is_hidden_from_usage_but_counted_as_health_success() {
+        let repository = repository().await;
+        write_custom_observation(
+            &repository,
+            "zero-usage",
+            LogicalStatus::Succeeded,
+            zero_observation(Vec::new()),
+        )
+        .await;
+
+        let scope = scope("user-1");
+        assert_eq!(
+            repository
+                .overview(&scope)
+                .await
+                .expect("overview")
+                .logical_requests,
+            0
+        );
+        assert!(
+            repository
+                .request_attempt(&scope, "zero-usage")
+                .await
+                .expect("detail")
+                .is_none()
+        );
+
+        let health = repository
+            .provider_health(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("health");
+        assert_eq!(health[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn positive_non_token_billable_is_valid_usage() {
+        let repository = repository().await;
+        write_custom_observation(
+            &repository,
+            "tool-call-usage",
+            LogicalStatus::Succeeded,
+            zero_observation(vec![BillableObservation {
+                component_code: BillableComponentCode::ServerToolCall,
+                unit: BillableUnit::Calls,
+                quantity: 1,
+            }]),
+        )
+        .await;
+
+        let scope = scope("user-1");
+        assert_eq!(
+            repository
+                .overview(&scope)
+                .await
+                .expect("overview")
+                .logical_requests,
+            1
+        );
+        let detail = repository
+            .request_attempt(&scope, "tool-call-usage")
+            .await
+            .expect("detail")
+            .expect("billable-only Usage is visible");
+        assert_eq!(detail.observation.billable.len(), 1);
+        assert_eq!(detail.observation.billable[0].quantity, 1);
     }
 
     #[tokio::test]

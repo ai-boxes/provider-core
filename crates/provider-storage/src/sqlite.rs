@@ -2250,7 +2250,10 @@ mod tests {
             .expect("load preserved account")
             .expect("preserved account");
         assert_eq!(preserved.auth_state, AccountAuthState::ReauthRequired);
-        assert_eq!(preserved.safe_error_code.as_deref(), Some("credential_expired"));
+        assert_eq!(
+            preserved.safe_error_code.as_deref(),
+            Some("credential_expired")
+        );
 
         account.credential.revision = 1;
         account.auth_state = AccountAuthState::Active;

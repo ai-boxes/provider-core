@@ -12,6 +12,7 @@ mod quota;
 mod usage_http;
 
 pub use app::run;
+pub use auth_http::ManagementOrigin;
 pub use catalog_source::HttpCatalogSource;
 pub use http::{
     router, router_with_management, router_with_management_and_usage, router_with_usage,

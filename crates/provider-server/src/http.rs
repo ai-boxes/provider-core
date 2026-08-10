@@ -12,9 +12,9 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-#[cfg(test)]
-use provider_auth::ApiKeyPatch;
 use provider_auth::{ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedApiKey};
+#[cfg(test)]
+use provider_auth::{ApiKeyPatch, CreateApiKeyInput};
 use provider_core::{
     AccountId, ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
     ProxyService, RequestMetadata, WireFormat,
@@ -45,6 +45,13 @@ struct AppState {
 
 #[derive(Clone)]
 pub struct ProxyReadiness(Arc<AtomicBool>);
+
+pub(crate) struct ManagementRouterConfig {
+    pub(crate) usage: Option<crate::usage_http::UsageServices>,
+    pub(crate) trusted_proxy_ip: Option<std::net::IpAddr>,
+    pub(crate) management_origin: crate::auth_http::ManagementOrigin,
+    pub(crate) proxy_readiness: ProxyReadiness,
+}
 
 impl ProxyReadiness {
     pub fn new(ready: bool) -> Self {
@@ -101,8 +108,17 @@ pub fn router_with_management(
     manager: ProviderManager,
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
+    management_origin: crate::auth_http::ManagementOrigin,
 ) -> Router {
-    router_with_management_and_usage(service, manager, auth, api_keys, None, None)
+    router_with_management_and_usage(
+        service,
+        manager,
+        auth,
+        api_keys,
+        None,
+        None,
+        management_origin,
+    )
 }
 
 pub fn router_with_management_and_usage(
@@ -112,15 +128,19 @@ pub fn router_with_management_and_usage(
     api_keys: ApiKeyAuthenticator,
     usage: Option<crate::usage_http::UsageServices>,
     trusted_proxy_ip: Option<std::net::IpAddr>,
+    management_origin: crate::auth_http::ManagementOrigin,
 ) -> Router {
     router_with_management_usage_and_readiness(
         service,
         manager,
         auth,
         api_keys,
-        usage,
-        trusted_proxy_ip,
-        ProxyReadiness::new(true),
+        ManagementRouterConfig {
+            usage,
+            trusted_proxy_ip,
+            management_origin,
+            proxy_readiness: ProxyReadiness::new(true),
+        },
     )
 }
 
@@ -129,15 +149,20 @@ pub(crate) fn router_with_management_usage_and_readiness(
     manager: ProviderManager,
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
-    usage: Option<crate::usage_http::UsageServices>,
-    trusted_proxy_ip: Option<std::net::IpAddr>,
-    proxy_readiness: ProxyReadiness,
+    config: ManagementRouterConfig,
 ) -> Router {
+    let ManagementRouterConfig {
+        usage,
+        trusted_proxy_ip,
+        management_origin,
+        proxy_readiness,
+    } = config;
     let auth_state = crate::auth_http::AuthHttpState::new(
         auth.clone(),
         api_keys.clone(),
         manager.clone(),
         trusted_proxy_ip,
+        management_origin.clone(),
     );
     let mut management = crate::management_http::router(manager, usage.clone());
     if let Some(usage) = &usage {
@@ -145,7 +170,7 @@ pub(crate) fn router_with_management_usage_and_readiness(
         // by a logged-in person, never with a proxy API key.
         management = management.merge(crate::usage_http::router(usage.clone()));
     }
-    let management = crate::auth_http::protect(management, auth)
+    let management = crate::auth_http::protect(management, auth, management_origin)
         .layer(DefaultBodyLimit::max(MAX_MANAGEMENT_BODY_BYTES))
         .layer(middleware::from_fn(reject_compressed_request));
     router_with_usage_and_readiness(
@@ -1203,15 +1228,15 @@ mod tests {
             .await
             .expect("API key index");
         let created_key = api_keys
-            .create(
-                &grant.user.id,
-                SecretString::from("test-api-key"),
-                "default".to_owned(),
-                "test".to_owned(),
-                None,
-                None,
+            .create(CreateApiKeyInput {
+                owner_user_id: &grant.user.id,
+                secret: SecretString::from("test-api-key"),
+                group_label: "default".to_owned(),
+                label: "test".to_owned(),
+                expires_at: None,
+                quota_limit_usd: None,
                 now,
-            )
+            })
             .await
             .expect("create API key");
         let api_key = created_key.key.expose_secret().to_owned();

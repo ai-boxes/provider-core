@@ -85,6 +85,12 @@ pub trait AttemptTracking: Send + Sync {
     /// must not record the attempt twice, which would double-count usage.
     fn finished(&self, fields: Option<RawUsageFields>);
 
+    /// The response stream was dropped before any protocol terminal was seen.
+    ///
+    /// Fields observed before cancellation are retained, but the attempt is
+    /// marked with an ambiguity gap because its upstream terminal is unknowable.
+    fn cancelled(&self, fields: Option<RawUsageFields>);
+
     /// The call failed outright, with no stream to read. Terminal.
     ///
     /// `answered` distinguishes a provider that replied with a failure status —

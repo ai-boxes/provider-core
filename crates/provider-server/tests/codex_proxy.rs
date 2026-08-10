@@ -10,7 +10,7 @@ use axum::{
     http::{Response, StatusCode},
     routing::{get, post},
 };
-use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
 use provider_core::{ProviderKind, ProviderVisibility, ProxyService};
 use provider_drivers::codex::CodexDriver;
 use provider_management::{CredentialProviderAccountInput, ProviderManager};
@@ -165,15 +165,15 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .await
         .expect("API key index");
     let created_key = api_keys
-        .create(
-            &grant.user.id,
-            SecretString::from("test-api-key"),
-            "default".to_owned(),
-            "test".to_owned(),
-            None,
-            None,
+        .create(CreateApiKeyInput {
+            owner_user_id: &grant.user.id,
+            secret: SecretString::from("test-api-key"),
+            group_label: "default".to_owned(),
+            label: "test".to_owned(),
+            expires_at: None,
+            quota_limit_usd: None,
             now,
-        )
+        })
         .await
         .expect("create API key");
     let api_key = created_key.key.expose_secret().to_owned();

@@ -46,7 +46,10 @@ async fn metadata_only_update_does_not_discover_or_overwrite_concurrent_auth_sta
     assert_eq!(updated.group_label, "new-group");
     assert_eq!(updated.visibility, ProviderVisibility::Shared);
     assert_eq!(updated.auth_state, AccountAuthState::ReauthRequired);
-    assert_eq!(updated.safe_error_code.as_deref(), Some("credential_expired"));
+    assert_eq!(
+        updated.safe_error_code.as_deref(),
+        Some("credential_expired")
+    );
     assert_eq!(control.builds.load(Ordering::SeqCst), 0);
     assert_eq!(control.discoveries.load(Ordering::SeqCst), 0);
     assert_eq!(control.installs.load(Ordering::SeqCst), 0);
@@ -55,7 +58,10 @@ async fn metadata_only_update_does_not_discover_or_overwrite_concurrent_auth_sta
     assert!(repository.snapshots().is_empty());
     let stored = repository.account();
     assert_eq!(stored.auth_state, AccountAuthState::ReauthRequired);
-    assert_eq!(stored.safe_error_code.as_deref(), Some("credential_expired"));
+    assert_eq!(
+        stored.safe_error_code.as_deref(),
+        Some("credential_expired")
+    );
     assert_eq!(stored.credential.revision, 7);
 }
 
@@ -108,7 +114,10 @@ async fn model_refresh_preserves_concurrent_auth_state() {
     assert_eq!(control.discoveries.load(Ordering::SeqCst), 1);
     let stored = repository.account();
     assert_eq!(stored.auth_state, AccountAuthState::ReauthRequired);
-    assert_eq!(stored.safe_error_code.as_deref(), Some("credential_expired"));
+    assert_eq!(
+        stored.safe_error_code.as_deref(),
+        Some("credential_expired")
+    );
     assert_eq!(stored.credential.revision, 7);
 }
 
@@ -196,10 +205,7 @@ impl ProviderManagementRepository for TestRepository {
     ) -> Result<ProviderSnapshotWriteOutcome, AccountRepositoryError> {
         assert!(!create);
         assert_eq!(expected_credential_revision, Some(7));
-        let mut account = self
-            .account
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut account = self.account.lock().unwrap_or_else(PoisonError::into_inner);
         account.auth_state = AccountAuthState::ReauthRequired;
         account.safe_error_code = Some("credential_expired".to_owned());
         let mut candidate = snapshot.account.clone();
@@ -207,7 +213,9 @@ impl ProviderManagementRepository for TestRepository {
             .is_some_and(|expected| candidate.credential.revision <= expected)
         {
             candidate.auth_state = account.auth_state;
-            candidate.safe_error_code.clone_from(&account.safe_error_code);
+            candidate
+                .safe_error_code
+                .clone_from(&account.safe_error_code);
         }
         *account = candidate;
         self.snapshots
@@ -233,10 +241,7 @@ impl ProviderManagementRepository for TestRepository {
         account_id: &AccountId,
         update: ProviderAccountUpdate,
     ) -> Result<bool, AccountRepositoryError> {
-        let mut account = self
-            .account
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut account = self.account.lock().unwrap_or_else(PoisonError::into_inner);
         if &account.id != account_id {
             return Ok(false);
         }

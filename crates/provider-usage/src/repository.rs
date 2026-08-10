@@ -158,6 +158,10 @@ pub trait UsageRepository: Send + Sync {
     ) -> Result<LogicalWriteOutcome, UsageRepositoryError>;
 
     /// Persist a logical request's terminal state.
+    ///
+    /// Operational outcomes are retained even when they are not user-visible
+    /// Usage. Read queries apply the Usage eligibility contract separately;
+    /// quota settlement remains independent.
     async fn complete_logical_request(
         &self,
         terminal: &LogicalRequestTerminal,

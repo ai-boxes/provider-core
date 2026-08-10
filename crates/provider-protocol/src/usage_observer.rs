@@ -71,6 +71,7 @@ fn observe_usage(
         attempt: Some(attempt),
         upstream_done: false,
         blind: false,
+        successful_terminal: None,
         extractor,
     };
 
@@ -90,6 +91,9 @@ struct UsageObservingStream {
     /// Set when the upstream framing became unparseable. Observation stops; the
     /// response itself is unaffected.
     blind: bool,
+    /// A successful terminal remains provisional until the stream ends. Any
+    /// explicit unsuccessful terminal is authoritative and cannot be upgraded.
+    successful_terminal: Option<bool>,
     extractor: FrameExtractor,
 }
 
@@ -115,7 +119,7 @@ impl UsageObservingStream {
                 if let Some(frame) = self.decoder.finish() {
                     self.inspect_frame(&frame);
                 }
-                self.report();
+                self.report_finished();
                 None
             }
         }
@@ -153,18 +157,19 @@ impl UsageObservingStream {
             if let Some(model) = &observed.model {
                 attempt.provider_model_observed(model);
             }
-            if observed.success_terminal {
-                // Proof the stream ended the way the protocol says it should,
-                // which is what separates a success from a stream that merely
-                // stopped.
-                attempt.success_terminal_observed();
-            }
             if observed.first_token {
                 attempt.first_token_observed();
             }
         }
-        // A later terminal supersedes an earlier one — but a frame that carried
-        // no usage does not erase usage already observed.
+        match observed.successful_terminal {
+            Some(false) => self.successful_terminal = Some(false),
+            Some(true) if self.successful_terminal.is_none() => {
+                self.successful_terminal = Some(true);
+            }
+            Some(true) | None => {}
+        }
+        // A later usage-bearing frame supersedes an earlier one, while a frame
+        // with no usage does not erase usage already observed.
         if observed.fields.is_some() {
             self.latest = observed.fields;
         }
@@ -172,9 +177,27 @@ impl UsageObservingStream {
 
     /// Tell the attempt the response ended. Safe to call more than once; only the
     /// first call reports.
-    fn report(&mut self) {
+    fn report_finished(&mut self) {
         if let Some(attempt) = self.attempt.take() {
+            if self.successful_terminal == Some(true) {
+                attempt.success_terminal_observed();
+            }
             attempt.finished(self.latest.take());
+        }
+    }
+
+    fn report_cancelled(&mut self) {
+        let Some(attempt) = self.attempt.take() else {
+            return;
+        };
+        match self.successful_terminal {
+            Some(successful) => {
+                if successful {
+                    attempt.success_terminal_observed();
+                }
+                attempt.finished(self.latest.take());
+            }
+            None => attempt.cancelled(self.latest.take()),
         }
     }
 }
@@ -184,7 +207,7 @@ impl Drop for UsageObservingStream {
         // A client disconnect drops us mid-stream: report whatever was already
         // observed instead of losing it, and let `upstream` drop so no
         // background reading continues.
-        self.report();
+        self.report_cancelled();
     }
 }
 
@@ -197,7 +220,9 @@ struct ObservedFrame {
     model: Option<String>,
     /// Whether this frame carries the first non-empty output delta.
     first_token: bool,
-    success_terminal: bool,
+    /// `Some(true)` proves success, `Some(false)` proves an unsuccessful
+    /// terminal, and `None` means this was not a terminal frame.
+    successful_terminal: Option<bool>,
 }
 
 /// Pull the terminal facts out of one decoded SSE data frame of an OpenAI
@@ -235,7 +260,7 @@ fn extract_responses_facts(frame: &[u8]) -> Option<ObservedFrame> {
         // rather than trusted at the length a 1 MiB frame allows.
         .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_LEN)
         .map(ToOwned::to_owned);
-    let success_terminal = event.get("type").and_then(Value::as_str) == Some(COMPLETED_EVENT);
+    let successful_terminal = responses_terminal(event_type, response);
     let first_token = event_type
         .is_some_and(|event_type| FIRST_TOKEN_EVENT_TYPES.contains(&event_type))
         && event
@@ -243,14 +268,14 @@ fn extract_responses_facts(frame: &[u8]) -> Option<ObservedFrame> {
             .and_then(Value::as_str)
             .is_some_and(|delta| !delta.is_empty());
 
-    if usage.is_none() && model.is_none() && !success_terminal && !first_token {
+    if usage.is_none() && model.is_none() && successful_terminal.is_none() && !first_token {
         return None;
     }
     Some(ObservedFrame {
         fields: usage.map(RawUsageFields::from_responses_usage),
         model,
         first_token,
-        success_terminal,
+        successful_terminal,
     })
 }
 
@@ -261,7 +286,7 @@ fn extract_chat_completions_facts(frame: &[u8]) -> Option<ObservedFrame> {
             fields: None,
             model: None,
             first_token: false,
-            success_terminal: true,
+            successful_terminal: Some(true),
         });
     }
     if !contains_subslice(frame, b"usage")
@@ -279,28 +304,59 @@ fn extract_chat_completions_facts(frame: &[u8]) -> Option<ObservedFrame> {
         .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_LEN)
         .map(ToOwned::to_owned);
     let choices = event.get("choices").and_then(Value::as_array);
-    let success_terminal = choices.is_some_and(|choices| {
-        choices.iter().any(|choice| {
-            choice
-                .get("finish_reason")
-                .is_some_and(|reason| !reason.is_null())
-        })
-    });
+    let successful_terminal = chat_completion_terminal(choices);
     let first_token = choices.is_some_and(|choices| {
         choices
             .iter()
             .any(|choice| choice.get("delta").is_some_and(chat_delta_has_output))
     });
 
-    if usage.is_none() && model.is_none() && !success_terminal && !first_token {
+    if usage.is_none() && model.is_none() && successful_terminal.is_none() && !first_token {
         return None;
     }
     Some(ObservedFrame {
         fields: usage.map(RawUsageFields::from_chat_completions_usage),
         model,
         first_token,
-        success_terminal,
+        successful_terminal,
     })
+}
+
+fn chat_completion_terminal(choices: Option<&Vec<Value>>) -> Option<bool> {
+    let reasons = choices?
+        .iter()
+        .filter_map(|choice| choice.get("finish_reason"))
+        .filter(|reason| !reason.is_null())
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(reasons.iter().all(|reason| {
+        matches!(
+            reason.as_str(),
+            Some("stop" | "tool_calls" | "function_call")
+        )
+    }))
+}
+
+fn responses_terminal(event_type: Option<&str>, response: Option<&Value>) -> Option<bool> {
+    let response_status = response
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str);
+    if matches!(
+        event_type,
+        Some(
+            "response.incomplete" | "response.failed" | "response.canceled" | "response.cancelled"
+        )
+    ) || matches!(
+        response_status,
+        Some("incomplete" | "failed" | "canceled" | "cancelled")
+    ) {
+        return Some(false);
+    }
+    (event_type == Some(COMPLETED_EVENT)
+        && response_status.is_none_or(|status| status == "completed"))
+    .then_some(true)
 }
 
 fn chat_delta_has_output(delta: &Value) -> bool {
@@ -364,6 +420,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingAttempt {
         finished: Mutex<Option<Option<RawUsageFields>>>,
+        cancelled: Mutex<bool>,
         observation_lost: Mutex<bool>,
         first_token: Mutex<bool>,
         success_terminal: Mutex<bool>,
@@ -385,6 +442,10 @@ mod tests {
 
         fn saw_first_token(&self) -> bool {
             *self.first_token.lock().expect("first token lock")
+        }
+
+        fn was_cancelled(&self) -> bool {
+            *self.cancelled.lock().expect("cancelled lock")
         }
     }
 
@@ -411,6 +472,11 @@ mod tests {
             let mut slot = self.finished.lock().expect("finished lock");
             assert!(slot.is_none(), "an attempt must be told exactly once");
             *slot = Some(fields);
+        }
+
+        fn cancelled(&self, fields: Option<RawUsageFields>) {
+            *self.cancelled.lock().expect("cancelled lock") = true;
+            self.finished(fields);
         }
 
         fn failed(&self, _answered: bool) {}
@@ -488,6 +554,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_length_terminal_with_usage_is_not_success() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_chat_completions_usage(
+            byte_stream(vec![
+                "data: {\"id\":\"chat_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+                "data: [DONE]\n\n",
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(
+            !observed.saw_success_terminal(),
+            "length is an explicit incomplete terminal, even when followed by [DONE]"
+        );
+        assert_eq!(
+            observed
+                .reported()
+                .expect("attempt told")
+                .expect("usage")
+                .total,
+            Some(16)
+        );
+    }
+
+    #[tokio::test]
+    async fn later_choice_length_downgrades_an_earlier_choice_stop() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_chat_completions_usage(
+            byte_stream(vec![
+                "data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"chat_1\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+                "data: [DONE]\n\n",
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(
+            !observed.saw_success_terminal(),
+            "an explicitly incomplete choice makes the whole completion unsuccessful"
+        );
+        assert_eq!(
+            observed
+                .reported()
+                .expect("attempt told")
+                .expect("usage")
+                .total,
+            Some(16)
+        );
+    }
+
+    #[tokio::test]
     async fn usage_outside_the_completed_event_is_not_a_success_terminal() {
         // A stream that reports usage on an incomplete or failed event has not
         // demonstrated success, and must not be recorded as if it had.
@@ -505,6 +624,32 @@ mod tests {
             .expect("attempt told")
             .expect("usage is still recorded");
         assert_eq!(fields.input, Some(5), "the usage it did report is kept");
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_status_cannot_be_upgraded_to_success() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_responses_usage(
+            byte_stream(vec![
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(
+            !observed.saw_success_terminal(),
+            "the first explicit unsuccessful terminal is final"
+        );
+        assert_eq!(
+            observed
+                .reported()
+                .expect("attempt told")
+                .expect("usage")
+                .input,
+            Some(5)
+        );
     }
 
     #[tokio::test]
@@ -548,6 +693,28 @@ mod tests {
             .expect("drop reported")
             .expect("usage observed before the drop");
         assert_eq!(fields.input, Some(120));
+        assert!(
+            !observed.was_cancelled(),
+            "an observed protocol terminal makes the attempt outcome knowable"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_before_a_terminal_reports_an_ambiguous_cancel() {
+        let (observed, attempt) = recording_attempt();
+        let mut stream = observe_responses_usage(
+            byte_stream(vec![
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                COMPLETED,
+            ]),
+            attempt,
+        );
+
+        let _first = stream.next().await.expect("first chunk");
+        drop(stream);
+
+        assert!(observed.was_cancelled());
+        assert!(observed.reported().is_some());
     }
 
     #[tokio::test]

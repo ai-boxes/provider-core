@@ -25,5 +25,5 @@ pub use repository::{
 };
 pub use service::{
     ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedApiKey, AuthenticatedSession,
-    CreatedRegistrationCode, REGISTRATION_CODE_TTL_SECONDS, SessionGrant,
+    CreateApiKeyInput, CreatedRegistrationCode, REGISTRATION_CODE_TTL_SECONDS, SessionGrant,
 };

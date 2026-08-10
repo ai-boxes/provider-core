@@ -2,6 +2,8 @@ use std::{io, net::IpAddr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+use crate::ManagementOrigin;
+
 /// Default bind address for local (non-container) runs.
 pub(crate) const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:8317";
 
@@ -18,6 +20,8 @@ pub(crate) const TRUSTED_PROXY_IP_ENV: &str = "PODE_TRUSTED_PROXY_IP";
 
 /// Base64-encoded 32-byte key used for the single supported credential ciphertext format.
 pub(crate) const PROVIDER_CREDENTIAL_KEY_ENV: &str = "PODE_PROVIDER_CREDENTIAL_KEY";
+
+pub(crate) const MANAGEMENT_ORIGIN_ENV: &str = "PODE_MANAGEMENT_ORIGIN";
 
 /// Resolved listen address. Docker sets `PODE_LISTEN_ADDRESS=0.0.0.0:8317`.
 pub(crate) fn listen_address() -> String {
@@ -53,6 +57,21 @@ pub(crate) fn trusted_proxy_ip() -> Result<Option<IpAddr>, io::Error> {
             format!("{TRUSTED_PROXY_IP_ENV} is invalid: {error}"),
         )),
     }
+}
+
+pub(crate) fn management_origin() -> Result<ManagementOrigin, io::Error> {
+    let origin = std::env::var(MANAGEMENT_ORIGIN_ENV).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MANAGEMENT_ORIGIN_ENV} is required: {error}"),
+        )
+    })?;
+    ManagementOrigin::try_new(&origin).map_err(|message| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MANAGEMENT_ORIGIN_ENV} {message}"),
+        )
+    })
 }
 
 pub(crate) fn provider_credential_key() -> Result<[u8; 32], io::Error> {

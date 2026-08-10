@@ -48,6 +48,16 @@ pub struct AuthenticatedApiKey {
     pub quota_limit_atoms: Option<String>,
 }
 
+pub struct CreateApiKeyInput<'a> {
+    pub owner_user_id: &'a UserId,
+    pub secret: SecretString,
+    pub group_label: String,
+    pub label: String,
+    pub expires_at: Option<i64>,
+    pub quota_limit_usd: Option<String>,
+    pub now: i64,
+}
+
 impl AuthService {
     #[must_use]
     pub fn new(repository: Arc<dyn AuthRepository>) -> Self {
@@ -325,16 +335,16 @@ impl ApiKeyAuthenticator {
         })
     }
 
-    pub async fn create(
-        &self,
-        owner_user_id: &UserId,
-        secret: SecretString,
-        group_label: String,
-        label: String,
-        expires_at: Option<i64>,
-        quota_limit_usd: Option<String>,
-        now: i64,
-    ) -> Result<CreatedApiKey, AuthError> {
+    pub async fn create(&self, input: CreateApiKeyInput<'_>) -> Result<CreatedApiKey, AuthError> {
+        let CreateApiKeyInput {
+            owner_user_id,
+            secret,
+            group_label,
+            label,
+            expires_at,
+            quota_limit_usd,
+            now,
+        } = input;
         let label = normalize_label(label)?;
         let group_label = normalize_group_label(group_label)?;
         validate_api_key_secret(&secret)?;

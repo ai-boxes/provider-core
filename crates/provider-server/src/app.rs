@@ -23,10 +23,10 @@ use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
     config::{
-        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address,
+        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address, management_origin,
         provider_credential_key, trusted_proxy_ip,
     },
-    http::{ProxyReadiness, router_with_management_usage_and_readiness},
+    http::{ManagementRouterConfig, ProxyReadiness, router_with_management_usage_and_readiness},
 };
 
 /// How long shutdown waits for queued usage facts before giving up on them.
@@ -94,22 +94,21 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
     let auth = AuthService::new(repository.clone());
 
-    // Usage facts share the accounts database. Anything a previous run left in
-    // flight has no knowable terminal, so it is closed as incomplete with a gap
-    // before this run records anything new.
+    // Usage facts share the accounts database. A prior run's unresolved quota
+    // reservations are released because no terminal cost can be invented.
     let recovered_quota = usage_repository
         .recover_quota_reservations(system_clock_ms())
         .await?;
     if recovered_quota > 0 {
-        eprintln!(
-            "settled {recovered_quota} quota reservation(s) left by a previous run at their maximum"
-        );
+        eprintln!("released {recovered_quota} unresolved quota reservation(s)");
     }
     let recovered = usage_repository
         .recover_in_flight_requests(unix_timestamp() * 1000)
         .await?;
     if recovered > 0 {
-        eprintln!("closed {recovered} usage request(s) left in flight by a previous run");
+        eprintln!(
+            "discarded {recovered} usage request(s) left in flight and recorded tracking gaps"
+        );
     }
     let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
     let writer = Arc::new(UsageWriter::spawn(
@@ -173,9 +172,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             manager,
             auth,
             api_keys,
-            Some(usage),
-            trusted_proxy_ip()?,
-            proxy_readiness,
+            ManagementRouterConfig {
+                usage: Some(usage),
+                trusted_proxy_ip: trusted_proxy_ip()?,
+                management_origin: management_origin()?,
+                proxy_readiness,
+            },
         )
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )

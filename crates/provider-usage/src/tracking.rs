@@ -448,6 +448,21 @@ impl AttemptTracker {
         };
     }
 
+    pub fn cancel(&self, raw: Option<RawUsageFields>) {
+        {
+            let mut state = self.lock();
+            if state.raw_usage.is_none() {
+                state.raw_usage = Some(raw);
+            }
+            if matches!(state.tracking, TrackingState::Complete) {
+                state.tracking = TrackingState::Gap {
+                    reason: TrackingGapReason::AmbiguousCancel,
+                };
+            }
+        }
+        self.close();
+    }
+
     /// What this attempt proved about the upstream side.
     ///
     /// Derived from evidence rather than reported, so it can never claim a success
@@ -639,6 +654,10 @@ impl AttemptTracking for AttemptTracker {
     fn finished(&self, fields: Option<RawUsageFields>) {
         self.record_usage(fields);
         self.close();
+    }
+
+    fn cancelled(&self, fields: Option<RawUsageFields>) {
+        self.cancel(fields);
     }
 
     fn failed(&self, answered: bool) {
