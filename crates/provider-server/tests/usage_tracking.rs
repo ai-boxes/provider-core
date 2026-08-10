@@ -31,7 +31,7 @@ use provider_core::{
     usage::{TokenMetric, TokenUnknownReason},
 };
 use provider_drivers::codex::CodexDriver;
-use provider_management::ProviderManager;
+use provider_management::{CredentialProviderAccountInput, ProviderManager};
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
@@ -222,21 +222,23 @@ async fn deployment_with_pricing(
     let created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
-            ProviderKind::Codex,
-            "Codex".to_owned(),
-            "default".to_owned(),
-            SecretString::from(
-                json!({
-                    "type": "codex",
-                    "auth_kind": "oauth",
-                    "access_token": "old-access",
-                    "refresh_token": "old-refresh",
-                    "id_token": "e30.e30.sig",
-                    "last_refreshed_at": now
-                })
-                .to_string(),
-            ),
-            ProviderVisibility::Private,
+            CredentialProviderAccountInput {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_owned(),
+                group_label: "default".to_owned(),
+                credential_json: SecretString::from(
+                    json!({
+                        "type": "codex",
+                        "auth_kind": "oauth",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "id_token": "e30.e30.sig",
+                        "last_refreshed_at": now
+                    })
+                    .to_string(),
+                ),
+                visibility: ProviderVisibility::Private,
+            },
             now,
         )
         .await
@@ -247,6 +249,7 @@ async fn deployment_with_pricing(
     let created_key = api_keys
         .create(
             &grant.user.id,
+            SecretString::from("test-api-key"),
             "default".to_owned(),
             "test".to_owned(),
             None,
@@ -687,30 +690,31 @@ async fn a_priced_response_records_an_exact_cost() {
     );
 }
 
-/// Log in and return the access token, so the usage endpoints can be called the
-/// way a dashboard calls them.
+/// Log in and return the cookie header used by the management UI.
 async fn login(server_url: &str, username: &str, password: &str) -> String {
-    let text = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/auth/login"))
+        .header(reqwest::header::ORIGIN, "https://admin.example.com")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": username, "password": password }).to_string())
         .send()
         .await
-        .expect("login request")
-        .text()
-        .await
-        .expect("login body");
-    let body: Value = serde_json::from_str(&text).expect("login json");
-    body["data"]["access_token"]
-        .as_str()
-        .expect("access token")
+        .expect("login request");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| value.starts_with("pode_session="))
+        .expect("session cookie")
         .to_owned()
 }
 
-async fn get_usage(server_url: &str, token: &str, path: &str) -> (StatusCode, Value) {
+async fn get_usage(server_url: &str, cookie: &str, path: &str) -> (StatusCode, Value) {
     let response = reqwest::Client::new()
         .get(format!("{server_url}{path}"))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, cookie)
         .send()
         .await
         .expect("usage request");
@@ -769,8 +773,8 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .expect("proxy request");
     assert!(deployment.writer.drain(Duration::from_secs(10)).await);
 
-    let admin_token = login(&server_url, "admin", "secret").await;
-    let (status, body) = get_usage(&server_url, &admin_token, "/api/v1/usage/overview").await;
+    let admin_cookie = login(&server_url, "admin", "secret").await;
+    let (status, body) = get_usage(&server_url, &admin_cookie, "/api/v1/usage/overview").await;
     assert_eq!(status, StatusCode::OK);
     let overview = &body["data"];
     assert_eq!(overview["logical_requests"], 1);
@@ -781,7 +785,8 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     // A second user with no usage of their own sees nothing, not the admin's.
     let created_text = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/users"))
-        .bearer_auth(&admin_token)
+        .header(reqwest::header::COOKIE, &admin_cookie)
+        .header(reqwest::header::ORIGIN, "https://admin.example.com")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": "other", "password": "other-secret" }).to_string())
         .send()
@@ -796,8 +801,8 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         "second user was created: {created}"
     );
 
-    let other_token = login(&server_url, "other", "other-secret").await;
-    let (status, body) = get_usage(&server_url, &other_token, "/api/v1/usage/overview").await;
+    let other_cookie = login(&server_url, "other", "other-secret").await;
+    let (status, body) = get_usage(&server_url, &other_cookie, "/api/v1/usage/overview").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["data"]["logical_requests"], 0,
@@ -813,7 +818,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .expect("a request was recorded");
     let (status, _) = get_usage(
         &server_url,
-        &other_token,
+        &other_cookie,
         &format!("/api/v1/usage/requests/{request_id}"),
     )
     .await;
@@ -825,7 +830,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
 
     let (status, body) = get_usage(
         &server_url,
-        &admin_token,
+        &admin_cookie,
         &format!("/api/v1/usage/requests/{request_id}"),
     )
     .await;
@@ -887,12 +892,12 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         "a proxy key must not read the dashboard"
     );
 
-    let token = login(&server_url, "admin", "secret").await;
+    let cookie = login(&server_url, "admin", "secret").await;
 
     // A range wider than retention is refused rather than silently truncated.
     let (status, body) = get_usage(
         &server_url,
-        &token,
+        &cookie,
         "/api/v1/usage/overview?from_ms=0&to_ms=99999999999999",
     )
     .await;
@@ -901,39 +906,49 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
 
     let (status, _) = get_usage(
         &server_url,
-        &token,
+        &cookie,
         "/api/v1/usage/overview?from_ms=100&to_ms=100",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty range is refused");
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/overview?unknown=1").await;
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/overview?unknown=1").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
         "unknown fields are refused"
     );
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/series?bucket=fortnight").await;
+    let (status, _) = get_usage(
+        &server_url,
+        &cookie,
+        "/api/v1/usage/series?bucket=fortnight",
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "removed usage APIs stay removed"
     );
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?limit=10").await;
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/requests?limit=10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "page size is server-owned");
 
     for filter in ["api_key_id", "model", "group"] {
         let path = format!("/api/v1/usage/requests?{filter}=%20");
-        let (status, _) = get_usage(&server_url, &token, &path).await;
+        let (status, _) = get_usage(&server_url, &cookie, &path).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "empty {filter} is refused");
     }
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?cursor=garbage").await;
+    let (status, _) = get_usage(
+        &server_url,
+        &cookie,
+        "/api/v1/usage/requests?cursor=garbage",
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/health").await;
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/health").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,

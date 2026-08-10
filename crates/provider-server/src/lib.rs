@@ -8,6 +8,7 @@ mod catalog_source;
 mod config;
 mod http;
 mod management_http;
+mod quota;
 mod usage_http;
 
 pub use app::run;

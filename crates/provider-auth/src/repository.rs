@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     ApiKeyId, NewApiKey, NewRegistrationCode, NewSession, NewUser, SessionId, StoredApiKey,
-    StoredSession, StoredUser, UserId, UserSummary,
+    StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserSummary,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,16 +13,17 @@ pub enum InitialUserCreateOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RefreshSessionOutcome {
-    Updated,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegisterUserOutcome {
     Created,
     InvalidCode,
     Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaReservationOutcome {
+    Reserved,
+    Unlimited,
+    Exceeded,
 }
 
 #[async_trait]
@@ -81,25 +82,10 @@ pub trait AuthRepository: Send + Sync {
 
     async fn create_session(&self, session: NewSession) -> Result<(), AuthRepositoryError>;
 
-    async fn load_session_by_access_hash(
+    async fn load_session_by_token_hash(
         &self,
-        access_token_hash: &[u8; 32],
+        token_hash: &[u8; 32],
     ) -> Result<Option<StoredSession>, AuthRepositoryError>;
-
-    async fn load_session_by_refresh_hash(
-        &self,
-        refresh_token_hash: &[u8; 32],
-    ) -> Result<Option<StoredSession>, AuthRepositoryError>;
-
-    async fn rotate_session(
-        &self,
-        refresh_token_hash: &[u8; 32],
-        new_access_token_hash: [u8; 32],
-        new_refresh_token_hash: [u8; 32],
-        access_expires_at: i64,
-        refresh_expires_at: i64,
-        updated_at: i64,
-    ) -> Result<RefreshSessionOutcome, AuthRepositoryError>;
 
     async fn revoke_session(
         &self,
@@ -124,12 +110,7 @@ pub trait AuthRepository: Send + Sync {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
-        group_label: &str,
-        label: &str,
-        enabled: bool,
-        expires_at: Option<i64>,
-        quota_limit_atoms: Option<Option<String>>,
-        updated_at: i64,
+        update: StoredApiKeyUpdate,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError>;
 
     async fn delete_api_key(
@@ -147,11 +128,15 @@ pub trait AuthRepository: Send + Sync {
         group_label: &str,
     ) -> Result<Vec<String>, AuthRepositoryError>;
 
-    /// Current cumulative known spend for a key, in USD atoms.
-    async fn load_api_key_spent_atoms(
+    /// Atomically reserve the maximum cost of one request against the key's
+    /// current lifetime limit. The repository is the sole admission authority.
+    async fn reserve_api_key_quota(
         &self,
         api_key_id: &ApiKeyId,
-    ) -> Result<Option<(String, bool)>, AuthRepositoryError>;
+        request_id: &str,
+        maximum_cost_atoms: &str,
+        reserved_at_ms: i64,
+    ) -> Result<QuotaReservationOutcome, AuthRepositoryError>;
 
     async fn quota_ledger_ready(&self) -> Result<(), AuthRepositoryError>;
 }

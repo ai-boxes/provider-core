@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, sync::LazyLock, time::Duration};
 
-use provider_core::{DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel};
+use provider_core::{
+    BoundedBodyError, DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel,
+    collect_bounded_body,
+};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 
@@ -111,18 +114,18 @@ impl GrokModelClient {
             )
             .with_upstream_status(status.as_u16()));
         }
-        let body = response.bytes().await.map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Upstream,
-                "failed to read Grok model discovery response",
-            )
-        })?;
-        if body.len() > MAX_MODELS_RESPONSE_SIZE {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Upstream,
-                "Grok model discovery response was too large",
-            ));
-        }
+        let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "failed to read Grok model discovery response",
+                ),
+                BoundedBodyError::TooLarge => ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "Grok model discovery response was too large",
+                ),
+            })?;
         let response: ModelsResponse = serde_json::from_slice(&body).map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,

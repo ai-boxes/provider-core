@@ -86,6 +86,15 @@ pub trait ProviderRoute: Send + Sync {
 
     fn native_format(&self) -> WireFormat;
 
+    fn usage_profile(&self) -> Option<crate::usage::ProviderUsageProfile> {
+        None
+    }
+
+    /// Maximum number of real upstream attempts one execution can make.
+    fn maximum_attempts(&self) -> u32 {
+        1
+    }
+
     /// Execute the request, opening one tracked attempt per real upstream call.
     ///
     /// `tracking` is threaded down here rather than handled by the caller because

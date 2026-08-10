@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::LazyLock, time::Duration};
 
-use futures_util::StreamExt;
-use provider_core::{DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel};
+use provider_core::{
+    BoundedBodyError, DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel,
+    collect_bounded_body,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -170,24 +172,19 @@ async fn read_limited(
     limit: usize,
     operation: &str,
 ) -> Result<Vec<u8>, ProviderError> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| {
-            ProviderError::new(
+    collect_bounded_body(response.bytes_stream(), limit)
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => ProviderError::new(
                 ProviderErrorKind::Upstream,
                 format!("failed to read {operation} response"),
-            )
-        })?;
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(ProviderError::new(
+            ),
+            BoundedBodyError::TooLarge => ProviderError::new(
                 ProviderErrorKind::Upstream,
                 format!("{operation} response was too large"),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            ),
+        })
 }
 
 fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {

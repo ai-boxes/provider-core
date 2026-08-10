@@ -13,7 +13,7 @@ use axum::{
 use provider_auth::{ApiKeyAuthenticator, AuthService};
 use provider_core::{ProviderKind, ProviderVisibility, ProxyService};
 use provider_drivers::codex::CodexDriver;
-use provider_management::ProviderManager;
+use provider_management::{CredentialProviderAccountInput, ProviderManager};
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::SqliteAccountRepository;
@@ -139,21 +139,23 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     let _created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
-            ProviderKind::Codex,
-            "Codex".to_owned(),
-            "default".to_owned(),
-            SecretString::from(
-                json!({
-                    "type": "codex",
-                    "auth_kind": "oauth",
-                    "access_token": "old-access",
-                    "refresh_token": "old-refresh",
-                    "id_token": "e30.e30.sig",
-                    "last_refreshed_at": now
-                })
-                .to_string(),
-            ),
-            ProviderVisibility::Private,
+            CredentialProviderAccountInput {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_owned(),
+                group_label: "default".to_owned(),
+                credential_json: SecretString::from(
+                    json!({
+                        "type": "codex",
+                        "auth_kind": "oauth",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "id_token": "e30.e30.sig",
+                        "last_refreshed_at": now
+                    })
+                    .to_string(),
+                ),
+                visibility: ProviderVisibility::Private,
+            },
             now,
         )
         .await
@@ -165,6 +167,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     let created_key = api_keys
         .create(
             &grant.user.id,
+            SecretString::from("test-api-key"),
             "default".to_owned(),
             "test".to_owned(),
             None,

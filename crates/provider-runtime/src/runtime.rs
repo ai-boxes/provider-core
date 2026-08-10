@@ -141,6 +141,22 @@ impl ProviderRuntime {
         Ok(())
     }
 
+    pub async fn replace(&self, account: Arc<dyn ProviderAccount>) {
+        debug_assert_eq!(account.provider_name(), self.inner.driver.name());
+        let account_id = account.account_id().clone();
+        self.inner.accounts.write().await.insert(
+            account_id.clone(),
+            Arc::new(AccountEntry {
+                account,
+                refresh_gate: Mutex::new(()),
+            }),
+        );
+        let _ = self
+            .inner
+            .scheduler_tx
+            .send(SchedulerCommand::Reschedule(account_id));
+    }
+
     pub async fn remove(&self, account_id: &AccountId) -> bool {
         let removed = self
             .inner

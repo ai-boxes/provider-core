@@ -380,6 +380,52 @@ fn data(value: Value) -> Json<Value> {
     Json(json!({ "data": value }))
 }
 
+pub(crate) struct ApiError {
+    status: StatusCode,
+    error_type: &'static str,
+    message: &'static str,
+}
+
+impl ApiError {
+    const fn invalid_request(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message,
+        }
+    }
+
+    const fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_type: "not_found_error",
+            message: "resource was not found",
+        }
+    }
+
+    /// Storage failures are not described to the caller: the detail would leak
+    /// internals and there is nothing actionable in it.
+    const fn internal() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "api_error",
+            message: "internal server error",
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": { "type": self.error_type, "message": self.message }
+            })),
+        )
+            .into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use provider_core::{
@@ -524,51 +570,5 @@ mod tests {
             prices.output_per_million,
             Some(UnitPrice::from_scaled(6 * PRICE_UNIT))
         );
-    }
-}
-
-pub(crate) struct ApiError {
-    status: StatusCode,
-    error_type: &'static str,
-    message: &'static str,
-}
-
-impl ApiError {
-    const fn invalid_request(message: &'static str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
-            message,
-        }
-    }
-
-    const fn not_found() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            error_type: "not_found_error",
-            message: "resource was not found",
-        }
-    }
-
-    /// Storage failures are not described to the caller: the detail would leak
-    /// internals and there is nothing actionable in it.
-    const fn internal() -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            error_type: "api_error",
-            message: "internal server error",
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "error": { "type": self.error_type, "message": self.message }
-            })),
-        )
-            .into_response()
     }
 }

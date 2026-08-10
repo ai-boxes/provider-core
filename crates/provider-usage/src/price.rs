@@ -72,6 +72,9 @@ pub struct ModelInlinePriceRecordV2 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// `PriceResolution` already boxes this enum; boxing one variant would add a
+// second allocation without shrinking the stored resolution.
+#[allow(clippy::large_enum_variant)]
 pub enum InlinePriceRecord {
     CatalogV1(CatalogInlinePriceRecordV1),
     ModelV2(ModelInlinePriceRecordV2),

@@ -2,7 +2,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use provider_core::{
-    PendingProviderOAuth, ProviderConfigurationError, ProviderOAuthChallenge, StartedProviderOAuth,
+    BoundedBodyError, PendingProviderOAuth, ProviderConfigurationError, ProviderOAuthChallenge,
+    StartedProviderOAuth, collect_bounded_body,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -197,14 +198,16 @@ impl PendingProviderOAuth for GrokPendingOAuth {
                 .await
                 .map_err(|_| ProviderConfigurationError::new("Grok device token request failed"))?;
             let status = response.status();
-            let body = response.bytes().await.map_err(|_| {
-                ProviderConfigurationError::new("failed to read Grok device token response")
-            })?;
-            if body.len() > MAX_RESPONSE_SIZE {
-                return Err(ProviderConfigurationError::new(
-                    "Grok device token response was too large",
-                ));
-            }
+            let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+                .await
+                .map_err(|error| match error {
+                    BoundedBodyError::Read(_) => {
+                        ProviderConfigurationError::new("failed to read Grok device token response")
+                    }
+                    BoundedBodyError::TooLarge => {
+                        ProviderConfigurationError::new("Grok device token response was too large")
+                    }
+                })?;
             let token: DeviceTokenResponse = serde_json::from_slice(&body).map_err(|_| {
                 ProviderConfigurationError::new("Grok device token response was invalid JSON")
             })?;
@@ -288,14 +291,16 @@ async fn response_json<T: for<'de> Deserialize<'de>>(
     operation: &str,
 ) -> Result<T, ProviderConfigurationError> {
     let status = response.status();
-    let body = response.bytes().await.map_err(|_| {
-        ProviderConfigurationError::new(format!("failed to read {operation} response"))
-    })?;
-    if body.len() > MAX_RESPONSE_SIZE {
-        return Err(ProviderConfigurationError::new(format!(
-            "{operation} response was too large"
-        )));
-    }
+    let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => {
+                ProviderConfigurationError::new(format!("failed to read {operation} response"))
+            }
+            BoundedBodyError::TooLarge => {
+                ProviderConfigurationError::new(format!("{operation} response was too large"))
+            }
+        })?;
     if !status.is_success() {
         return Err(ProviderConfigurationError::new(format!(
             "{operation} returned HTTP {status}"

@@ -6,9 +6,7 @@ use thiserror::Error;
 
 pub const PASSWORD_MIN_CHARACTERS: usize = 6;
 pub const PASSWORD_MAX_BYTES: usize = 1024;
-pub const ACCESS_TOKEN_TTL_SECONDS: i64 = 4 * 60 * 60;
-pub const REFRESH_TOKEN_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
-pub const ABSOLUTE_SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 const TOKEN_RANDOM_BYTES: usize = 32;
 const PASSWORD_SALT_BYTES: usize = 16;
@@ -18,12 +16,9 @@ pub struct IssuedSecret {
     pub digest: [u8; 32],
 }
 
-pub struct AccessRefreshTokens {
-    pub access: IssuedSecret,
-    pub refresh: IssuedSecret,
-    pub access_expires_at: i64,
-    pub refresh_expires_at: i64,
-    pub absolute_expires_at: i64,
+pub struct IssuedSession {
+    pub token: IssuedSecret,
+    pub expires_at: i64,
 }
 
 pub fn validate_password(password: &SecretString) -> Result<(), CredentialError> {
@@ -55,19 +50,11 @@ pub fn verify_password(password: &SecretString, encoded: &str) -> Result<bool, C
         .is_ok())
 }
 
-pub fn issue_session_tokens(now: i64) -> Result<AccessRefreshTokens, CredentialError> {
-    let absolute_expires_at = checked_add(now, ABSOLUTE_SESSION_TTL_SECONDS)?;
-    session_tokens(now, absolute_expires_at)
-}
-
-pub fn rotate_session_tokens(
-    now: i64,
-    absolute_expires_at: i64,
-) -> Result<AccessRefreshTokens, CredentialError> {
-    if now >= absolute_expires_at {
-        return Err(CredentialError::SessionExpired);
-    }
-    session_tokens(now, absolute_expires_at)
+pub fn issue_session(now: i64) -> Result<IssuedSession, CredentialError> {
+    Ok(IssuedSession {
+        token: random_secret()?,
+        expires_at: checked_add(now, SESSION_TTL_SECONDS)?,
+    })
 }
 
 pub fn issue_api_key() -> Result<IssuedSecret, CredentialError> {
@@ -81,24 +68,6 @@ pub fn issue_registration_code() -> Result<IssuedSecret, CredentialError> {
 #[must_use]
 pub fn digest_secret(secret: &str) -> [u8; 32] {
     Sha256::digest(secret.as_bytes()).into()
-}
-
-fn session_tokens(
-    now: i64,
-    absolute_expires_at: i64,
-) -> Result<AccessRefreshTokens, CredentialError> {
-    let access_expires_at = checked_add(now, ACCESS_TOKEN_TTL_SECONDS)?.min(absolute_expires_at);
-    let refresh_expires_at = checked_add(now, REFRESH_TOKEN_TTL_SECONDS)?.min(absolute_expires_at);
-    if access_expires_at <= now || refresh_expires_at <= now {
-        return Err(CredentialError::SessionExpired);
-    }
-    Ok(AccessRefreshTokens {
-        access: random_secret()?,
-        refresh: random_secret()?,
-        access_expires_at,
-        refresh_expires_at,
-        absolute_expires_at,
-    })
 }
 
 fn random_secret() -> Result<IssuedSecret, CredentialError> {
@@ -127,8 +96,6 @@ pub enum CredentialError {
     RandomSource,
     #[error("failed to process password hash")]
     PasswordHash,
-    #[error("session has reached its maximum lifetime")]
-    SessionExpired,
     #[error("credential timestamp is out of range")]
     TimestampOutOfRange,
 }
@@ -155,16 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn rotates_tokens_without_exceeding_absolute_session_expiry() {
-        let initial = issue_session_tokens(100).expect("initial tokens");
-        let near_end = initial.absolute_expires_at - 60;
-        let rotated =
-            rotate_session_tokens(near_end, initial.absolute_expires_at).expect("rotated tokens");
+    fn issues_one_fixed_lifetime_session_token() {
+        let session = issue_session(100).expect("session token");
 
-        assert_eq!(rotated.access_expires_at, initial.absolute_expires_at);
-        assert_eq!(rotated.refresh_expires_at, initial.absolute_expires_at);
-        assert_ne!(initial.access.digest, rotated.access.digest);
-        assert_ne!(initial.refresh.digest, rotated.refresh.digest);
+        assert_eq!(session.expires_at, 100 + SESSION_TTL_SECONDS);
+        assert_eq!(
+            session.token.digest,
+            digest_secret(session.token.secret.expose_secret())
+        );
     }
 
     #[test]

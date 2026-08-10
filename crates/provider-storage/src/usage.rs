@@ -29,7 +29,7 @@ use provider_usage::{
     UsdAtoms,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
 
 /// Observed-usage facts stored in the same SQLite database as accounts and auth.
 ///
@@ -47,6 +47,29 @@ impl SqliteUsageRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
+
+async fn add_api_key_spend(
+    connection: &mut SqliteConnection,
+    api_key_id: &str,
+    atoms: &str,
+) -> Result<(), UsageRepositoryError> {
+    let spent: Option<String> = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = ?")
+        .bind(api_key_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| usage_error("failed to load API key spend", error))?;
+    if let Some(spent) = spent {
+        let next = add_atoms(&spent, atoms)
+            .map_err(|_| UsageRepositoryError::new("API key spend overflowed"))?;
+        sqlx::query("UPDATE api_keys SET spent_atoms = ? WHERE id = ?")
+            .bind(next)
+            .bind(api_key_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to update API key spend", error))?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -322,6 +345,38 @@ impl UsageRepository for SqliteUsageRepository {
                 .await
                 .map_err(|error| usage_error("failed to record billable observation", error))?;
             }
+
+            if matches!(
+                cost.status,
+                CostStatus::CompleteForObservedCatalogComponents
+            ) && let Some(cost_atoms) = cost.atoms
+            {
+                // A durable reservation owns finite-quota spend. Its absence
+                // remains authoritative if the key's quota changes in flight.
+                let api_key_id = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT request_row.api_key_id
+                    FROM usage_logical_requests AS request_row
+                    WHERE request_row.request_id = ?
+                      AND request_row.api_key_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM api_key_quota_ledger AS quota
+                          WHERE quota.entry_id = request_row.request_id
+                      )
+                    "#,
+                )
+                .bind(&facts.logical_request_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    usage_error("failed to resolve unreserved API key spend", error)
+                })?;
+                if let Some(api_key_id) = api_key_id {
+                    let cost_atoms = cost_atoms.to_string();
+                    add_api_key_spend(&mut transaction, &api_key_id, &cost_atoms).await?;
+                }
+            }
         }
 
         sqlx::query("COMMIT")
@@ -344,67 +399,117 @@ impl UsageRepository for SqliteUsageRepository {
             .execute(&mut *connection)
             .await
             .map_err(|error| usage_error("failed to start quota ledger transaction", error))?;
-        let state = if entry.cost_atoms.is_some() {
-            "charged"
-        } else {
-            "indeterminate"
-        };
-        let inserted = sqlx::query(
+        let reservation = sqlx::query(
             r#"
-            INSERT INTO api_key_quota_ledger
-                (entry_id, api_key_id, cost_atoms, accounting_state, recorded_at_ms)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (entry_id) DO NOTHING
+            SELECT api_key_id, state
+            FROM api_key_quota_ledger
+            WHERE entry_id = ?
             "#,
         )
         .bind(&entry.entry_id)
-        .bind(&entry.api_key_id)
-        .bind(entry.cost_atoms.as_deref())
-        .bind(state)
-        .bind(entry.recorded_at_ms)
-        .execute(&mut *connection)
+        .fetch_optional(&mut *connection)
         .await
-        .map_err(|error| usage_error("failed to insert quota ledger entry", error))?;
-
-        if inserted.rows_affected() > 0 {
-            if let Some(atoms) = entry.cost_atoms.as_deref() {
-                let spent: Option<String> =
-                    sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = ?")
-                        .bind(&entry.api_key_id)
-                        .fetch_optional(&mut *connection)
-                        .await
-                        .map_err(|error| {
-                            usage_error("failed to load API key quota spend", error)
-                        })?;
-                if let Some(spent) = spent {
-                    let next = add_atoms(&spent, atoms)
-                        .map_err(|_| UsageRepositoryError::new("API key spend overflowed"))?;
-                    sqlx::query("UPDATE api_keys SET spent_atoms = ? WHERE id = ?")
-                        .bind(next)
-                        .bind(&entry.api_key_id)
-                        .execute(&mut *connection)
-                        .await
-                        .map_err(|error| {
-                            usage_error("failed to update API key quota spend", error)
-                        })?;
-                }
-            } else {
-                sqlx::query(
-                    "UPDATE api_keys SET quota_accounting_state = 'indeterminate' WHERE id = ?",
-                )
-                .bind(&entry.api_key_id)
+        .map_err(|error| usage_error("failed to load quota reservation", error))?
+        .ok_or_else(|| UsageRepositoryError::new("quota reservation does not exist"))?;
+        let reserved_key_id: String = reservation
+            .try_get("api_key_id")
+            .map_err(|error| usage_error("failed to decode quota reservation key", error))?;
+        let state: String = reservation
+            .try_get("state")
+            .map_err(|error| usage_error("failed to decode quota reservation state", error))?;
+        if reserved_key_id != entry.api_key_id {
+            return Err(UsageRepositoryError::new(
+                "quota reservation belongs to a different API key",
+            ));
+        }
+        if state != "reserved" {
+            sqlx::query("COMMIT")
                 .execute(&mut *connection)
                 .await
-                .map_err(|error| {
-                    usage_error("failed to mark API key quota indeterminate", error)
-                })?;
+                .map_err(|error| usage_error("failed to commit quota ledger replay", error))?;
+            return Ok(());
+        }
+
+        if let Some(settled_atoms) = entry.cost_atoms.as_deref() {
+            if !entry.dispatched {
+                return Err(UsageRepositoryError::new(
+                    "an undispatched quota reservation cannot carry a cost",
+                ));
             }
+            sqlx::query(
+                r#"
+                UPDATE api_key_quota_ledger
+                SET state = 'settled', settled_atoms = ?, resolved_at_ms = ?
+                WHERE entry_id = ? AND state = 'reserved'
+                "#,
+            )
+            .bind(settled_atoms)
+            .bind(entry.resolved_at_ms)
+            .bind(&entry.entry_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to settle quota reservation", error))?;
+
+            add_api_key_spend(&mut connection, &entry.api_key_id, settled_atoms).await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE api_key_quota_ledger
+                SET state = 'released', settled_atoms = NULL, resolved_at_ms = ?
+                WHERE entry_id = ? AND state = 'reserved'
+                "#,
+            )
+            .bind(entry.resolved_at_ms)
+            .bind(&entry.entry_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to release quota reservation", error))?;
         }
         sqlx::query("COMMIT")
             .execute(&mut *connection)
             .await
             .map_err(|error| usage_error("failed to commit quota ledger entry", error))?;
         Ok(())
+    }
+
+    async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError> {
+        let mut connection =
+            self.pool.acquire().await.map_err(|error| {
+                usage_error("failed to acquire quota recovery connection", error)
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to start quota recovery transaction", error))?;
+        let rows = sqlx::query(
+            r#"
+            SELECT entry_id
+            FROM api_key_quota_ledger
+            WHERE state = 'reserved'
+            ORDER BY entry_id
+            "#,
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| usage_error("failed to load unresolved quota reservations", error))?;
+        let recovered = u64::try_from(rows.len())
+            .map_err(|_| UsageRepositoryError::new("too many quota reservations to recover"))?;
+        sqlx::query(
+            r#"
+            UPDATE api_key_quota_ledger
+            SET state = 'released', settled_atoms = NULL, resolved_at_ms = ?
+            WHERE state = 'reserved'
+            "#,
+        )
+        .bind(now_ms)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| usage_error("failed to settle recovered quota reservations", error))?;
+        sqlx::query("COMMIT")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to commit quota recovery", error))?;
+        Ok(recovered)
     }
 
     async fn record_tracking_gap(
@@ -509,6 +614,31 @@ impl UsageRepository for SqliteUsageRepository {
             attempts.push(facts);
         }
         Ok(attempts)
+    }
+
+    async fn delete_resolved_quota_ledger_entries_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM api_key_quota_ledger
+            WHERE entry_id IN (
+                SELECT entry_id FROM api_key_quota_ledger
+                WHERE state IN ('settled', 'released')
+                  AND resolved_at_ms < ?
+                ORDER BY resolved_at_ms, entry_id
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(cutoff_ms)
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| usage_error("failed to delete resolved quota ledger entries", error))?;
+        Ok(result.rows_affected())
     }
 
     async fn delete_logical_requests_before(
@@ -1488,7 +1618,12 @@ fn unknown_value(field: &str, value: &str) -> UsageRepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use provider_usage::{CatalogInlinePriceRecordV1, ComponentPrices, PRICE_SCALE, UnitPrice};
+    use std::sync::Arc;
+
+    use provider_auth::{AccountRepository, ApiKeyId, QuotaReservationOutcome};
+    use provider_usage::{
+        CatalogInlinePriceRecordV1, ComponentPrices, PRICE_SCALE, QuotaLedgerWriter, UnitPrice,
+    };
 
     use super::*;
     use crate::SqliteAccountRepository;
@@ -1629,6 +1764,59 @@ mod tests {
         }
     }
 
+    async fn insert_api_key(
+        repository: &SqliteUsageRepository,
+        key_id: &str,
+        quota_limit_atoms: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES ('user-1', 'quota-user', 'hash', 'user', 1, 1, 1)
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert quota user");
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (
+                id, owner_user_id, group_label, label, key,
+                enabled, quota_limit_atoms, spent_atoms, created_at, updated_at
+            )
+            VALUES (?, 'user-1', 'default', 'quota', 'pode-usage-test-key', 1,
+                    ?, '0', 1, 1)
+            "#,
+        )
+        .bind(key_id)
+        .bind(quota_limit_atoms)
+        .execute(&repository.pool)
+        .await
+        .expect("insert API key");
+    }
+
+    async fn insert_reservation(
+        repository: &SqliteUsageRepository,
+        entry_id: &str,
+        api_key_id: &str,
+        reserved_atoms: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_ledger (
+                entry_id, api_key_id, reserved_atoms, state, reserved_at_ms
+            )
+            VALUES (?, ?, ?, 'reserved', 1)
+            "#,
+        )
+        .bind(entry_id)
+        .bind(api_key_id)
+        .bind(reserved_atoms)
+        .execute(&repository.pool)
+        .await
+        .expect("insert quota reservation");
+    }
+
     #[tokio::test]
     async fn an_unknown_token_count_is_null_not_zero() {
         let repository = repository().await;
@@ -1668,99 +1856,231 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_ledger_charges_complete_cost_and_marks_partial_indeterminate() {
+    async fn unlimited_key_spend_records_complete_attempts_once() {
         let repository = repository().await;
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at)
-            VALUES ('user-1', 'quota-user', 'hash', 'user', 1, 1, 1)
-            "#,
-        )
-        .execute(&repository.pool)
-        .await
-        .expect("insert quota user");
-        sqlx::query(
-            r#"
-            INSERT INTO api_keys (
-                id, owner_user_id, group_label, label, key, enabled,
-                quota_limit_atoms, spent_atoms, created_at, updated_at
-            )
-            VALUES ('key-1', 'user-1', 'default', 'quota', 'quota-key-1', 1,
-                    '9999999999999999', '0', 1, 1)
-            "#,
-        )
-        .execute(&repository.pool)
-        .await
-        .expect("insert quota API key");
+        insert_api_key(&repository, "key-1", None).await;
+        repository
+            .begin_logical_request(&start("req-unlimited"))
+            .await
+            .expect("begin unlimited request");
+
+        let mut first = attempt("req-unlimited", "att-1", 1);
+        first.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(40),
+            status: CostStatus::CompleteForObservedCatalogComponents,
+            reasons: Vec::new(),
+            calculator_version: 1,
+        };
+        repository
+            .record_attempt(&first)
+            .await
+            .expect("record first attempt");
+        repository
+            .record_attempt(&first)
+            .await
+            .expect("redeliver first attempt");
+
+        let mut second = attempt("req-unlimited", "att-2", 2);
+        second.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(60),
+            status: CostStatus::CompleteForObservedCatalogComponents,
+            reasons: Vec::new(),
+            calculator_version: 1,
+        };
+        repository
+            .record_attempt(&second)
+            .await
+            .expect("record second attempt");
 
         repository
-            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
-                entry_id: "req-partial".to_owned(),
-                api_key_id: "key-1".to_owned(),
-                cost_atoms: None,
-                recorded_at_ms: 10,
-            })
+            .record_attempt(&attempt("req-unlimited", "att-partial", 3))
             .await
-            .expect("record partial ledger entry");
-        let (spent, state): (String, String) = sqlx::query_as(
-            "SELECT spent_atoms, quota_accounting_state FROM api_keys WHERE id = 'key-1'",
-        )
-        .fetch_one(&repository.pool)
-        .await
-        .expect("load quota after partial cost");
-        assert_eq!((spent.as_str(), state.as_str()), ("0", "indeterminate"));
+            .expect("record partial attempt");
 
-        repository
-            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
-                entry_id: "req-complete".to_owned(),
-                api_key_id: "key-1".to_owned(),
-                cost_atoms: Some("2512500000000".to_owned()),
-                recorded_at_ms: 11,
-            })
-            .await
-            .expect("record complete ledger entry");
-        repository
-            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
-                entry_id: "req-complete".to_owned(),
-                api_key_id: "key-1".to_owned(),
-                cost_atoms: Some("2512500000000".to_owned()),
-                recorded_at_ms: 11,
-            })
-            .await
-            .expect("redeliver complete ledger entry");
         let spent: String =
             sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
                 .fetch_one(&repository.pool)
                 .await
-                .expect("load spend after complete cost");
-        assert_eq!(spent, "2512500000000");
+                .expect("load unlimited key spend");
+        assert_eq!(spent, "100");
+    }
+
+    #[tokio::test]
+    async fn finite_quota_attempt_spend_is_owned_by_the_ledger() {
+        let repository = repository().await;
+        insert_api_key(&repository, "key-1", Some("100")).await;
+        repository
+            .begin_logical_request(&start("req-quota"))
+            .await
+            .expect("begin quota request");
+        insert_reservation(&repository, "req-quota", "key-1", "100").await;
+
+        let mut facts = attempt("req-quota", "att-quota", 1);
+        facts.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(40),
+            status: CostStatus::CompleteForObservedCatalogComponents,
+            reasons: Vec::new(),
+            calculator_version: 1,
+        };
+        repository
+            .record_attempt(&facts)
+            .await
+            .expect("record quota attempt");
+
+        let before_settlement: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load spend before settlement");
+        assert_eq!(before_settlement, "0");
+
+        repository
+            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
+                entry_id: "req-quota".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: true,
+                cost_atoms: Some("40".to_owned()),
+                resolved_at_ms: 10,
+            })
+            .await
+            .expect("settle quota request");
+
+        let after_settlement: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load spend after settlement");
+        assert_eq!(after_settlement, "40");
+    }
+
+    #[tokio::test]
+    async fn quota_ledger_records_observed_cost_above_reservation_and_keeps_writer_ready() {
+        let account_repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("test database");
+        let repository = Arc::new(account_repository.usage_repository());
+        insert_api_key(&repository, "key-1", Some("100")).await;
+        insert_reservation(&repository, "req-over-reservation", "key-1", "50").await;
+
+        let writer = QuotaLedgerWriter::spawn(repository.clone(), 1);
+        let receipt = writer
+            .reserve()
+            .await
+            .expect("quota writer permit")
+            .submit(provider_usage::QuotaLedgerEntry {
+                entry_id: "req-over-reservation".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: true,
+                cost_atoms: Some("140".to_owned()),
+                resolved_at_ms: 10,
+            });
+
+        assert!(receipt.persisted().await);
+        assert!(writer.drain().await);
+        assert!(writer.is_ready());
+        assert_eq!(writer.pending(), 0);
+
+        let ledger: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = ?",
+        )
+        .bind("req-over-reservation")
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load settled quota entry");
+        assert_eq!(ledger, ("settled".to_owned(), Some("140".to_owned())));
+
+        let spent: String = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = ?")
+            .bind("key-1")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("load actual spend");
+        assert_eq!(spent, "140");
+
+        assert_eq!(
+            account_repository
+                .reserve_api_key_quota(
+                    &ApiKeyId::new("key-1").expect("API key ID"),
+                    "req-after-overrun",
+                    "1",
+                    11,
+                )
+                .await
+                .expect("check admission after overrun"),
+            QuotaReservationOutcome::Exceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_ledger_settles_exact_and_releases_unknown_costs_once() {
+        let repository = repository().await;
+        insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+        insert_reservation(&repository, "req-unknown", "key-1", "100").await;
+        insert_reservation(&repository, "req-complete", "key-1", "50").await;
+        insert_reservation(&repository, "req-release", "key-1", "70").await;
+
+        repository
+            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
+                entry_id: "req-unknown".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: true,
+                cost_atoms: None,
+                resolved_at_ms: 10,
+            })
+            .await
+            .expect("release unknown cost");
+
+        let complete = provider_usage::QuotaLedgerEntry {
+            entry_id: "req-complete".to_owned(),
+            api_key_id: "key-1".to_owned(),
+            dispatched: true,
+            cost_atoms: Some("40".to_owned()),
+            resolved_at_ms: 11,
+        };
+        repository
+            .record_quota_ledger_entry(&complete)
+            .await
+            .expect("settle exact cost");
+        repository
+            .record_quota_ledger_entry(&complete)
+            .await
+            .expect("redeliver exact settlement");
+        repository
+            .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
+                entry_id: "req-release".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: false,
+                cost_atoms: None,
+                resolved_at_ms: 12,
+            })
+            .await
+            .expect("release undispatched request");
+        let spent: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load settled spend");
+        assert_eq!(spent, "40");
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, settled_atoms FROM api_key_quota_ledger ORDER BY entry_id",
+        )
+        .fetch_all(&repository.pool)
+        .await
+        .expect("load quota outcomes");
+        assert_eq!(
+            rows,
+            vec![
+                ("settled".to_owned(), Some("40".to_owned())),
+                ("released".to_owned(), None),
+                ("released".to_owned(), None),
+            ]
+        );
     }
 
     #[tokio::test]
     async fn quota_ledger_survives_api_key_deletion_after_dispatch() {
         let repository = repository().await;
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at)
-            VALUES ('user-1', 'quota-delete-user', 'hash', 'user', 1, 1, 1)
-            "#,
-        )
-        .execute(&repository.pool)
-        .await
-        .expect("insert quota user");
-        sqlx::query(
-            r#"
-            INSERT INTO api_keys (
-                id, owner_user_id, group_label, label, key, enabled,
-                quota_limit_atoms, spent_atoms, created_at, updated_at
-            )
-            VALUES ('key-deleted', 'user-1', 'default', 'quota', 'quota-key-deleted', 1,
-                    '9999999999999999', '0', 1, 1)
-            "#,
-        )
-        .execute(&repository.pool)
-        .await
-        .expect("insert quota API key");
+        insert_api_key(&repository, "key-deleted", Some("9999999999999999")).await;
+        insert_reservation(&repository, "req-after-key-delete", "key-deleted", "200").await;
         sqlx::query("DELETE FROM api_keys WHERE id = 'key-deleted'")
             .execute(&repository.pool)
             .await
@@ -1770,20 +2090,135 @@ mod tests {
             .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
                 entry_id: "req-after-key-delete".to_owned(),
                 api_key_id: "key-deleted".to_owned(),
+                dispatched: true,
                 cost_atoms: Some("100".to_owned()),
-                recorded_at_ms: 10,
+                resolved_at_ms: 10,
             })
             .await
             .expect("record terminal ledger entry");
 
         let stored: (String, String) = sqlx::query_as(
-            "SELECT api_key_id, cost_atoms FROM api_key_quota_ledger WHERE entry_id = ?",
+            "SELECT api_key_id, settled_atoms FROM api_key_quota_ledger WHERE entry_id = ?",
         )
         .bind("req-after-key-delete")
         .fetch_one(&repository.pool)
         .await
         .expect("load terminal ledger entry");
         assert_eq!(stored, ("key-deleted".to_owned(), "100".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn quota_ledger_retention_deletes_only_expired_resolved_entries_in_batches() {
+        let repository = repository().await;
+        insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+        for entry_id in [
+            "old-settled",
+            "old-released",
+            "cutoff-settled",
+            "active-reservation",
+        ] {
+            insert_reservation(&repository, entry_id, "key-1", "100").await;
+        }
+
+        for entry in [
+            provider_usage::QuotaLedgerEntry {
+                entry_id: "old-settled".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: true,
+                cost_atoms: Some("40".to_owned()),
+                resolved_at_ms: 10,
+            },
+            provider_usage::QuotaLedgerEntry {
+                entry_id: "old-released".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: false,
+                cost_atoms: None,
+                resolved_at_ms: 20,
+            },
+            provider_usage::QuotaLedgerEntry {
+                entry_id: "cutoff-settled".to_owned(),
+                api_key_id: "key-1".to_owned(),
+                dispatched: true,
+                cost_atoms: Some("30".to_owned()),
+                resolved_at_ms: 50,
+            },
+        ] {
+            repository
+                .record_quota_ledger_entry(&entry)
+                .await
+                .expect("resolve quota ledger entry");
+        }
+
+        assert_eq!(
+            repository
+                .delete_resolved_quota_ledger_entries_before(50, 1)
+                .await
+                .expect("delete first expired entry"),
+            1
+        );
+        assert_eq!(
+            repository
+                .delete_resolved_quota_ledger_entries_before(50, 1)
+                .await
+                .expect("delete second expired entry"),
+            1
+        );
+        assert_eq!(
+            repository
+                .delete_resolved_quota_ledger_entries_before(50, 1)
+                .await
+                .expect("reach retention tail"),
+            0
+        );
+
+        let remaining: Vec<(String, String)> =
+            sqlx::query_as("SELECT entry_id, state FROM api_key_quota_ledger ORDER BY entry_id")
+                .fetch_all(&repository.pool)
+                .await
+                .expect("load remaining quota ledger entries");
+        assert_eq!(
+            remaining,
+            vec![
+                ("active-reservation".to_owned(), "reserved".to_owned()),
+                ("cutoff-settled".to_owned(), "settled".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_releases_unresolved_reservations_without_spend() {
+        let repository = repository().await;
+        insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+        insert_reservation(&repository, "req-1", "key-1", "30").await;
+        insert_reservation(&repository, "req-2", "key-1", "40").await;
+
+        assert_eq!(
+            repository
+                .recover_quota_reservations(100)
+                .await
+                .expect("recover outstanding reservations"),
+            2
+        );
+        assert_eq!(
+            repository
+                .recover_quota_reservations(200)
+                .await
+                .expect("no reservations remain"),
+            0
+        );
+        let spent: String =
+            sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("load recovered spend");
+        assert_eq!(spent, "0");
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_quota_ledger WHERE state = 'reserved'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("count unresolved reservations");
+        assert_eq!(unresolved, 0);
     }
 
     #[tokio::test]

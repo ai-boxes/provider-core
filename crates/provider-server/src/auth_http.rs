@@ -7,21 +7,28 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Extension, Path, Request, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode, header},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State, rejection::JsonRejection,
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use provider_auth::{
-    ApiKeyAuthenticator, ApiKeyId, ApiKeySummary, AuthError, AuthService, AuthenticatedSession,
-    CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant, UserId, UserSummary,
+    ApiKeyAuthenticator, ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthError, AuthService,
+    AuthenticatedSession, CreatedApiKey, CreatedRegistrationCode, CredentialError, SessionGrant,
+    UserId, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
+
+const MANAGEMENT_ORIGIN_ENV: &str = "PODE_MANAGEMENT_ORIGIN";
+const SESSION_COOKIE: &str = "pode_session";
+pub(crate) const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct AuthHttpState {
@@ -29,6 +36,8 @@ pub(crate) struct AuthHttpState {
     api_keys: ApiKeyAuthenticator,
     manager: ProviderManager,
     rate_limits: Arc<AuthRateLimits>,
+    management_origin: HeaderValue,
+    secure_cookie: bool,
 }
 
 impl AuthHttpState {
@@ -39,6 +48,10 @@ impl AuthHttpState {
         manager: ProviderManager,
         trusted_proxy_ip: Option<IpAddr>,
     ) -> Self {
+        let management_origin = std::env::var(MANAGEMENT_ORIGIN_ENV)
+            .unwrap_or_else(|_| panic!("{MANAGEMENT_ORIGIN_ENV} must be configured"));
+        let management_origin = parse_management_origin(&management_origin)
+            .unwrap_or_else(|message| panic!("{MANAGEMENT_ORIGIN_ENV} {message}"));
         Self {
             auth,
             api_keys,
@@ -47,6 +60,8 @@ impl AuthHttpState {
                 trusted_proxy_ip,
                 ..AuthRateLimits::default()
             }),
+            management_origin,
+            secure_cookie: true,
         }
     }
 
@@ -57,6 +72,10 @@ impl AuthHttpState {
 }
 
 pub(crate) fn router(state: AuthHttpState) -> Router {
+    let session_guard = SessionGuardState {
+        auth: state.auth_service(),
+        management_origin: state.management_origin.clone(),
+    };
     let protected = Router::new()
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
@@ -70,8 +89,8 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
             get(get_key).put(update_key).delete(delete_key),
         )
         .route_layer(middleware::from_fn_with_state(
-            state.auth_service(),
-            require_access,
+            session_guard,
+            require_session,
         ));
 
     let login_route = Router::new()
@@ -92,18 +111,43 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
             },
             require_auth_rate,
         ));
+    let setup_post_route = Router::new()
+        .route("/api/v1/auth/setup", post(setup))
+        .route_layer(middleware::from_fn_with_state(
+            AuthRateLimitState {
+                limits: Arc::clone(&state.rate_limits),
+                route: AuthRoute::Setup,
+            },
+            require_auth_rate,
+        ));
 
     Router::new()
-        .route("/api/v1/auth/setup", get(setup_required).post(setup))
-        .route("/api/v1/auth/refresh", post(refresh))
+        .route("/api/v1/auth/setup", get(setup_required))
+        .merge(setup_post_route)
         .merge(login_route)
         .merge(register_route)
         .merge(protected)
+        .route_layer(middleware::from_fn_with_state(
+            state.management_origin.clone(),
+            require_origin,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
+        .layer(middleware::from_fn(crate::http::reject_compressed_request))
         .with_state(state)
 }
 
 pub(crate) fn protect(router: Router, auth: AuthService) -> Router {
-    router.route_layer(middleware::from_fn_with_state(auth, require_access))
+    let origin = std::env::var(MANAGEMENT_ORIGIN_ENV)
+        .unwrap_or_else(|_| panic!("{MANAGEMENT_ORIGIN_ENV} must be configured"));
+    let management_origin = parse_management_origin(&origin)
+        .unwrap_or_else(|message| panic!("{MANAGEMENT_ORIGIN_ENV} {message}"));
+    router.route_layer(middleware::from_fn_with_state(
+        SessionGuardState {
+            auth,
+            management_origin,
+        },
+        require_session,
+    ))
 }
 
 async fn setup_required(State(state): State<AuthHttpState>) -> Result<Json<Value>, AuthApiError> {
@@ -115,7 +159,7 @@ async fn setup_required(State(state): State<AuthHttpState>) -> Result<Json<Value
 async fn setup(
     State(state): State<AuthHttpState>,
     request: Result<Json<UserCredentialsRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), AuthApiError> {
+) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
     let grant = state
         .auth
@@ -128,13 +172,17 @@ async fn setup(
     state
         .manager
         .claim_unowned_account_access(grant.user.id.as_str());
-    Ok((StatusCode::CREATED, data(session_grant_json(&grant))))
+    Ok(session_response(
+        StatusCode::CREATED,
+        &grant,
+        state.secure_cookie,
+    ))
 }
 
 async fn login(
     State(state): State<AuthHttpState>,
     request: Result<Json<UserCredentialsRequest>, JsonRejection>,
-) -> Result<Json<Value>, AuthApiError> {
+) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
     let grant = state
         .auth
@@ -144,13 +192,17 @@ async fn login(
             unix_timestamp(),
         )
         .await?;
-    Ok(data(session_grant_json(&grant)))
+    Ok(session_response(
+        StatusCode::OK,
+        &grant,
+        state.secure_cookie,
+    ))
 }
 
 async fn register_user(
     State(state): State<AuthHttpState>,
     request: Result<Json<RegisterUserRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), AuthApiError> {
+) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
     let grant = state
         .auth
@@ -161,30 +213,22 @@ async fn register_user(
             unix_timestamp(),
         )
         .await?;
-    Ok((StatusCode::CREATED, data(session_grant_json(&grant))))
-}
-
-async fn refresh(
-    State(state): State<AuthHttpState>,
-    request: Result<Json<RefreshRequest>, JsonRejection>,
-) -> Result<Json<Value>, AuthApiError> {
-    let request = json_request(request)?;
-    let grant = state
-        .auth
-        .refresh(&request.refresh_token, unix_timestamp())
-        .await?;
-    Ok(data(session_grant_json(&grant)))
+    Ok(session_response(
+        StatusCode::CREATED,
+        &grant,
+        state.secure_cookie,
+    ))
 }
 
 async fn logout(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
-) -> Result<StatusCode, AuthApiError> {
+) -> Result<Response, AuthApiError> {
     state
         .auth
         .logout_session(&session.session_id, unix_timestamp())
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(clear_session_response(state.secure_cookie))
 }
 
 async fn me(Extension(session): Extension<AuthenticatedSession>) -> Json<Value> {
@@ -239,19 +283,15 @@ async fn update_user(
 ) -> Result<Json<Value>, AuthApiError> {
     let request = json_request(request)?;
     let user = state
-        .auth
+        .api_keys
         .set_user_enabled(
+            &state.auth,
             &session.user,
             &parse_user_id(&user_id)?,
             request.enabled,
             unix_timestamp(),
         )
         .await?;
-    if request.enabled {
-        state.api_keys.reload_owner(&user.id).await?;
-    } else {
-        state.api_keys.revoke_owner(&user.id);
-    }
     Ok(data(user_json(&user)))
 }
 
@@ -294,6 +334,7 @@ async fn create_key(
         .api_keys
         .create(
             &session.user.id,
+            SecretString::from(request.key),
             request.group_label,
             request.label,
             request.expires_at,
@@ -338,12 +379,14 @@ async fn update_key(
         .update(
             &session.user.id,
             &parse_api_key_id(&key_id)?,
-            request.label,
-            request.group_label,
-            request.enabled,
-            request.expires_at.map(|value| value.0),
-            request.quota_limit_usd.map(|value| value.0),
-            unix_timestamp(),
+            ApiKeyPatch {
+                label: request.label,
+                group_label: request.group_label,
+                enabled: request.enabled,
+                expires_at: request.expires_at.map(|value| value.0),
+                quota_limit_usd: request.quota_limit_usd.map(|value| value.0),
+                updated_at: unix_timestamp(),
+            },
         )
         .await?;
     Ok(data(api_key_json(&key)?))
@@ -361,15 +404,37 @@ async fn delete_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn require_access(
-    State(auth): State<AuthService>,
-    headers: HeaderMap,
+#[derive(Clone)]
+struct SessionGuardState {
+    auth: AuthService,
+    management_origin: HeaderValue,
+}
+
+async fn require_session(
+    State(state): State<SessionGuardState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthApiError> {
-    let token = bearer_token(&headers)?;
-    let session = auth.authenticate_access(token, unix_timestamp()).await?;
+    require_exact_origin(
+        request.method(),
+        request.headers(),
+        &state.management_origin,
+    )?;
+    let token = session_cookie(request.headers())?;
+    let session = state
+        .auth
+        .authenticate_session(token, unix_timestamp())
+        .await?;
     request.extensions_mut().insert(session);
+    Ok(next.run(request).await)
+}
+
+async fn require_origin(
+    State(origin): State<HeaderValue>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthApiError> {
+    require_exact_origin(request.method(), request.headers(), &origin)?;
     Ok(next.run(request).await)
 }
 
@@ -400,14 +465,9 @@ struct ResetUserPasswordRequest {
     password: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum AuthRoute {
+    Setup,
     Login,
     Register,
 }
@@ -448,6 +508,7 @@ impl AuthRateLimits {
         let now = unix_timestamp();
         let minute = now.div_euclid(60);
         let limit = match route {
+            AuthRoute::Setup => 3,
             AuthRoute::Login => 10,
             AuthRoute::Register => 5,
         };
@@ -486,9 +547,47 @@ fn client_ip(
     peer_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
+fn parse_management_origin(origin: &str) -> Result<HeaderValue, &'static str> {
+    if origin.is_empty() || origin.ends_with('/') || !origin.starts_with("https://") {
+        return Err("must be an exact HTTPS origin without a trailing slash");
+    }
+    let authority = origin
+        .split_once("://")
+        .map(|(_, authority)| authority)
+        .ok_or("must be an exact HTTPS origin without a trailing slash")?;
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains(',')
+        || authority.contains('\\')
+        || authority.chars().any(char::is_whitespace)
+        || authority
+            .chars()
+            .any(|character| matches!(character, '/' | '?' | '#'))
+    {
+        return Err("must be an exact HTTPS origin without a trailing slash");
+    }
+    HeaderValue::from_str(origin).map_err(|_| "must be a valid HTTP Origin header value")
+}
+
+fn require_exact_origin(
+    method: &Method,
+    headers: &HeaderMap,
+    expected: &HeaderValue,
+) -> Result<(), AuthApiError> {
+    if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS {
+        return Ok(());
+    }
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    if origins.next() != Some(expected) || origins.next().is_some() {
+        return Err(AuthApiError::forbidden());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateApiKeyRequest {
+    key: String,
     label: String,
     group_label: String,
     expires_at: Option<i64>,
@@ -527,23 +626,31 @@ where
 }
 
 fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, AuthApiError> {
-    request
-        .map(|Json(request)| request)
-        .map_err(|_| AuthApiError::invalid_request("request body must be valid JSON"))
+    request.map(|Json(request)| request).map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            AuthApiError::payload_too_large()
+        } else {
+            AuthApiError::invalid_request("request body must be valid JSON")
+        }
+    })
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthApiError> {
-    let value = headers
-        .get(header::AUTHORIZATION)
+fn session_cookie(headers: &HeaderMap) -> Result<&str, AuthApiError> {
+    let cookies = headers
+        .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(AuthApiError::unauthorized)?;
-    let mut parts = value.split_whitespace();
-    let scheme = parts.next().ok_or_else(AuthApiError::unauthorized)?;
-    let token = parts.next().ok_or_else(AuthApiError::unauthorized)?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() || parts.next().is_some() {
-        return Err(AuthApiError::unauthorized());
+    let mut session = None;
+    for cookie in cookies.split(';') {
+        if let Some((name, value)) = cookie.trim().split_once('=')
+            && name == SESSION_COOKIE
+            && !value.is_empty()
+            && session.replace(value).is_some()
+        {
+            return Err(AuthApiError::unauthorized());
+        }
     }
-    Ok(token)
+    session.ok_or_else(AuthApiError::unauthorized)
 }
 
 fn parse_api_key_id(value: &str) -> Result<ApiKeyId, AuthApiError> {
@@ -557,11 +664,43 @@ fn parse_user_id(value: &str) -> Result<UserId, AuthApiError> {
 fn session_grant_json(grant: &SessionGrant) -> Value {
     json!({
         "user": user_json(&grant.user),
-        "access_token": grant.access_token.expose_secret(),
-        "refresh_token": grant.refresh_token.expose_secret(),
-        "access_expires_at": grant.access_expires_at,
-        "refresh_expires_at": grant.refresh_expires_at
+        "expires_at": grant.expires_at
     })
+}
+
+fn session_response(status: StatusCode, grant: &SessionGrant, secure: bool) -> Response {
+    let mut response = (status, data(session_grant_json(grant))).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(
+            grant.session_token.expose_secret(),
+            grant.expires_at,
+            secure,
+        ),
+    );
+    response
+}
+
+fn clear_session_response(secure: bool) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let secure = if secure { "; Secure" } else { "" };
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{SESSION_COOKIE}=; Path=/api/v1; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
+        ))
+        .expect("static cookie attributes are valid"),
+    );
+    response
+}
+
+fn session_cookie_header(token: &str, expires_at: i64, secure: bool) -> HeaderValue {
+    let max_age = expires_at.saturating_sub(unix_timestamp()).max(0);
+    let secure = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE}={token}; Path=/api/v1; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+    ))
+    .expect("URL-safe session token makes a valid cookie")
 }
 
 fn user_json(user: &UserSummary) -> Value {
@@ -594,9 +733,9 @@ fn stored_api_key_json(key: &provider_auth::StoredApiKey) -> Result<Value, AuthA
         .as_deref()
         .map(provider_auth::format_usd_atoms)
         .transpose()
-        .map_err(|()| AuthApiError::internal())?;
+        .map_err(|_| AuthApiError::internal())?;
     let spent_usd =
-        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
+        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|_| AuthApiError::internal())?;
     Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
@@ -607,7 +746,6 @@ fn stored_api_key_json(key: &provider_auth::StoredApiKey) -> Result<Value, AuthA
         "expires_at": key.expires_at,
         "quota_limit_usd": quota_limit_usd,
         "spent_usd": spent_usd,
-        "quota_accounting": if key.quota_accounting_ready { "ready" } else { "indeterminate" },
         "last_used_at": key.last_used_at,
         "created_at": key.created_at,
         "updated_at": key.updated_at
@@ -620,9 +758,9 @@ fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
         .as_deref()
         .map(provider_auth::format_usd_atoms)
         .transpose()
-        .map_err(|()| AuthApiError::internal())?;
+        .map_err(|_| AuthApiError::internal())?;
     let spent_usd =
-        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|()| AuthApiError::internal())?;
+        provider_auth::format_usd_atoms(&key.spent_atoms).map_err(|_| AuthApiError::internal())?;
     Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
@@ -633,7 +771,6 @@ fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
         "expires_at": key.expires_at,
         "quota_limit_usd": quota_limit_usd,
         "spent_usd": spent_usd,
-        "quota_accounting": if key.quota_accounting_ready { "ready" } else { "indeterminate" },
         "last_used_at": key.last_used_at,
         "created_at": key.created_at,
         "updated_at": key.updated_at
@@ -652,6 +789,7 @@ fn unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+#[derive(Debug)]
 struct AuthApiError {
     status: StatusCode,
     error_type: &'static str,
@@ -664,6 +802,14 @@ impl AuthApiError {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
             message,
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            error_type: "invalid_request_error",
+            message: "request body is too large",
         }
     }
 
@@ -709,10 +855,8 @@ impl From<AuthError> for AuthApiError {
                 message: "resource already exists",
             },
             AuthError::InvalidCredentials
-            | AuthError::InvalidAccessToken
-            | AuthError::InvalidRefreshToken
-            | AuthError::InvalidApiKey
-            | AuthError::Credential(CredentialError::SessionExpired) => Self::unauthorized(),
+            | AuthError::InvalidSession
+            | AuthError::InvalidApiKey => Self::unauthorized(),
             AuthError::Forbidden => Self::forbidden(),
             AuthError::NotFound => Self::not_found(),
             AuthError::InvalidRegistrationCode => {
@@ -722,6 +866,7 @@ impl From<AuthError> for AuthApiError {
                 Self::invalid_request("no visible provider accounts use this group label")
             }
             AuthError::InvalidUsername
+            | AuthError::InvalidApiKeyValue
             | AuthError::InvalidLabel
             | AuthError::InvalidExpiry
             | AuthError::InvalidQuotaLimit
@@ -758,901 +903,85 @@ impl IntoResponse for AuthApiError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use provider_auth::AuthRepository;
-    use provider_core::{
-        AccountId, CredentialKind, NewCredential, NewProviderAccount, ProviderKind,
-        ProviderManagementRepository, ProviderVisibility,
-    };
-    use provider_management::ProviderManager;
-    use provider_runtime::ProviderRuntimeCatalog;
-    use provider_storage::SqliteAccountRepository;
-    use provider_usage::{QuotaLedgerEntry, UsageRepository};
-    use tokio::net::TcpListener;
-
+mod focused_tests {
     use super::*;
 
     #[test]
-    fn auth_request_bodies_reject_unknown_fields() {
-        assert!(
-            serde_json::from_str::<UserCredentialsRequest>(
-                r#"{"username":"user","password":"secret","extra":true}"#,
-            )
-            .is_err()
+    fn unsafe_requests_require_the_exact_configured_origin() {
+        let expected = HeaderValue::from_static("https://admin.example.com");
+        let mut headers = HeaderMap::new();
+        assert!(require_exact_origin(&Method::GET, &headers, &expected).is_ok());
+        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_err());
+        headers.insert(header::ORIGIN, expected.clone());
+        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_ok());
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://admin.example.com/"),
         );
-        assert!(
-            serde_json::from_str::<UpdateUserRequest>(r#"{"enabled":true,"extra":true}"#,).is_err()
-        );
-        assert!(
-            serde_json::from_str::<ResetUserPasswordRequest>(
-                r#"{"password":"secret","extra":true}"#,
-            )
-            .is_err()
-        );
-        assert!(
-            serde_json::from_str::<RefreshRequest>(r#"{"refresh_token":"token","extra":true}"#,)
-                .is_err()
-        );
+        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_err());
     }
 
     #[test]
-    fn auth_rate_limits_isolate_ips_and_prune_old_windows() {
+    fn production_session_cookie_is_http_only_secure_and_strict() {
+        let cookie = session_cookie_header("opaque", unix_timestamp() + 60, true);
+        let cookie = cookie.to_str().expect("cookie header");
+        assert!(cookie.starts_with("pode_session=opaque;"));
+        assert!(cookie.contains("; HttpOnly"));
+        assert!(cookie.contains("; SameSite=Strict"));
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn api_key_metadata_contains_only_the_masked_secret() {
+        let summary = ApiKeySummary {
+            id: ApiKeyId::new("key-id").expect("key ID"),
+            owner_user_id: UserId::new("owner-id").expect("user ID"),
+            group_label: "group".to_owned(),
+            label: "label".to_owned(),
+            key: "pod************************XYZ".to_owned(),
+            enabled: true,
+            expires_at: None,
+            quota_limit_atoms: None,
+            spent_atoms: "0".to_owned(),
+            last_used_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let value = api_key_json(&summary).expect("API key JSON");
+
+        assert_eq!(value["key"], "pod************************XYZ");
+    }
+
+    #[test]
+    fn api_key_detail_contains_the_complete_secret() {
+        let key = provider_auth::StoredApiKey {
+            id: ApiKeyId::new("key-id").expect("key ID"),
+            owner_user_id: UserId::new("owner-id").expect("user ID"),
+            group_label: "group".to_owned(),
+            label: "label".to_owned(),
+            key: SecretString::from("complete-api-key"),
+            enabled: true,
+            expires_at: None,
+            quota_limit_atoms: None,
+            spent_atoms: "0".to_owned(),
+            last_used_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let value = stored_api_key_json(&key).expect("API key detail JSON");
+
+        assert_eq!(value["key"], "complete-api-key");
+    }
+
+    #[test]
+    fn setup_has_a_dedicated_tighter_rate_limit() {
         let limits = AuthRateLimits::default();
         let headers = HeaderMap::new();
-        let first = Some("198.51.100.10:1234".parse().expect("first peer"));
-        let second = Some("198.51.100.11:1234".parse().expect("second peer"));
-        for _ in 0..10 {
-            assert!(limits.check(AuthRoute::Login, first, &headers).is_ok());
+        let peer = Some("198.51.100.10:1234".parse().expect("peer"));
+        for _ in 0..3 {
+            assert!(limits.check(AuthRoute::Setup, peer, &headers).is_ok());
         }
-        assert!(limits.check(AuthRoute::Login, first, &headers).is_err());
-        assert!(limits.check(AuthRoute::Login, second, &headers).is_ok());
-
-        limits.windows.lock().expect("rate windows").insert(
-            (
-                AuthRoute::Register,
-                "203.0.113.9".parse().expect("stale IP"),
-            ),
-            (unix_timestamp().div_euclid(60) - 1, 1),
-        );
-        assert!(limits.check(AuthRoute::Register, second, &headers).is_ok());
-        assert_eq!(limits.windows.lock().expect("rate windows").len(), 3);
-    }
-
-    #[test]
-    fn forwarded_ip_is_only_trusted_from_internal_proxy() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "203.0.113.20".parse().expect("header"));
-        assert_eq!(
-            client_ip(
-                Some("127.0.0.1:80".parse().expect("proxy")),
-                &headers,
-                Some("172.20.0.3".parse().expect("trusted proxy")),
-            ),
-            "127.0.0.1".parse::<IpAddr>().expect("peer IP")
-        );
-        assert_eq!(
-            client_ip(
-                Some("172.20.0.3:80".parse().expect("compose proxy")),
-                &headers,
-                Some("172.20.0.3".parse().expect("trusted proxy")),
-            ),
-            "203.0.113.20".parse::<IpAddr>().expect("forwarded IP")
-        );
-        assert_eq!(
-            client_ip(
-                Some("172.20.0.4:80".parse().expect("other internal peer")),
-                &headers,
-                Some("172.20.0.3".parse().expect("trusted proxy")),
-            ),
-            "172.20.0.4".parse::<IpAddr>().expect("peer IP")
-        );
-        assert_eq!(
-            client_ip(
-                Some("198.51.100.30:80".parse().expect("direct peer")),
-                &headers,
-                Some("172.20.0.3".parse().expect("trusted proxy")),
-            ),
-            "198.51.100.30".parse::<IpAddr>().expect("peer IP")
-        );
-    }
-
-    async fn seed_account_with_group(
-        repository: Arc<SqliteAccountRepository>,
-        owner: &UserId,
-        account_id: &str,
-        group_label: &str,
-    ) {
-        repository
-            .create_provider_account(
-                NewProviderAccount {
-                    id: AccountId::new(account_id).expect("account ID"),
-                    provider: ProviderKind::OpenAiCompatible,
-                    label: "seed".to_owned(),
-                    group_label: group_label.to_owned(),
-                    config_json: "{}".to_owned(),
-                    enabled: true,
-                    credential: NewCredential {
-                        kind: CredentialKind::ApiKey,
-                        format_version: 1,
-                        credential_json: SecretString::from("seed-secret".to_owned()),
-                        expires_at: None,
-                        last_refreshed_at: None,
-                    },
-                },
-                owner.as_str(),
-                ProviderVisibility::Private,
-            )
-            .await
-            .expect("seed provider account");
-    }
-
-    #[tokio::test]
-    async fn auth_lifecycle_manages_retrievable_api_keys() {
-        let repository = Arc::new(
-            SqliteAccountRepository::in_memory()
-                .await
-                .expect("repository"),
-        );
-        let auth = AuthService::new(repository.clone());
-        let api_keys = ApiKeyAuthenticator::load(repository.clone())
-            .await
-            .expect("API key index");
-        let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
-        let manager = ProviderManager::new(repository.clone(), runtime.clone());
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind auth server");
-        let address = listener.local_addr().expect("auth address");
-        let server = tokio::spawn(
-            axum::serve(
-                listener,
-                router(AuthHttpState::new(auth, api_keys.clone(), manager, None)),
-            )
-            .into_future(),
-        );
-        let client = reqwest::Client::new();
-        let base_url = format!("http://{address}");
-
-        let setup_status = client
-            .get(format!("{base_url}/api/v1/auth/setup"))
-            .send()
-            .await
-            .expect("setup status");
-        assert_eq!(setup_status.status(), StatusCode::OK);
-        assert_eq!(response_json(setup_status).await["data"]["required"], true);
-
-        let unauthenticated_me = client
-            .get(format!("{base_url}/api/v1/auth/me"))
-            .send()
-            .await
-            .expect("unauthenticated me");
-        assert_eq!(unauthenticated_me.status(), StatusCode::UNAUTHORIZED);
-
-        let setup = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/setup"),
-            json!({ "username": "Admin", "password": "secret" }),
-            None,
-        )
-        .await;
-        assert_eq!(setup.status(), StatusCode::CREATED);
-        let setup_body = response_json(setup).await;
-        let access_token = response_secret(&setup_body, "access_token");
-        let refresh_token = response_secret(&setup_body, "refresh_token");
-        assert_eq!(setup_body["data"]["user"]["username"], "Admin");
-        assert!(!setup_body.to_string().contains("password_hash"));
-
-        let me = client
-            .get(format!("{base_url}/api/v1/auth/me"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("authenticated me");
-        assert_eq!(me.status(), StatusCode::OK);
-
-        let owner_id = setup_body["data"]["user"]["id"]
-            .as_str()
-            .expect("setup user ID")
-            .to_owned();
-        seed_account_with_group(
-            repository.clone(),
-            &UserId::new(owner_id.clone()).expect("user ID"),
-            "acct-auth-1",
-            "shared-codex",
-        )
-        .await;
-        let created_key = post_json(
-            &client,
-            format!("{base_url}/api/v1/keys"),
-            json!({
-                "label": "local",
-                "group_label": "shared-codex",
-                "quota_limit_usd": "12.5"
-            }),
-            Some(&access_token),
-        )
-        .await;
-        assert_eq!(created_key.status(), StatusCode::CREATED);
-        let created_key = response_json(created_key).await;
-        let issued_key = response_secret(&created_key, "key");
-        assert_eq!(issued_key.len(), 43);
-        let authenticated = api_keys
-            .authenticate(&issued_key, unix_timestamp())
-            .expect("authenticate issued key");
-        let (first_admission, second_admission) = tokio::join!(
-            api_keys.acquire_quota(&authenticated),
-            api_keys.acquire_quota(&authenticated)
-        );
-        assert!(first_admission.is_ok());
-        assert!(second_admission.is_ok());
-        assert_eq!(created_key["data"]["group_label"], "shared-codex");
-        assert_eq!(created_key["data"]["quota_limit_usd"], "12.50000000000000");
-        assert_eq!(created_key["data"]["spent_usd"], "0.00000000000000");
-        let key_id = created_key["data"]["id"]
-            .as_str()
-            .expect("API key ID")
-            .to_owned();
-
-        let listed_keys = client
-            .get(format!("{base_url}/api/v1/keys"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("list API keys");
-        assert_eq!(listed_keys.status(), StatusCode::OK);
-        let listed_keys = response_json(listed_keys).await;
-        let masked_key = listed_keys["data"][0]["key"]
-            .as_str()
-            .expect("masked API key");
-        assert_ne!(masked_key, issued_key);
-        assert!(masked_key.starts_with(&issued_key[..3]));
-        assert!(masked_key.ends_with(&issued_key[issued_key.len() - 3..]));
-        assert!(!listed_keys.to_string().contains(&issued_key));
-
-        let key_detail = client
-            .get(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("get API key detail");
-        assert_eq!(key_detail.status(), StatusCode::OK);
-        assert_eq!(response_json(key_detail).await["data"]["key"], issued_key);
-
-        repository
-            .usage_repository()
-            .record_quota_ledger_entry(&QuotaLedgerEntry {
-                entry_id: "single-overage".to_owned(),
-                api_key_id: key_id.clone(),
-                cost_atoms: Some("1300000000000000".to_owned()),
-                recorded_at_ms: unix_timestamp() * 1000,
-            })
-            .await
-            .expect("persist one request beyond quota");
-        api_keys.record_quota_result(
-            &ApiKeyId::new(key_id.clone()).expect("API key ID"),
-            Some(1_300_000_000_000_000),
-        );
-        assert!(matches!(
-            api_keys.ensure_quota_available(&authenticated).await,
-            Err(AuthError::QuotaExceeded)
-        ));
-
-        let registration_code = client
-            .post(format!("{base_url}/api/v1/registration-codes"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("create registration code");
-        assert_eq!(registration_code.status(), StatusCode::CREATED);
-        let registration_code = response_secret(&response_json(registration_code).await, "code");
-        let conflicting_registration = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/register"),
-            json!({
-                "username": "ADMIN",
-                "password": "secret2",
-                "invitation_code": registration_code.clone()
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(conflicting_registration.status(), StatusCode::CONFLICT);
-        let created_member = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/register"),
-            json!({
-                "username": "member",
-                "password": "secret2",
-                "invitation_code": registration_code.clone()
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(created_member.status(), StatusCode::CREATED);
-        let created_member_body = response_json(created_member).await;
-        let member_access = response_secret(&created_member_body, "access_token");
-        assert_eq!(created_member_body["data"]["user"]["username"], "member");
-        let reused_code = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/register"),
-            json!({
-                "username": "second-member",
-                "password": "secret3",
-                "invitation_code": registration_code
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(reused_code.status(), StatusCode::BAD_REQUEST);
-        let malformed_code = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/register"),
-            json!({
-                "username": "third-member",
-                "password": "secret4",
-                "invitation_code": "not-a-code"
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(malformed_code.status(), StatusCode::BAD_REQUEST);
-
-        let unauthenticated_code = client
-            .post(format!("{base_url}/api/v1/registration-codes"))
-            .send()
-            .await
-            .expect("reject unauthenticated registration code creation");
-        assert_eq!(unauthenticated_code.status(), StatusCode::UNAUTHORIZED);
-
-        let forbidden_code = client
-            .post(format!("{base_url}/api/v1/registration-codes"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("reject member registration code creation");
-        assert_eq!(forbidden_code.status(), StatusCode::FORBIDDEN);
-
-        let foreign_update = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&member_access)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":false}"#)
-            .send()
-            .await
-            .expect("foreign API key update");
-        assert_eq!(foreign_update.status(), StatusCode::NOT_FOUND);
-
-        let foreign_get = client
-            .get(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("foreign API key detail");
-        assert_eq!(foreign_get.status(), StatusCode::NOT_FOUND);
-
-        seed_account_with_group(
-            repository.clone(),
-            &UserId::new(owner_id.clone()).expect("user ID"),
-            "acct-auth-2",
-            "shared-claude",
-        )
-        .await;
-        let renamed = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(
-                json!({
-                    "label": "renamed-local",
-                    "group_label": "shared-claude",
-                    "quota_limit_usd": "20"
-                })
-                .to_string(),
-            )
-            .send()
-            .await
-            .expect("update API key label and group");
-        assert_eq!(renamed.status(), StatusCode::OK);
-        let renamed = response_json(renamed).await;
-        assert_eq!(renamed["data"]["label"], "renamed-local");
-        assert_eq!(renamed["data"]["group_label"], "shared-claude");
-        assert_eq!(renamed["data"]["quota_limit_usd"], "20.00000000000000");
-
-        let unlimited = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"quota_limit_usd":null}"#)
-            .send()
-            .await
-            .expect("clear API key quota");
-        assert_eq!(unlimited.status(), StatusCode::OK);
-        let unlimited = response_json(unlimited).await;
-        assert_eq!(unlimited["data"]["quota_limit_usd"], Value::Null);
-        assert_eq!(unlimited["data"]["spent_usd"], "13.00000000000000");
-
-        for quota_limit_usd in ["", "0", "-1", "1.000000000000001"] {
-            let invalid_quota = client
-                .put(format!("{base_url}/api/v1/keys/{key_id}"))
-                .bearer_auth(&access_token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(json!({ "quota_limit_usd": quota_limit_usd }).to_string())
-                .send()
-                .await
-                .expect("reject invalid API key quota");
-            assert_eq!(invalid_quota.status(), StatusCode::BAD_REQUEST);
-        }
-
-        let unknown_field = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"quota_limit":10,"enabled":true}"#)
-            .send()
-            .await
-            .expect("reject unknown API key field");
-        assert_eq!(unknown_field.status(), StatusCode::BAD_REQUEST);
-
-        let expires_at = unix_timestamp() + 3600;
-        let updated_expiry = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(json!({ "expires_at": expires_at }).to_string())
-            .send()
-            .await
-            .expect("update API key expiry");
-        assert_eq!(updated_expiry.status(), StatusCode::OK);
-        let updated_expiry = response_json(updated_expiry).await;
-        assert_eq!(updated_expiry["data"]["expires_at"], expires_at);
-        assert_eq!(updated_expiry["data"]["enabled"], true);
-        assert_eq!(updated_expiry["data"]["key"], masked_key);
-
-        let invalid_expiry = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(json!({ "expires_at": unix_timestamp() - 1 }).to_string())
-            .send()
-            .await
-            .expect("reject expired API key expiry");
-        assert_eq!(invalid_expiry.status(), StatusCode::BAD_REQUEST);
-
-        let disabled = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":false}"#)
-            .send()
-            .await
-            .expect("disable API key");
-        assert_eq!(disabled.status(), StatusCode::OK);
-        assert_eq!(response_json(disabled).await["data"]["enabled"], false);
-
-        let invalid_group = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":false,"group_label":"missing"}"#)
-            .send()
-            .await
-            .expect("reject missing provider group for disabled API key");
-        assert_eq!(invalid_group.status(), StatusCode::BAD_REQUEST);
-
-        let old_enabled_route = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}/enabled"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":true}"#)
-            .send()
-            .await
-            .expect("old API key enabled route");
-        assert_eq!(old_enabled_route.status(), StatusCode::NOT_FOUND);
-
-        let cleared_expiry = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":true,"expires_at":null}"#)
-            .send()
-            .await
-            .expect("clear API key expiry");
-        assert_eq!(cleared_expiry.status(), StatusCode::OK);
-        let cleared_expiry = response_json(cleared_expiry).await;
-        assert_eq!(cleared_expiry["data"]["enabled"], true);
-        assert_eq!(cleared_expiry["data"]["expires_at"], Value::Null);
-
-        let empty_update = client
-            .put(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body("{}")
-            .send()
-            .await
-            .expect("empty API key update");
-        assert_eq!(empty_update.status(), StatusCode::BAD_REQUEST);
-
-        let deleted = client
-            .delete(format!("{base_url}/api/v1/keys/{key_id}"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("delete API key");
-        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
-
-        let remaining_keys = client
-            .get(format!("{base_url}/api/v1/keys"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("list remaining API keys");
-        assert_eq!(
-            response_json(remaining_keys).await["data"]
-                .as_array()
-                .expect("remaining API keys")
-                .len(),
-            0
-        );
-
-        let refreshed = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/refresh"),
-            json!({ "refresh_token": refresh_token }),
-            None,
-        )
-        .await;
-        assert_eq!(refreshed.status(), StatusCode::OK);
-        let refreshed_body = response_json(refreshed).await;
-        let rotated_access = response_secret(&refreshed_body, "access_token");
-        let rotated_refresh = response_secret(&refreshed_body, "refresh_token");
-        assert_ne!(rotated_access, access_token);
-        assert_ne!(rotated_refresh, refresh_token);
-
-        let reused_refresh = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/refresh"),
-            json!({ "refresh_token": refresh_token }),
-            None,
-        )
-        .await;
-        assert_eq!(reused_refresh.status(), StatusCode::UNAUTHORIZED);
-
-        let logout = client
-            .post(format!("{base_url}/api/v1/auth/logout"))
-            .bearer_auth(&rotated_access)
-            .send()
-            .await
-            .expect("logout");
-        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
-
-        let logged_out_me = client
-            .get(format!("{base_url}/api/v1/auth/me"))
-            .bearer_auth(&rotated_access)
-            .send()
-            .await
-            .expect("logged out me");
-        assert_eq!(logged_out_me.status(), StatusCode::UNAUTHORIZED);
-
-        server.abort();
-        runtime.shutdown();
-    }
-
-    #[tokio::test]
-    async fn super_admin_manages_users_and_revokes_sessions_on_password_reset() {
-        let repository = Arc::new(
-            SqliteAccountRepository::in_memory()
-                .await
-                .expect("repository"),
-        );
-        let auth = AuthService::new(repository.clone());
-        let api_keys = ApiKeyAuthenticator::load(repository.clone())
-            .await
-            .expect("API key index");
-        let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
-        let manager = ProviderManager::new(repository.clone(), runtime.clone());
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind auth server");
-        let address = listener.local_addr().expect("auth address");
-        let server = tokio::spawn(
-            axum::serve(
-                listener,
-                router(AuthHttpState::new(auth, api_keys.clone(), manager, None)),
-            )
-            .into_future(),
-        );
-        let client = reqwest::Client::new();
-        let base_url = format!("http://{address}");
-
-        let setup = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/setup"),
-            json!({ "username": "Admin", "password": "secret" }),
-            None,
-        )
-        .await;
-        assert_eq!(setup.status(), StatusCode::CREATED);
-        let setup_body = response_json(setup).await;
-        let admin_access = response_secret(&setup_body, "access_token");
-        let admin_id = setup_body["data"]["user"]["id"]
-            .as_str()
-            .expect("admin user ID")
-            .to_owned();
-
-        let created_member = post_json(
-            &client,
-            format!("{base_url}/api/v1/users"),
-            json!({ "username": "Member", "password": "secret2" }),
-            Some(&admin_access),
-        )
-        .await;
-        assert_eq!(created_member.status(), StatusCode::CREATED);
-        let created_member = response_json(created_member).await;
-        assert_eq!(created_member["data"]["username"], "Member");
-        assert_eq!(created_member["data"]["role"], "user");
-        assert_eq!(created_member["data"]["enabled"], true);
-        let member_id = created_member["data"]["id"]
-            .as_str()
-            .expect("member user ID")
-            .to_owned();
-        let member_user_id = UserId::new(member_id.clone()).expect("member user ID");
-        seed_account_with_group(
-            repository.clone(),
-            &member_user_id,
-            "acct-member-1",
-            "member-group",
-        )
-        .await;
-        let enabled_key = api_keys
-            .create(
-                &member_user_id,
-                "member-group".to_owned(),
-                "enabled".to_owned(),
-                None,
-                None,
-                unix_timestamp(),
-            )
-            .await
-            .expect("create enabled member key");
-        let enabled_secret = enabled_key.key.expose_secret().to_owned();
-        let disabled_key = api_keys
-            .create(
-                &member_user_id,
-                "member-group".to_owned(),
-                "disabled".to_owned(),
-                None,
-                None,
-                unix_timestamp(),
-            )
-            .await
-            .expect("create disabled member key");
-        let disabled_secret = disabled_key.key.expose_secret().to_owned();
-        api_keys
-            .update(
-                &member_user_id,
-                &disabled_key.summary.id,
-                None,
-                None,
-                Some(false),
-                None,
-                None,
-                unix_timestamp(),
-            )
-            .await
-            .expect("disable one member key");
-        assert!(
-            api_keys
-                .authenticate(&enabled_secret, unix_timestamp())
-                .is_ok()
-        );
-        assert!(
-            api_keys
-                .authenticate(&disabled_secret, unix_timestamp())
-                .is_err()
-        );
-
-        let listed_users = client
-            .get(format!("{base_url}/api/v1/users"))
-            .bearer_auth(&admin_access)
-            .send()
-            .await
-            .expect("list users");
-        assert_eq!(listed_users.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(listed_users).await["data"]
-                .as_array()
-                .expect("user list")
-                .len(),
-            2
-        );
-
-        let member_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "Member", "password": "secret2" }),
-            None,
-        )
-        .await;
-        assert_eq!(member_login.status(), StatusCode::OK);
-        let member_login = response_json(member_login).await;
-        let member_access = response_secret(&member_login, "access_token");
-
-        let forbidden_list = client
-            .get(format!("{base_url}/api/v1/users"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("member list users");
-        assert_eq!(forbidden_list.status(), StatusCode::FORBIDDEN);
-
-        let self_disable = client
-            .put(format!("{base_url}/api/v1/users/{admin_id}"))
-            .bearer_auth(&admin_access)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":false}"#)
-            .send()
-            .await
-            .expect("self disable");
-        assert_eq!(self_disable.status(), StatusCode::FORBIDDEN);
-
-        let disabled_member = client
-            .put(format!("{base_url}/api/v1/users/{member_id}"))
-            .bearer_auth(&admin_access)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":false}"#)
-            .send()
-            .await
-            .expect("disable member");
-        assert_eq!(disabled_member.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(disabled_member).await["data"]["enabled"],
-            false
-        );
-
-        let disabled_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "Member", "password": "secret2" }),
-            None,
-        )
-        .await;
-        assert_eq!(disabled_login.status(), StatusCode::UNAUTHORIZED);
-
-        let disabled_me = client
-            .get(format!("{base_url}/api/v1/auth/me"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("disabled member me");
-        assert_eq!(disabled_me.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            api_keys
-                .authenticate(&enabled_secret, unix_timestamp())
-                .is_err()
-        );
-
-        let enabled_member = client
-            .put(format!("{base_url}/api/v1/users/{member_id}"))
-            .bearer_auth(&admin_access)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"enabled":true}"#)
-            .send()
-            .await
-            .expect("enable member");
-        assert_eq!(enabled_member.status(), StatusCode::OK);
-        assert_eq!(response_json(enabled_member).await["data"]["enabled"], true);
-        assert!(
-            api_keys
-                .authenticate(&enabled_secret, unix_timestamp())
-                .is_ok()
-        );
-        assert!(
-            api_keys
-                .authenticate(&disabled_secret, unix_timestamp())
-                .is_err()
-        );
-        assert_eq!(
-            repository
-                .load_api_key(&member_user_id, &enabled_key.summary.id)
-                .await
-                .expect("enabled key state")
-                .expect("enabled key")
-                .enabled,
-            true
-        );
-        assert_eq!(
-            repository
-                .load_api_key(&member_user_id, &disabled_key.summary.id)
-                .await
-                .expect("disabled key state")
-                .expect("disabled key")
-                .enabled,
-            false
-        );
-
-        let member_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "Member", "password": "secret2" }),
-            None,
-        )
-        .await;
-        assert_eq!(member_login.status(), StatusCode::OK);
-        let member_access = response_secret(&response_json(member_login).await, "access_token");
-
-        let reset_password = client
-            .put(format!("{base_url}/api/v1/users/{member_id}/password"))
-            .bearer_auth(&admin_access)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"password":"secret3"}"#)
-            .send()
-            .await
-            .expect("reset member password");
-        assert_eq!(reset_password.status(), StatusCode::OK);
-        assert!(
-            !response_json(reset_password)
-                .await
-                .to_string()
-                .contains("secret3")
-        );
-
-        let revoked_me = client
-            .get(format!("{base_url}/api/v1/auth/me"))
-            .bearer_auth(&member_access)
-            .send()
-            .await
-            .expect("revoked member me");
-        assert_eq!(revoked_me.status(), StatusCode::UNAUTHORIZED);
-
-        let old_password_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "Member", "password": "secret2" }),
-            None,
-        )
-        .await;
-        assert_eq!(old_password_login.status(), StatusCode::UNAUTHORIZED);
-
-        let new_password_login = post_json(
-            &client,
-            format!("{base_url}/api/v1/auth/login"),
-            json!({ "username": "Member", "password": "secret3" }),
-            None,
-        )
-        .await;
-        assert_eq!(new_password_login.status(), StatusCode::OK);
-
-        server.abort();
-        runtime.shutdown();
-    }
-
-    async fn post_json(
-        client: &reqwest::Client,
-        url: String,
-        body: Value,
-        bearer: Option<&str>,
-    ) -> reqwest::Response {
-        let mut request = client
-            .post(url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body.to_string());
-        if let Some(bearer) = bearer {
-            request = request.bearer_auth(bearer);
-        }
-        request.send().await.expect("JSON response")
-    }
-
-    async fn response_json(response: reqwest::Response) -> Value {
-        serde_json::from_slice(&response.bytes().await.expect("response body"))
-            .expect("response JSON")
-    }
-
-    fn response_secret(response: &Value, field: &str) -> String {
-        response["data"][field]
-            .as_str()
-            .expect("secret response field")
-            .to_owned()
+        assert!(limits.check(AuthRoute::Setup, peer, &headers).is_err());
+        assert!(limits.check(AuthRoute::Login, peer, &headers).is_ok());
     }
 }

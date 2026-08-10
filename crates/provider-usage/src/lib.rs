@@ -32,7 +32,8 @@ pub use catalog::{
     component_prices_from_model_pricing, context_price_tiers_from_model_pricing, parse_unit_price,
 };
 pub use cost::{
-    CALCULATOR_VERSION, CostReason, CostStatus, ObservedCatalogCost, compute_observed_catalog_cost,
+    CALCULATOR_VERSION, CostReason, CostStatus, MaximumCostError, ObservedCatalogCost,
+    compute_maximum_text_request_cost, compute_observed_catalog_cost,
 };
 pub use lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal};
 pub use money::{AMOUNT_SCALE, PRICE_SCALE, UnitPrice, UsdAtoms, component_cost_atoms};
@@ -58,8 +59,7 @@ pub use retention::{
     RetentionWorker,
 };
 pub use tracking::{
-    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, SpendObserver, UsageTracking,
-    system_clock_ms,
+    AttemptSpec, AttemptTracker, ClockMs, LogicalTracker, UsageTracking, system_clock_ms,
 };
 pub use writer::{
     DEFAULT_QUOTA_QUEUE, DEFAULT_WRITE_QUEUE, GAP_BUCKET_MS, QuotaLedgerPermit, QuotaLedgerReceipt,

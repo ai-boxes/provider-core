@@ -42,7 +42,7 @@ pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 enum CatalogEntry {
     Priced {
         prices: Box<ComponentPrices>,
-        model_tiers: Box<Vec<ProviderModelPricingTier>>,
+        model_tiers: Vec<ProviderModelPricingTier>,
     },
     /// The entry exists but carries no `cost` at all.
     NoCost,
@@ -76,7 +76,7 @@ impl CatalogSnapshot {
                     {
                         (Some(prices), Some(model_tiers)) => CatalogEntry::Priced {
                             prices: Box::new(prices),
-                            model_tiers: Box::new(model_tiers),
+                            model_tiers,
                         },
                         _ => CatalogEntry::Invalid,
                     },
@@ -107,10 +107,10 @@ impl CatalogSnapshot {
 
     #[must_use]
     pub fn exact_model_pricing(&self, model: &str) -> Option<ProviderModelPricing> {
-        if let Some(provider) = official_catalog_provider(model) {
-            if let Some(entry) = self.entries.get(&(provider.to_owned(), model.to_owned())) {
-                return model_pricing_from_entry(entry);
-            }
+        if let Some(provider) = official_catalog_provider(model)
+            && let Some(entry) = self.entries.get(&(provider.to_owned(), model.to_owned()))
+        {
+            return model_pricing_from_entry(entry);
         }
 
         let mut candidate: Option<ProviderModelPricing> = None;
@@ -137,7 +137,7 @@ fn model_pricing_from_entry(entry: &CatalogEntry) -> Option<ProviderModelPricing
             ..
         } => {
             let mut pricing = model_pricing_from_components(**prices);
-            pricing.tiers = (**model_tiers).clone();
+            pricing.tiers = model_tiers.clone();
             Some(pricing)
         }
         CatalogEntry::NoCost | CatalogEntry::Invalid => None,

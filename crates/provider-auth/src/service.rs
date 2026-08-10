@@ -8,12 +8,11 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::{
-    ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
-    InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
-    RefreshSessionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, UserId, UserRole,
-    UserSummary, add_atoms, atoms_ge, digest_secret, hash_password, issue_api_key,
-    issue_registration_code, issue_session_tokens, parse_quota_limit_usd, rotate_session_tokens,
-    verify_password,
+    ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey,
+    CredentialError, InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
+    QuotaReservationOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
+    UserId, UserRole, UserSummary, digest_secret, hash_password, issue_registration_code,
+    issue_session, parse_quota_limit_usd, verify_password,
 };
 
 pub const REGISTRATION_CODE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -25,10 +24,8 @@ pub struct AuthService {
 
 pub struct SessionGrant {
     pub user: UserSummary,
-    pub access_token: SecretString,
-    pub refresh_token: SecretString,
-    pub access_expires_at: i64,
-    pub refresh_expires_at: i64,
+    pub session_token: SecretString,
+    pub expires_at: i64,
 }
 
 pub struct CreatedRegistrationCode {
@@ -113,20 +110,19 @@ impl AuthService {
         self.create_session(user_summary(&user), now).await
     }
 
-    pub async fn authenticate_access(
+    pub async fn authenticate_session(
         &self,
-        access_token: &str,
+        session_token: &str,
         now: i64,
     ) -> Result<AuthenticatedSession, AuthError> {
-        let digest = digest_secret(access_token);
+        let digest = digest_secret(session_token);
         let session = self
             .repository
-            .load_session_by_access_hash(&digest)
+            .load_session_by_token_hash(&digest)
             .await?
-            .ok_or(AuthError::InvalidAccessToken)?;
-        if session.revoked_at.is_some() || session.access_expires_at <= now || !session.user.enabled
-        {
-            return Err(AuthError::InvalidAccessToken);
+            .ok_or(AuthError::InvalidSession)?;
+        if session.revoked_at.is_some() || session.expires_at <= now || !session.user.enabled {
+            return Err(AuthError::InvalidSession);
         }
         Ok(AuthenticatedSession {
             session_id: session.id,
@@ -134,52 +130,9 @@ impl AuthService {
         })
     }
 
-    pub async fn refresh(&self, refresh_token: &str, now: i64) -> Result<SessionGrant, AuthError> {
-        let digest = digest_secret(refresh_token);
-        let session = self
-            .repository
-            .load_session_by_refresh_hash(&digest)
-            .await?
-            .ok_or(AuthError::InvalidRefreshToken)?;
-        if session.revoked_at.is_some()
-            || session.refresh_expires_at <= now
-            || session.absolute_expires_at <= now
-            || !session.user.enabled
-        {
-            return Err(AuthError::InvalidRefreshToken);
-        }
-        let tokens = rotate_session_tokens(now, session.absolute_expires_at)?;
-        let outcome = self
-            .repository
-            .rotate_session(
-                &digest,
-                tokens.access.digest,
-                tokens.refresh.digest,
-                tokens.access_expires_at,
-                tokens.refresh_expires_at,
-                now,
-            )
-            .await?;
-        if outcome != RefreshSessionOutcome::Updated {
-            return Err(AuthError::InvalidRefreshToken);
-        }
-        Ok(SessionGrant {
-            user: session.user,
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
-    }
-
-    pub async fn logout(&self, access_token: &str, now: i64) -> Result<(), AuthError> {
-        let session = self.authenticate_access(access_token, now).await?;
-        self.logout_session(&session.session_id, now).await
-    }
-
     pub async fn logout_session(&self, session_id: &SessionId, now: i64) -> Result<(), AuthError> {
         if !self.repository.revoke_session(session_id, now).await? {
-            return Err(AuthError::InvalidAccessToken);
+            return Err(AuthError::InvalidSession);
         }
         Ok(())
     }
@@ -313,23 +266,18 @@ impl AuthService {
 }
 
 fn new_session_grant(user: UserSummary, now: i64) -> Result<(NewSession, SessionGrant), AuthError> {
-    let tokens = issue_session_tokens(now)?;
+    let issued = issue_session(now)?;
     let session = NewSession {
         id: SessionId::random(),
         user_id: user.id.clone(),
-        access_token_hash: tokens.access.digest,
-        refresh_token_hash: tokens.refresh.digest,
-        access_expires_at: tokens.access_expires_at,
-        refresh_expires_at: tokens.refresh_expires_at,
-        absolute_expires_at: tokens.absolute_expires_at,
+        token_hash: issued.token.digest,
+        expires_at: issued.expires_at,
         created_at: now,
     };
     let grant = SessionGrant {
         user,
-        access_token: tokens.access.secret,
-        refresh_token: tokens.refresh.secret,
-        access_expires_at: tokens.access_expires_at,
-        refresh_expires_at: tokens.refresh_expires_at,
+        session_token: issued.token.secret,
+        expires_at: issued.expires_at,
     };
     Ok((session, grant))
 }
@@ -339,10 +287,7 @@ pub struct ApiKeyAuthenticator {
     repository: Arc<dyn AuthRepository>,
     active: Arc<RwLock<HashMap<[u8; 32], ActiveApiKey>>>,
     mutation: Arc<Mutex<()>>,
-    quota_spent: Arc<RwLock<HashMap<ApiKeyId, QuotaSpend>>>,
 }
-
-pub struct ApiKeyQuotaLease;
 
 #[derive(Clone)]
 struct ActiveApiKey {
@@ -354,34 +299,13 @@ struct ActiveApiKey {
     expires_at: Option<i64>,
 }
 
-#[derive(Clone)]
-enum QuotaSpend {
-    Known(String),
-    Unavailable,
-}
-
 impl ApiKeyAuthenticator {
     pub async fn load(repository: Arc<dyn AuthRepository>) -> Result<Self, AuthError> {
         let keys = repository.load_active_api_keys().await?;
-        let quota_spent = keys
-            .iter()
-            .filter(|key| key.quota_limit_atoms.is_some())
-            .map(|key| {
-                (
-                    key.id.clone(),
-                    if key.quota_accounting_ready {
-                        quota_spend(&key.spent_atoms)
-                    } else {
-                        QuotaSpend::Unavailable
-                    },
-                )
-            })
-            .collect();
         Ok(Self {
             repository,
             active: Arc::new(RwLock::new(active_key_map(keys))),
             mutation: Arc::new(Mutex::new(())),
-            quota_spent: Arc::new(RwLock::new(quota_spent)),
         })
     }
 
@@ -404,6 +328,7 @@ impl ApiKeyAuthenticator {
     pub async fn create(
         &self,
         owner_user_id: &UserId,
+        secret: SecretString,
         group_label: String,
         label: String,
         expires_at: Option<i64>,
@@ -412,6 +337,7 @@ impl ApiKeyAuthenticator {
     ) -> Result<CreatedApiKey, AuthError> {
         let label = normalize_label(label)?;
         let group_label = normalize_group_label(group_label)?;
+        validate_api_key_secret(&secret)?;
         if expires_at.is_some_and(|expires_at| expires_at <= now) {
             return Err(AuthError::InvalidExpiry);
         }
@@ -421,13 +347,13 @@ impl ApiKeyAuthenticator {
                 Some(parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?)
             }
         };
-        let issued = issue_api_key()?;
+        let digest = digest_secret(secret.expose_secret());
         let key = NewApiKey {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
             group_label: group_label.clone(),
             label,
-            key: issued.secret.clone(),
+            key: secret.clone(),
             enabled: true,
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
@@ -443,7 +369,6 @@ impl ApiKeyAuthenticator {
             expires_at,
             quota_limit_atoms: quota_limit_atoms.clone(),
             spent_atoms: "0".to_owned(),
-            quota_accounting_ready: true,
             last_used_at: None,
             created_at: now,
             updated_at: now,
@@ -459,17 +384,11 @@ impl ApiKeyAuthenticator {
         if !self.repository.create_api_key(key.clone()).await? {
             return Err(AuthError::Conflict);
         }
-        if quota_limit_atoms.is_some() {
-            self.quota_spent
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(summary.id.clone(), QuotaSpend::Known("0".to_owned()));
-        }
         self.active
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
-                issued.digest,
+                digest,
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
@@ -481,7 +400,7 @@ impl ApiKeyAuthenticator {
             );
         Ok(CreatedApiKey {
             summary,
-            key: issued.secret,
+            key: secret,
         })
     }
 
@@ -510,13 +429,16 @@ impl ApiKeyAuthenticator {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
-        label: Option<String>,
-        group_label: Option<String>,
-        enabled: Option<bool>,
-        expires_at: Option<Option<i64>>,
-        quota_limit_usd: Option<Option<String>>,
-        now: i64,
+        patch: ApiKeyPatch,
     ) -> Result<ApiKeySummary, AuthError> {
+        let ApiKeyPatch {
+            label,
+            group_label,
+            enabled,
+            expires_at,
+            quota_limit_usd,
+            updated_at,
+        } = patch;
         let _mutation = self.mutation.lock().await;
         let current = self
             .repository
@@ -525,7 +447,7 @@ impl ApiKeyAuthenticator {
             .ok_or(AuthError::NotFound)?;
         if expires_at
             .flatten()
-            .is_some_and(|expires_at| expires_at <= now)
+            .is_some_and(|expires_at| expires_at <= updated_at)
         {
             return Err(AuthError::InvalidExpiry);
         }
@@ -559,12 +481,14 @@ impl ApiKeyAuthenticator {
             .update_api_key(
                 owner_user_id,
                 key_id,
-                &group_label,
-                &label,
-                enabled,
-                expires_at,
-                quota_limit_atoms,
-                now,
+                StoredApiKeyUpdate {
+                    group_label,
+                    label,
+                    enabled,
+                    expires_at,
+                    quota_limit_atoms,
+                    updated_at,
+                },
             )
             .await
         {
@@ -578,11 +502,6 @@ impl ApiKeyAuthenticator {
                 return Err(error.into());
             }
         };
-        if updated.quota_limit_atoms.is_some() {
-            self.remember_spent(&updated.id, &updated.spent_atoms);
-        } else {
-            self.forget_quota_state(&updated.id);
-        }
         if updated.enabled {
             self.active
                 .write()
@@ -606,10 +525,7 @@ impl ApiKeyAuthenticator {
         let _mutation = self.mutation.lock().await;
         let removed = self.remove_active(owner_user_id, key_id);
         match self.repository.delete_api_key(owner_user_id, key_id).await {
-            Ok(true) => {
-                self.forget_quota_state(key_id);
-                Ok(())
-            }
+            Ok(true) => Ok(()),
             Ok(false) => {
                 self.restore_active(removed);
                 Err(AuthError::NotFound)
@@ -621,85 +537,53 @@ impl ApiKeyAuthenticator {
         }
     }
 
-    /// Reject when the key's lifetime observed spend has already reached its USD ceiling.
-    pub async fn ensure_quota_available(&self, key: &AuthenticatedApiKey) -> Result<(), AuthError> {
-        let Some(limit) = key.quota_limit_atoms.as_deref() else {
-            return Ok(());
+    /// Disable admission before committing the durable user/key revocation.
+    /// Requests that already authenticated keep their cloned identity and may finish.
+    pub async fn set_user_enabled(
+        &self,
+        auth: &AuthService,
+        actor: &UserSummary,
+        user_id: &UserId,
+        enabled: bool,
+        now: i64,
+    ) -> Result<UserSummary, AuthError> {
+        let _mutation = self.mutation.lock().await;
+        let removed = if enabled {
+            Vec::new()
+        } else {
+            self.remove_owner_active(user_id)
         };
-        let (persisted, accounting_ready) = self
-            .repository
-            .load_api_key_spent_atoms(&key.key_id)
-            .await?
-            .ok_or(AuthError::QuotaLedgerUnavailable)?;
-        if !accounting_ready {
-            return Err(AuthError::QuotaLedgerUnavailable);
-        }
-        let persisted = match quota_spend(&persisted) {
-            QuotaSpend::Known(value) => value,
-            QuotaSpend::Unavailable => return Err(AuthError::QuotaLedgerUnavailable),
-        };
-        let memory = self
-            .quota_spent
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key.key_id)
-            .cloned();
-        let spent = match memory {
-            Some(QuotaSpend::Unavailable) => return Err(AuthError::QuotaLedgerUnavailable),
-            Some(QuotaSpend::Known(memory))
-                if atoms_ge(&memory, &persisted)
-                    .map_err(|_| AuthError::QuotaLedgerUnavailable)? =>
-            {
-                memory
+        match auth.set_user_enabled(actor, user_id, enabled, now).await {
+            Ok(user) => Ok(user),
+            Err(error) => {
+                self.restore_many_active(removed);
+                Err(error)
             }
-            _ => {
-                self.remember_spent(&key.key_id, &persisted);
-                persisted
-            }
-        };
-        if atoms_ge(&spent, limit).map_err(|_| AuthError::QuotaLedgerUnavailable)? {
-            return Err(AuthError::QuotaExceeded);
         }
-        Ok(())
     }
 
-    /// Check the authoritative ledger without serializing normal concurrent
-    /// requests. A request that crosses the limit is charged in full and makes
-    /// later admissions fail.
-    pub async fn acquire_quota(
+    /// Atomically reserve one request's maximum cost before any upstream call.
+    /// Returns whether a durable reservation was created; unlimited keys need no
+    /// quota writer entry.
+    pub async fn reserve_quota(
         &self,
         key: &AuthenticatedApiKey,
-    ) -> Result<ApiKeyQuotaLease, AuthError> {
-        self.ensure_quota_available(key).await?;
-        Ok(ApiKeyQuotaLease)
-    }
-
-    /// Record known cost immediately for admission checks. The durable writer
-    /// records the same amount transactionally; keeping the high-water mark in
-    /// memory closes the gap between response completion and database commit.
-    pub fn record_quota_result(&self, api_key_id: &ApiKeyId, atoms: Option<i128>) {
-        let Some(atoms) = atoms else {
-            self.quota_spent
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(api_key_id.clone(), QuotaSpend::Unavailable);
-            return;
-        };
-        if atoms <= 0 {
-            return;
+        request_id: &str,
+        maximum_cost_atoms: &str,
+        reserved_at_ms: i64,
+    ) -> Result<bool, AuthError> {
+        if key.quota_limit_atoms.is_none() {
+            return Ok(false);
         }
-        let mut spent = self
-            .quota_spent
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let current = match spent.get(api_key_id) {
-            Some(QuotaSpend::Unavailable) => return,
-            Some(QuotaSpend::Known(value)) => value.as_str(),
-            None => return,
-        };
-        let next = add_atoms(current, &atoms.to_string())
-            .map_or(QuotaSpend::Unavailable, QuotaSpend::Known);
-        spent.insert(api_key_id.clone(), next);
+        match self
+            .repository
+            .reserve_api_key_quota(&key.key_id, request_id, maximum_cost_atoms, reserved_at_ms)
+            .await?
+        {
+            QuotaReservationOutcome::Reserved => Ok(true),
+            QuotaReservationOutcome::Unlimited => Ok(false),
+            QuotaReservationOutcome::Exceeded => Err(AuthError::QuotaExceeded),
+        }
     }
 
     pub async fn account_ids_for_key(
@@ -715,25 +599,6 @@ impl ApiKeyAuthenticator {
 
     pub async fn quota_ledger_ready(&self) -> Result<(), AuthError> {
         Ok(self.repository.quota_ledger_ready().await?)
-    }
-
-    pub fn revoke_owner(&self, owner_user_id: &UserId) {
-        self.active
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|_, key| key.owner_user_id != *owner_user_id);
-    }
-
-    pub async fn reload_owner(&self, owner_user_id: &UserId) -> Result<(), AuthError> {
-        let keys = self.repository.load_active_api_keys().await?;
-        let mut active = self.active.write().unwrap_or_else(PoisonError::into_inner);
-        active.retain(|_, key| key.owner_user_id != *owner_user_id);
-        active.extend(active_key_map(
-            keys.into_iter()
-                .filter(|key| key.owner_user_id == *owner_user_id)
-                .collect(),
-        ));
-        Ok(())
     }
 
     fn remove_active(
@@ -757,46 +622,23 @@ impl ApiKeyAuthenticator {
         }
     }
 
-    fn remember_spent(&self, api_key_id: &ApiKeyId, spent_atoms: &str) {
-        let mut spent = self
-            .quota_spent
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let incoming = quota_spend(spent_atoms);
-        match (spent.get(api_key_id), incoming) {
-            (_, QuotaSpend::Unavailable) | (Some(QuotaSpend::Unavailable), _) => {
-                spent.insert(api_key_id.clone(), QuotaSpend::Unavailable);
-            }
-            (Some(QuotaSpend::Known(current)), QuotaSpend::Known(next)) => {
-                match atoms_ge(&next, current) {
-                    Ok(true) => {
-                        spent.insert(api_key_id.clone(), QuotaSpend::Known(next));
-                    }
-                    Ok(false) => {}
-                    Err(()) => {
-                        spent.insert(api_key_id.clone(), QuotaSpend::Unavailable);
-                    }
-                }
-            }
-            (None, QuotaSpend::Known(next)) => {
-                spent.insert(api_key_id.clone(), QuotaSpend::Known(next));
-            }
-        }
+    fn remove_owner_active(&self, owner_user_id: &UserId) -> Vec<([u8; 32], ActiveApiKey)> {
+        let mut active = self.active.write().unwrap_or_else(PoisonError::into_inner);
+        let digests = active
+            .iter()
+            .filter_map(|(digest, key)| (key.owner_user_id == *owner_user_id).then_some(*digest))
+            .collect::<Vec<_>>();
+        digests
+            .into_iter()
+            .filter_map(|digest| active.remove_entry(&digest))
+            .collect()
     }
 
-    fn forget_quota_state(&self, api_key_id: &ApiKeyId) {
-        self.quota_spent
+    fn restore_many_active(&self, removed: Vec<([u8; 32], ActiveApiKey)>) {
+        self.active
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(api_key_id);
-    }
-}
-
-fn quota_spend(value: &str) -> QuotaSpend {
-    if value.is_empty() || value.len() > 64 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        QuotaSpend::Unavailable
-    } else {
-        QuotaSpend::Known(value.to_owned())
+            .extend(removed);
     }
 }
 
@@ -829,7 +671,6 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
         expires_at: key.expires_at,
         quota_limit_atoms: key.quota_limit_atoms.clone(),
         spent_atoms: key.spent_atoms.clone(),
-        quota_accounting_ready: key.quota_accounting_ready,
         last_used_at: key.last_used_at,
         created_at: key.created_at,
         updated_at: key.updated_at,
@@ -855,6 +696,14 @@ fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
         return Err(AuthError::InvalidGroup);
     }
     Ok(group_label)
+}
+
+fn validate_api_key_secret(key: &SecretString) -> Result<(), AuthError> {
+    let key = key.expose_secret();
+    if key.is_empty() || key.len() > 1024 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AuthError::InvalidApiKeyValue);
+    }
+    Ok(())
 }
 
 fn normalize_username(username: String) -> Result<String, AuthError> {
@@ -954,12 +803,12 @@ pub enum AuthError {
     AlreadyConfigured,
     #[error("invalid username or password")]
     InvalidCredentials,
-    #[error("invalid access token")]
-    InvalidAccessToken,
-    #[error("invalid refresh token")]
-    InvalidRefreshToken,
+    #[error("invalid session")]
+    InvalidSession,
     #[error("invalid API key")]
     InvalidApiKey,
+    #[error("API key must contain 1 to 1024 non-whitespace ASCII characters")]
+    InvalidApiKeyValue,
     #[error("user is not allowed to perform this operation")]
     Forbidden,
     #[error("resource already exists")]
@@ -990,4 +839,20 @@ pub enum AuthError {
     Credential(#[from] CredentialError),
     #[error(transparent)]
     Repository(#[from] AuthRepositoryError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_metadata_keeps_only_first_and_last_three_characters() {
+        let key = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+        let masked = mask_api_key(key);
+
+        assert_eq!(masked.len(), key.len());
+        assert!(masked.starts_with("abc"));
+        assert!(masked.ends_with("OPQ"));
+        assert!(masked[3..masked.len() - 3].bytes().all(|byte| byte == b'*'));
+    }
 }

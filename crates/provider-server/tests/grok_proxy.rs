@@ -134,6 +134,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     let created_key = api_keys
         .create(
             &grant.user.id,
+            SecretString::from("test-api-key"),
             "default".to_owned(),
             "test".to_owned(),
             None,

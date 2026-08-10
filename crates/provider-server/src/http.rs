@@ -1,18 +1,20 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-use provider_auth::{
-    ApiKeyAuthenticator, ApiKeyQuotaLease, AuthError, AuthService, AuthenticatedApiKey,
-};
+#[cfg(test)]
+use provider_auth::ApiKeyPatch;
+use provider_auth::{ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedApiKey};
 use provider_core::{
     AccountId, ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
     ProxyService, RequestMetadata, WireFormat,
@@ -20,6 +22,7 @@ use provider_core::{
 use provider_management::ProviderManager;
 use provider_usage::{
     DeliveryOutcome, ExecutionOutcome, LogicalRequestStart, LogicalTracker, UsageTracking,
+    compute_maximum_text_request_cost,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -27,7 +30,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const CLAUDE_MODEL_PREFIX: &str = "claude-fable-5-dd-";
 const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
-const CLAUDE_CODE_SESSION_SUFFIX: &str = "_session_";
+pub(crate) const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MANAGEMENT_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -36,6 +40,24 @@ struct AppState {
     /// `None` disables usage tracking entirely, which is how every path stays
     /// working when there is no database to record into.
     usage: Option<Arc<UsageTracking>>,
+    proxy_readiness: ProxyReadiness,
+}
+
+#[derive(Clone)]
+pub struct ProxyReadiness(Arc<AtomicBool>);
+
+impl ProxyReadiness {
+    pub fn new(ready: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(ready)))
+    }
+
+    pub(crate) fn signal(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 pub fn router(service: ProxyService, api_keys: ApiKeyAuthenticator) -> Router {
@@ -47,6 +69,15 @@ pub fn router_with_usage(
     api_keys: ApiKeyAuthenticator,
     usage: Option<Arc<UsageTracking>>,
 ) -> Router {
+    router_with_usage_and_readiness(service, api_keys, usage, ProxyReadiness::new(true))
+}
+
+fn router_with_usage_and_readiness(
+    service: ProxyService,
+    api_keys: ApiKeyAuthenticator,
+    usage: Option<Arc<UsageTracking>>,
+    proxy_readiness: ProxyReadiness,
+) -> Router {
     Router::new()
         .route("/healthz", get(liveness))
         .route("/livez", get(liveness))
@@ -55,10 +86,13 @@ pub fn router_with_usage(
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .layer(DefaultBodyLimit::max(MAX_PROXY_BODY_BYTES))
+        .layer(middleware::from_fn(reject_compressed_request))
         .with_state(AppState {
             service,
             api_keys,
             usage,
+            proxy_readiness,
         })
 }
 
@@ -79,6 +113,26 @@ pub fn router_with_management_and_usage(
     usage: Option<crate::usage_http::UsageServices>,
     trusted_proxy_ip: Option<std::net::IpAddr>,
 ) -> Router {
+    router_with_management_usage_and_readiness(
+        service,
+        manager,
+        auth,
+        api_keys,
+        usage,
+        trusted_proxy_ip,
+        ProxyReadiness::new(true),
+    )
+}
+
+pub(crate) fn router_with_management_usage_and_readiness(
+    service: ProxyService,
+    manager: ProviderManager,
+    auth: AuthService,
+    api_keys: ApiKeyAuthenticator,
+    usage: Option<crate::usage_http::UsageServices>,
+    trusted_proxy_ip: Option<std::net::IpAddr>,
+    proxy_readiness: ProxyReadiness,
+) -> Router {
     let auth_state = crate::auth_http::AuthHttpState::new(
         auth.clone(),
         api_keys.clone(),
@@ -91,10 +145,45 @@ pub fn router_with_management_and_usage(
         // by a logged-in person, never with a proxy API key.
         management = management.merge(crate::usage_http::router(usage.clone()));
     }
-    let management = crate::auth_http::protect(management, auth);
-    router_with_usage(service, api_keys, usage.map(|usage| usage.tracking))
-        .merge(crate::auth_http::router(auth_state))
-        .merge(management)
+    let management = crate::auth_http::protect(management, auth)
+        .layer(DefaultBodyLimit::max(MAX_MANAGEMENT_BODY_BYTES))
+        .layer(middleware::from_fn(reject_compressed_request));
+    router_with_usage_and_readiness(
+        service,
+        api_keys,
+        usage.map(|usage| usage.tracking),
+        proxy_readiness,
+    )
+    .merge(crate::auth_http::router(auth_state))
+    .merge(management)
+}
+
+pub(crate) async fn reject_compressed_request(request: Request, next: Next) -> Response {
+    let compressed = request
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+            })
+        });
+    if compressed {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "compressed request bodies are not supported"
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn liveness() -> Json<Value> {
@@ -107,7 +196,8 @@ async fn readiness(State(state): State<AppState>) -> Response {
         .usage
         .as_ref()
         .is_none_or(|usage| usage.quota_ledger_ready());
-    let ready = database_ready && writer_ready;
+    let providers_ready = state.proxy_readiness.get();
+    let ready = database_ready && writer_ready && providers_ready;
     (
         if ready {
             StatusCode::OK
@@ -117,7 +207,8 @@ async fn readiness(State(state): State<AppState>) -> Response {
         Json(json!({
             "status": if ready { "ready" } else { "not_ready" },
             "database": database_ready,
-            "quota_ledger": writer_ready
+            "quota_ledger": writer_ready,
+            "providers": providers_ready
         })),
     )
         .into_response()
@@ -128,6 +219,7 @@ async fn models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
     let protocol = models_protocol(&headers);
+    ensure_proxy_ready(&state, protocol)?;
     let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
     let account_ids = load_key_account_filter(&state.api_keys, &key, protocol).await?;
     let models = state
@@ -219,9 +311,18 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
+    ensure_proxy_ready(&state, WireFormat::OpenAiResponses)?;
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::OpenAiResponses, &body).await?;
+    let maximum_output_tokens =
+        match quota_output_limit(&key, WireFormat::OpenAiResponses, &payload) {
+            Ok(limit) => limit,
+            Err(error) => {
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                return Err(error);
+            }
+        };
     let request =
         match proxy_request_from_payload(WireFormat::OpenAiResponses, &headers, body, payload) {
             Ok(request) => request,
@@ -230,7 +331,7 @@ async fn responses(
                 return Err(error);
             }
         };
-    proxy_prepared_stream(&state, &key, request, logical).await
+    proxy_prepared_stream(&state, &key, request, logical, maximum_output_tokens).await
 }
 
 async fn messages(
@@ -238,9 +339,18 @@ async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
+    ensure_proxy_ready(&state, WireFormat::ClaudeMessages)?;
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::ClaudeMessages, &body).await?;
+    let maximum_output_tokens = match quota_output_limit(&key, WireFormat::ClaudeMessages, &payload)
+    {
+        Ok(limit) => limit,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(error);
+        }
+    };
     let request = match proxy_request_for_key_from_payload(
         WireFormat::ClaudeMessages,
         &headers,
@@ -254,7 +364,7 @@ async fn messages(
             return Err(error);
         }
     };
-    proxy_prepared_stream(&state, &key, request, logical).await
+    proxy_prepared_stream(&state, &key, request, logical, maximum_output_tokens).await
 }
 
 async fn count_tokens(
@@ -262,6 +372,7 @@ async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, HttpError> {
+    ensure_proxy_ready(&state, WireFormat::ClaudeMessages)?;
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
     let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
     let account_ids =
@@ -275,27 +386,27 @@ async fn count_tokens(
     Ok(Json(json!({ "input_tokens": count })))
 }
 
+fn ensure_proxy_ready(state: &AppState, protocol: WireFormat) -> Result<(), HttpError> {
+    if state.proxy_readiness.get() {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            protocol,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "provider runtime recovery is incomplete",
+        ))
+    }
+}
+
 async fn proxy_prepared_stream(
     state: &AppState,
     key: &AuthenticatedApiKey,
     request: ProxyRequest,
     logical: Option<Arc<LogicalTracker>>,
+    maximum_output_tokens: Option<u64>,
 ) -> Result<Response, HttpError> {
     let protocol = request.format;
-    let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
-    let quota_lease = match ensure_key_quota(&state.api_keys, key, protocol).await {
-        Ok(lease) => lease,
-        Err(error) => {
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
-            return Err(error);
-        }
-    };
-    if let Some(logical) = logical.as_ref()
-        && logical.reserve_quota().await.is_err()
-    {
-        finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-        return Err(HttpError::internal(protocol));
-    }
     let account_ids = match load_key_account_filter(&state.api_keys, key, protocol).await {
         Ok(account_ids) => account_ids,
         Err(error) => {
@@ -303,17 +414,103 @@ async fn proxy_prepared_stream(
             return Err(error);
         }
     };
+    let mut prepared =
+        match state
+            .service
+            .prepare_stream(key.owner_user_id.as_str(), request, Some(&account_ids))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                return Err(HttpError::from_provider(protocol, error));
+            }
+        };
 
-    let stream = match state
-        .service
-        .execute_tracked_stream(
-            key.owner_user_id.as_str(),
-            request,
-            tracking.as_ref(),
-            Some(&account_ids),
-        )
-        .await
-    {
+    if let Some(maximum_output_tokens) = maximum_output_tokens {
+        let Some(logical) = logical.as_ref() else {
+            return Err(HttpError::service_unavailable(
+                protocol,
+                "quota accounting is unavailable",
+            ));
+        };
+        let Some(pricing) = prepared.pricing().cloned() else {
+            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+            return Err(HttpError::invalid_request(
+                protocol,
+                "the requested model has no official price for quota admission",
+            ));
+        };
+        let Some(profile) = prepared.usage_profile() else {
+            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+            return Err(HttpError::invalid_request(
+                protocol,
+                "the requested provider cannot account for finite quotas",
+            ));
+        };
+        let input_tokens = match prepared.count_input_tokens().await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+                return Err(HttpError::from_provider(protocol, error));
+            }
+        };
+        let maximum = match compute_maximum_text_request_cost(
+            &pricing.pricing,
+            &profile.contract,
+            input_tokens,
+            maximum_output_tokens,
+            prepared.maximum_attempts(),
+        ) {
+            Ok(maximum) => maximum,
+            Err(_) => {
+                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+                return Err(HttpError::invalid_request(
+                    protocol,
+                    "the requested model price cannot produce a finite quota maximum",
+                ));
+            }
+        };
+        if logical.reserve_quota_settlement().await.is_err() {
+            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+            return Err(HttpError::service_unavailable(
+                protocol,
+                "quota accounting is unavailable",
+            ));
+        }
+        match state
+            .api_keys
+            .reserve_quota(
+                key,
+                logical.request_id(),
+                &maximum.as_atoms().to_string(),
+                provider_usage::system_clock_ms(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => logical.cancel_quota_settlement(),
+            Err(AuthError::QuotaExceeded) => {
+                logical.cancel_quota_settlement();
+                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+                return Err(HttpError::rate_limited(
+                    protocol,
+                    "API key USD quota has been exhausted",
+                ));
+            }
+            Err(_) => {
+                logical.cancel_quota_settlement();
+                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
+                return Err(HttpError::service_unavailable(
+                    protocol,
+                    "quota accounting is unavailable",
+                ));
+            }
+        }
+    }
+
+    let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
+
+    let stream = match prepared.execute_stream(tracking.as_ref()).await {
         Ok(stream) => stream,
         Err(error) => {
             finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
@@ -321,7 +518,7 @@ async fn proxy_prepared_stream(
         }
     };
 
-    let body = Body::from_stream(observe_delivery(stream, logical, quota_lease));
+    let body = Body::from_stream(observe_delivery(stream, logical));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -380,6 +577,30 @@ fn finish_before_bytes(logical: Option<&Arc<LogicalTracker>>, execution: Executi
     }
 }
 
+fn quota_output_limit(
+    key: &AuthenticatedApiKey,
+    protocol: WireFormat,
+    payload: &Value,
+) -> Result<Option<u64>, HttpError> {
+    if key.quota_limit_atoms.is_none() {
+        return Ok(None);
+    }
+    crate::quota::maximum_text_output_tokens(protocol, payload)
+        .map(Some)
+        .map_err(|error| match error {
+            crate::quota::QuotaRequestError::MissingOutputLimit => HttpError::invalid_request(
+                protocol,
+                "finite-quota requests require a positive output token limit",
+            ),
+            crate::quota::QuotaRequestError::UnsupportedBillableContent => {
+                HttpError::invalid_request(
+                    protocol,
+                    "finite quotas currently support text-only requests",
+                )
+            }
+        })
+}
+
 /// Record the start of a logical request, if usage is being tracked.
 ///
 /// The write inside is the only tracking write on the request path, and it is
@@ -432,12 +653,10 @@ fn request_reasoning_effort(payload: &Value) -> Option<String> {
 fn observe_delivery(
     stream: ProviderStream,
     logical: Option<Arc<LogicalTracker>>,
-    quota_lease: ApiKeyQuotaLease,
 ) -> ProviderStream {
     struct Delivery {
         inner: Option<ProviderStream>,
         logical: Option<Arc<LogicalTracker>>,
-        _quota_lease: ApiKeyQuotaLease,
         sent_bytes: bool,
     }
 
@@ -457,7 +676,6 @@ fn observe_delivery(
         Delivery {
             inner: Some(stream),
             logical,
-            _quota_lease: quota_lease,
             sent_bytes: false,
         },
         |mut state| async move {
@@ -624,26 +842,12 @@ fn claude_code_session_id(
         .and_then(Value::as_object)
         .and_then(|metadata| metadata.get("user_id"))
         .and_then(Value::as_str)
+        && let Ok(metadata) = serde_json::from_str::<Value>(user_id)
+        && let Some(session_id) = metadata.get("session_id").and_then(Value::as_str)
     {
-        if let Ok(metadata) = serde_json::from_str::<Value>(user_id)
-            && let Some(session_id) = metadata.get("session_id").and_then(Value::as_str)
-        {
-            return validated_session_id(session_id, protocol);
-        }
-        if let Some((_, session_id)) = user_id.rsplit_once(CLAUDE_CODE_SESSION_SUFFIX)
-            && valid_legacy_claude_session_id(session_id)
-        {
-            return validated_session_id(session_id, protocol);
-        }
+        return validated_session_id(session_id, protocol);
     }
     metadata_header(headers, "session-id", protocol)
-}
-
-fn valid_legacy_claude_session_id(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase() || byte == b'-')
 }
 
 fn validated_session_id(value: &str, protocol: WireFormat) -> Result<Option<String>, HttpError> {
@@ -734,21 +938,6 @@ async fn load_key_account_filter(
     Ok(set)
 }
 
-async fn ensure_key_quota(
-    api_keys: &ApiKeyAuthenticator,
-    key: &AuthenticatedApiKey,
-    protocol: WireFormat,
-) -> Result<ApiKeyQuotaLease, HttpError> {
-    match api_keys.acquire_quota(key).await {
-        Ok(lease) => Ok(lease),
-        Err(AuthError::QuotaExceeded) => Err(HttpError::rate_limited(
-            protocol,
-            "API key USD quota has been exhausted",
-        )),
-        Err(_) => Err(HttpError::internal(protocol)),
-    }
-}
-
 fn authenticate_api_key(
     authenticator: &ApiKeyAuthenticator,
     headers: &HeaderMap,
@@ -817,6 +1006,15 @@ impl HttpError {
             protocol,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
+            message,
+        )
+    }
+
+    fn service_unavailable(protocol: WireFormat, message: &'static str) -> Self {
+        Self::new(
+            protocol,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
             message,
         )
     }
@@ -933,6 +1131,18 @@ mod tests {
         serde_json::from_slice(&body).expect("response JSON")
     }
 
+    fn padded_json(prefix: &str, suffix: &str, size: usize) -> String {
+        let padding = size
+            .checked_sub(prefix.len() + suffix.len())
+            .expect("requested JSON size");
+        let mut body = String::with_capacity(size);
+        body.push_str(prefix);
+        body.extend(std::iter::repeat_n('a', padding));
+        body.push_str(suffix);
+        assert_eq!(body.len(), size);
+        body
+    }
+
     struct TestProvider {
         models: Vec<ProviderModel>,
         metadata: Arc<Mutex<Vec<RequestMetadata>>>,
@@ -995,6 +1205,7 @@ mod tests {
         let created_key = api_keys
             .create(
                 &grant.user.id,
+                SecretString::from("test-api-key"),
                 "default".to_owned(),
                 "test".to_owned(),
                 None,
@@ -1136,16 +1347,59 @@ mod tests {
         .await;
         assert_eq!(count["input_tokens"], 42);
 
+        let compressed = client
+            .post(format!("{base_url}/v1/responses"))
+            .bearer_auth(&api_key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(r#"{"model":"grok-4.5","input":"hello"}"#)
+            .send()
+            .await
+            .expect("compressed proxy request");
+        assert_eq!(compressed.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let exact_body = padded_json(
+            r#"{"model":"grok-4.5","input":""#,
+            r#""}"#,
+            MAX_PROXY_BODY_BYTES,
+        );
+        let exact_limit = client
+            .post(format!("{base_url}/v1/responses"))
+            .bearer_auth(&api_key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(exact_body)
+            .send()
+            .await
+            .expect("proxy request at body limit");
+        assert_eq!(exact_limit.status(), StatusCode::OK);
+
+        let oversized_body = padded_json(
+            r#"{"model":"grok-4.5","input":""#,
+            r#""}"#,
+            MAX_PROXY_BODY_BYTES + 1,
+        );
+        let oversized = client
+            .post(format!("{base_url}/v1/responses"))
+            .bearer_auth(&api_key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized_body)
+            .send()
+            .await
+            .expect("oversized proxy request");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
         api_keys
             .update(
                 &grant.user.id,
                 &created_key.summary.id,
-                None,
-                None,
-                Some(false),
-                None,
-                None,
-                unix_timestamp(),
+                ApiKeyPatch {
+                    label: None,
+                    group_label: None,
+                    enabled: Some(false),
+                    expires_at: None,
+                    quota_limit_usd: None,
+                    updated_at: unix_timestamp(),
+                },
             )
             .await
             .expect("disable API key");
@@ -1232,24 +1486,21 @@ mod tests {
     }
 
     #[test]
-    fn extracts_legacy_session_and_rejects_bare_user_id() {
+    fn ignores_unstructured_claude_user_ids() {
         let headers = HeaderMap::new();
-        let legacy: Value = serde_json::from_slice(
+        let prefixed: Value = serde_json::from_slice(
             br#"{"metadata":{"user_id":"user_account_session_123e4567-e89b-12d3-a456-426614174000"}}"#,
         )
-        .expect("legacy JSON");
-        let legacy_session = match claude_code_session_id(
+        .expect("prefixed JSON");
+        let prefixed_session = match claude_code_session_id(
             &headers,
-            legacy.as_object().expect("legacy object"),
+            prefixed.as_object().expect("prefixed object"),
             WireFormat::ClaudeMessages,
         ) {
             Ok(value) => value,
-            Err(_) => panic!("legacy session should be valid"),
+            Err(_) => panic!("prefixed user ID should be ignored"),
         };
-        assert_eq!(
-            legacy_session.as_deref(),
-            Some("123e4567-e89b-12d3-a456-426614174000")
-        );
+        assert_eq!(prefixed_session, None);
         let bare: Value =
             serde_json::from_slice(br#"{"metadata":{"user_id":"same-user-across-chats"}}"#)
                 .expect("bare JSON");

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 provider-auth.workspace = true
@@ -33,6 +34,8 @@ uuid.workspace = true
 [dev-dependencies]
 provider-drivers = { workspace = true, features = ["test-util"] }
 provider-storage = { workspace = true, features = ["test-util"] }
+rcgen.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

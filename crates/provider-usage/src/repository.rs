@@ -119,16 +119,16 @@ pub struct AttemptFacts {
     pub cost: ObservedCatalogCost,
 }
 
-/// One authoritative logical-request quota result. `cost_atoms = Some` means
-/// every dispatched attempt was completely priced and contains their total
-/// (zero is valid); `None` means at least one dispatched attempt is unknowable
-/// and the key must stop claiming a reliable remaining quota.
+/// One authoritative logical-request quota result for a reservation created
+/// before dispatch. Only an observed exact cost is settled; an absent cost
+/// releases the reservation without inventing spend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuotaLedgerEntry {
     pub entry_id: String,
     pub api_key_id: String,
+    pub dispatched: bool,
     pub cost_atoms: Option<String>,
-    pub recorded_at_ms: i64,
+    pub resolved_at_ms: i64,
 }
 
 /// The stored models.dev catalog. Exactly one is kept; an absent row means the
@@ -165,7 +165,8 @@ pub trait UsageRepository: Send + Sync {
 
     /// Persist one attempt. Re-submitting the same `attempt_id` is a no-op; a
     /// *different* attempt claiming an already-used sequence is an error,
-    /// because that would silently duplicate upstream usage.
+    /// because that would silently duplicate upstream usage. Complete costs for
+    /// requests without a quota reservation also advance lifetime key spend.
     async fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), UsageRepositoryError>;
 
     /// Persist a logical request's quota result idempotently and update the API
@@ -174,6 +175,10 @@ pub trait UsageRepository: Send + Sync {
         &self,
         entry: &QuotaLedgerEntry,
     ) -> Result<(), UsageRepositoryError>;
+
+    /// Release every reservation left by a prior process. Without terminal
+    /// usage facts, restart recovery cannot invent a billable amount.
+    async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError>;
 
     /// Add `count` lost facts to a bucket, creating it if needed. Counting rather
     /// than inserting per loss is what keeps a saturated writer from turning
@@ -200,6 +205,14 @@ pub trait UsageRepository: Send + Sync {
         &self,
         request_id: &str,
     ) -> Result<Vec<AttemptFacts>, UsageRepositoryError>;
+
+    /// Delete up to `batch` settled or released quota-ledger entries resolved
+    /// before `cutoff_ms`. Active reservations are never eligible.
+    async fn delete_resolved_quota_ledger_entries_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError>;
 
     /// Delete up to `batch` finished logical requests that ended before
     /// `cutoff_ms`, together with everything belonging to them.

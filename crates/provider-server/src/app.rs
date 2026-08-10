@@ -1,20 +1,21 @@
 use std::{error::Error, sync::Arc};
 
-use provider_auth::{ApiKeyAuthenticator, ApiKeyId, AuthService};
-use provider_core::{AccountRepository, ProviderControl, ProxyService};
+use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_core::{
+    AccountRepository, ProviderControl, ProviderManagementRepository, ProxyService,
+};
 use provider_drivers::{
     anthropic_compatible::AnthropicCompatibleDriver, codex::CodexDriver, grok::GrokDriver,
     openai_compatible::OpenAiCompatibleDriver,
 };
-use provider_management::{ModelCatalogService, ProviderManager};
+use provider_management::ProviderManager;
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{InstanceGuard, SqliteAccountRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, DEFAULT_QUOTA_QUEUE, DEFAULT_REFRESH_PERIOD,
     DEFAULT_RETENTION, DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, QuotaLedgerWriter,
-    RefreshOutcome, RetentionWorker, SpendObserver, UsageRepository, UsageTracking, UsageWriter,
-    system_clock_ms,
+    RefreshOutcome, RetentionWorker, UsageRepository, UsageTracking, UsageWriter, system_clock_ms,
 };
 use tokio::net::TcpListener;
 
@@ -22,9 +23,10 @@ use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
     config::{
-        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address, trusted_proxy_ip,
+        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address,
+        provider_credential_key, trusted_proxy_ip,
     },
-    router_with_management_and_usage,
+    http::{ProxyReadiness, router_with_management_usage_and_readiness},
 };
 
 /// How long shutdown waits for queued usage facts before giving up on them.
@@ -36,7 +38,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // process is the only one using it. Held until the process exits.
     let _instance = InstanceGuard::acquire(DATABASE_PATH)?;
 
-    let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
+    let repository = Arc::new(
+        SqliteAccountRepository::connect(DATABASE_PATH, provider_credential_key()?).await?,
+    );
     let usage_repository = Arc::new(repository.usage_repository());
     let prices = Arc::new(CatalogPrices::new());
     let refresher = Arc::new(CatalogRefresher::new(
@@ -60,7 +64,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     runtime.register_driver(Arc::new(CodexDriver::new()))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
-    let model_catalog = ModelCatalogService::with_pricing(repository.clone(), prices.clone());
+    let proxy_readiness = ProxyReadiness::new(true);
+    runtime.bind_recovery_readiness(proxy_readiness.signal());
     for account in repository.load_enabled_accounts().await? {
         let account_id = account.id.clone();
         let kind = account.provider;
@@ -69,40 +74,44 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             Ok(account) => account,
             Err(error) => {
                 eprintln!("failed to build provider account {account_id}: {error}");
+                runtime.mark_recovery_failed(account_id);
                 continue;
             }
         };
-        let models = match model_catalog
-            .refresh(account.as_ref(), unix_timestamp())
-            .await
-        {
+        let models = match repository.list_provider_models(Some(&account_id)).await {
             Ok(models) => models,
             Err(error) => {
-                eprintln!("failed to discover models for provider account {account_id}: {error}");
+                eprintln!(
+                    "failed to load persisted models for provider account {account_id}: {error}"
+                );
+                runtime.mark_recovery_failed(account_id);
                 continue;
             }
         };
-        if let Err(error) = runtime
-            .activate_account(kind, account, models.models, access)
-            .await
-        {
-            eprintln!("failed to activate provider account {account_id}: {error}");
-        }
+        runtime.install_account(kind, account, models, access).await;
     }
 
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
     let auth = AuthService::new(repository.clone());
-    let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
 
     // Usage facts share the accounts database. Anything a previous run left in
     // flight has no knowable terminal, so it is closed as incomplete with a gap
     // before this run records anything new.
+    let recovered_quota = usage_repository
+        .recover_quota_reservations(system_clock_ms())
+        .await?;
+    if recovered_quota > 0 {
+        eprintln!(
+            "settled {recovered_quota} quota reservation(s) left by a previous run at their maximum"
+        );
+    }
     let recovered = usage_repository
         .recover_in_flight_requests(unix_timestamp() * 1000)
         .await?;
     if recovered > 0 {
         eprintln!("closed {recovered} usage request(s) left in flight by a previous run");
     }
+    let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
     let writer = Arc::new(UsageWriter::spawn(
         usage_repository.clone(),
         DEFAULT_WRITE_QUEUE,
@@ -111,14 +120,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         usage_repository.clone(),
         DEFAULT_QUOTA_QUEUE,
     ));
-    let spend_observer: SpendObserver = {
-        let api_keys = api_keys.clone();
-        Arc::new(move |api_key_id, atoms| {
-            if let Ok(api_key_id) = ApiKeyId::new(api_key_id.to_owned()) {
-                api_keys.record_quota_result(&api_key_id, atoms);
-            }
-        })
-    };
     // Raw facts expire on their own so the database does not grow without bound.
     // In-flight requests are never touched, and each cycle deletes in small
     // batches rather than one long transaction.
@@ -133,11 +134,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     tokio::spawn(retention.run(DEFAULT_RETENTION_PERIOD));
 
     let usage = UsageServices {
-        tracking: Arc::new(UsageTracking::with_spend_observer(
+        tracking: Arc::new(UsageTracking::with_quota_writer(
             usage_repository.clone(),
             writer.clone(),
             quota_writer.clone(),
-            spend_observer,
         )),
         query: usage_repository,
     };
@@ -168,13 +168,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     println!("provider-core listening on http://{listen_address}");
     let result = axum::serve(
         listener,
-        router_with_management_and_usage(
+        router_with_management_usage_and_readiness(
             service,
             manager,
             auth,
             api_keys,
             Some(usage),
             trusted_proxy_ip()?,
+            proxy_readiness,
         )
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )

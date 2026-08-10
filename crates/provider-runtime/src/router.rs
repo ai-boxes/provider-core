@@ -61,6 +61,7 @@ struct RoutedAccount {
 struct RuntimeAccountRoute {
     runtime: ProviderRuntime,
     account_id: AccountId,
+    usage_profile: Option<provider_core::usage::ProviderUsageProfile>,
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +103,7 @@ impl ProviderModelRouter {
         let route = Arc::new(RuntimeAccountRoute {
             runtime,
             account_id: account_id.clone(),
+            usage_profile: account.usage_profile(),
         });
         self.accounts().insert(
             account_id,
@@ -312,6 +314,14 @@ impl ProviderRoute for RuntimeAccountRoute {
 
     fn native_format(&self) -> WireFormat {
         self.runtime.native_format()
+    }
+
+    fn usage_profile(&self) -> Option<provider_core::usage::ProviderUsageProfile> {
+        self.usage_profile
+    }
+
+    fn maximum_attempts(&self) -> u32 {
+        2
     }
 
     async fn execute_stream(

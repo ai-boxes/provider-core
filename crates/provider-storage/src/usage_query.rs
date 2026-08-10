@@ -141,15 +141,14 @@ impl UsageQuery for SqliteUsageRepository {
                 a.account_id,
                 COUNT(DISTINCT l.request_id) AS requests,
                 SUM(CASE WHEN l.logical_status = 'succeeded' THEN 1 ELSE 0 END) AS successes,
-                SUM(CASE WHEN l.logical_status IN ('failed', 'incomplete')
-                    THEN 1 ELSE 0 END) AS failures
+                SUM(CASE WHEN l.logical_status = 'failed' THEN 1 ELSE 0 END) AS failures
             FROM usage_logical_requests AS l
             INNER JOIN usage_attempts AS a
                 ON a.id = l.final_attempt_id
             WHERE a.account_id IN ({placeholders})
               AND l.completed_at_ms >= ?
               AND l.completed_at_ms < ?
-              AND l.logical_status IN ('succeeded', 'failed', 'incomplete')
+              AND l.logical_status IN ('succeeded', 'failed')
             GROUP BY a.account_id
             ORDER BY a.account_id
             "#,
@@ -680,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_health_counts_incomplete_as_failure_and_excludes_cancellation() {
+    async fn provider_health_counts_only_known_successes_and_failures() {
         let repository = repository().await;
         let succeeded = Written::new("health-success", "user-1", T0 + HOUR);
         let mut failed = Written::new("health-failed", "user-1", T0 + HOUR);
@@ -702,9 +701,9 @@ mod tests {
             .expect("provider health");
 
         assert_eq!(health.len(), 1);
-        assert_eq!(health[0].requests, 3);
+        assert_eq!(health[0].requests, 2);
         assert_eq!(health[0].successes, 1);
-        assert_eq!(health[0].failures, 2);
+        assert_eq!(health[0].failures, 1);
     }
 
     #[tokio::test]

@@ -136,13 +136,13 @@ pub trait ProviderControl: ProviderQuotaControl + Send + Sync {
         kind: ProviderKind,
     ) -> Result<StartedProviderOAuth, ProviderControlError>;
 
-    async fn activate_account(
+    async fn install_account(
         &self,
         kind: ProviderKind,
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
         access: ProviderAccountAccess,
-    ) -> Result<(), ProviderControlError>;
+    );
 
     fn update_account_access(&self, account_id: &AccountId, access: ProviderAccountAccess) -> bool;
 

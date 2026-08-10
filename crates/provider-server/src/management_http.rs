@@ -5,21 +5,24 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Extension, Path, State},
+    extract::{
+        Extension, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use provider_auth::AuthenticatedSession;
+use provider_auth::{AuthenticatedSession, UserRole};
 use provider_core::{
     AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind, ProviderModelOverride,
     ProviderModelPricing, ProviderVisibility, StoredProviderModel,
 };
 use provider_drivers::compatible_api_key_credential;
 use provider_management::{
-    CreatedProviderAccount, DirectProviderAccountInput, ModelCatalogError, ModelCatalogSnapshot,
-    OAuthSessionSnapshot, OAuthSessionStatus, ProviderCredentialReplacement, ProviderManager,
-    ProviderManagerError,
+    CreatedProviderAccount, CredentialProviderAccountInput, DirectProviderAccountInput,
+    ModelCatalogError, ModelCatalogSnapshot, OAuthSessionSnapshot, OAuthSessionStatus,
+    ProviderCredentialReplacement, ProviderManager, ProviderManagerError,
 };
 use provider_usage::{
     ProviderHealthSummary, TimeRange, TimeRangeError, canonical_model_pricing, system_clock_ms,
@@ -92,8 +95,9 @@ async fn list_accounts(
 async fn list_provider_health(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
-    axum::extract::Query(params): axum::extract::Query<ProviderHealthParams>,
+    params: Result<Query<ProviderHealthParams>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let params = query_request(params)?;
     let usage = state.usage.as_ref().ok_or_else(ApiError::internal)?;
     let accounts = state
         .manager
@@ -144,8 +148,10 @@ async fn get_account(
 async fn create_account(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
-    Json(request): Json<CreateAccountRequest>,
+    request: Result<Json<CreateAccountRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
     let created = match request {
         CreateAccountRequest::CredentialJson {
             provider,
@@ -158,11 +164,13 @@ async fn create_account(
                 .manager
                 .create_credential_account(
                     session.user.id.as_str(),
-                    provider,
-                    label,
-                    group_label,
-                    SecretString::from(json_document(credential_json)),
-                    visibility.unwrap_or_default(),
+                    CredentialProviderAccountInput {
+                        kind: provider,
+                        label,
+                        group_label,
+                        credential_json: SecretString::from(json_document(credential_json)),
+                        visibility: visibility.unwrap_or_default(),
+                    },
                     unix_timestamp(),
                 )
                 .await?
@@ -199,8 +207,10 @@ async fn update_account(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
-    Json(request): Json<UpdateAccountRequest>,
+    request: Result<Json<UpdateAccountRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
     let UpdateAccountRequest {
         label,
         group_label,
@@ -309,8 +319,10 @@ async fn set_account_enabled(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
-    Json(request): Json<SetEnabledRequest>,
+    request: Result<Json<SetEnabledRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
     let account = state
         .manager
         .set_account_enabled(
@@ -328,6 +340,7 @@ async fn delete_account(
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_super_admin(&session)?;
     state
         .manager
         .delete_account(session.user.id.as_str(), &parse_account_id(&account_id)?)
@@ -353,6 +366,7 @@ async fn refresh_models(
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
     let snapshot = state
         .manager
         .refresh_models(
@@ -385,6 +399,7 @@ async fn refresh_quota(
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
     let quota = state
         .manager
         .refresh_quota(
@@ -400,8 +415,10 @@ async fn update_model(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
     Path(account_id): Path<String>,
-    Json(request): Json<UpdateModelRequest>,
+    request: Result<Json<UpdateModelRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
     let upstream_model = request.upstream_model.as_str();
     if upstream_model.is_empty() || upstream_model.trim() != upstream_model {
         return Err(ApiError::invalid_request(
@@ -433,8 +450,10 @@ async fn update_model(
 async fn start_oauth_session(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
-    Json(request): Json<StartOAuthRequest>,
+    request: Result<Json<StartOAuthRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
     let session = state
         .manager
         .start_oauth_session(
@@ -453,6 +472,7 @@ async fn get_oauth_session(
     Extension(session): Extension<AuthenticatedSession>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
     let session = state
         .manager
         .oauth_session(session.user.id.as_str(), &session_id)
@@ -465,11 +485,20 @@ async fn cancel_oauth_session(
     Extension(session): Extension<AuthenticatedSession>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
     let session = state
         .manager
         .cancel_oauth_session(session.user.id.as_str(), &session_id)
         .ok_or_else(ApiError::not_found)?;
     Ok(data(oauth_session_json(&session)))
+}
+
+fn require_super_admin(session: &AuthenticatedSession) -> Result<(), ApiError> {
+    if session.user.role == UserRole::SuperAdmin {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden())
+    }
 }
 
 #[derive(Deserialize)]
@@ -544,7 +573,7 @@ enum ModelPricingPatch {
     #[default]
     Missing,
     Null,
-    Value(UpdateModelPricingRequest),
+    Value(Box<UpdateModelPricingRequest>),
 }
 
 impl<'de> Deserialize<'de> for ModelPricingPatch {
@@ -553,7 +582,7 @@ impl<'de> Deserialize<'de> for ModelPricingPatch {
         D: Deserializer<'de>,
     {
         Option::<UpdateModelPricingRequest>::deserialize(deserializer)
-            .map(|pricing| pricing.map_or(Self::Null, Self::Value))
+            .map(|pricing| pricing.map_or(Self::Null, |value| Self::Value(Box::new(value))))
     }
 }
 
@@ -644,7 +673,7 @@ fn updated_pricing(
         )),
         ModelPricingPatch::Null => Ok(Some(None)),
         ModelPricingPatch::Value(pricing) => {
-            let pricing = pricing.into_model_pricing().ok_or_else(|| {
+            let pricing = (*pricing).into_model_pricing().ok_or_else(|| {
                 ApiError::invalid_request("pricing fields must be decimal strings or null")
             })?;
             let pricing = canonical_model_pricing(&pricing).ok_or_else(|| {
@@ -791,6 +820,22 @@ fn data(value: Value) -> Json<Value> {
     Json(json!({ "data": value }))
 }
 
+fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    request.map(|Json(request)| request).map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::payload_too_large()
+        } else {
+            ApiError::invalid_request("request body must be valid JSON")
+        }
+    })
+}
+
+fn query_request<T>(request: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
+    request
+        .map(|Query(request)| request)
+        .map_err(|_| ApiError::invalid_request("query parameters are invalid"))
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -815,11 +860,27 @@ impl ApiError {
         }
     }
 
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            error_type: "invalid_request_error",
+            message: "request body is too large".to_owned(),
+        }
+    }
+
     fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             error_type: "not_found_error",
             message: "resource was not found".to_owned(),
+        }
+    }
+
+    fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error_type: "forbidden_error",
+            message: "super_admin role is required".to_owned(),
         }
     }
 
@@ -862,9 +923,9 @@ impl From<ProviderManagerError> for ApiError {
                 error_type: "upstream_error",
                 message: error.to_string(),
             },
-            ProviderManagerError::Repository(_)
-            | ProviderManagerError::ModelCatalog(ModelCatalogError::Repository(_))
-            | ProviderManagerError::MissingOwner => Self::internal(),
+            ProviderManagerError::Repository(_) | ProviderManagerError::MissingOwner => {
+                Self::internal()
+            }
         }
     }
 }
@@ -891,10 +952,13 @@ mod tests {
     use axum::{
         Router,
         extract::State,
-        http::{HeaderMap, StatusCode, header},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
         routing::{get, post},
     };
-    use provider_auth::{ApiKeyAuthenticator, AuthService, UserSummary};
+    use provider_auth::{
+        ApiKeyAuthenticator, AuthService, AuthenticatedSession, SessionId, UserId, UserRole,
+        UserSummary,
+    };
     use provider_core::{
         AccountId, CredentialKind, ProviderKind, ProviderManagementRepository,
         ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
@@ -902,20 +966,90 @@ mod tests {
     use provider_drivers::{
         codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
     };
-    use provider_management::{ProviderCredentialReplacement, ProviderManager};
+    use provider_management::{
+        CredentialProviderAccountInput, ProviderCredentialReplacement, ProviderManager,
+    };
     use provider_protocol::DefaultProtocolBridge;
     use provider_runtime::ProviderRuntimeCatalog;
     use provider_storage::SqliteAccountRepository;
     use secrecy::{ExposeSecret, SecretString};
     use serde_json::Value;
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{ServerConfig, pki_types::PrivateKeyDer},
+    };
 
-    use crate::router_with_management;
+    use crate::{
+        auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES, router_with_management,
+    };
 
     use super::{
         ModelPricingPatch, ProviderHealthParams, SetEnabledRequest, UpdateModelRequest,
-        unix_timestamp, updated_pricing,
+        require_super_admin, unix_timestamp, updated_pricing,
     };
+
+    const TEST_MANAGEMENT_ORIGIN: &str = "https://admin.example.com";
+
+    fn management_headers(session_token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("pode_session={session_token}"))
+                .expect("session cookie"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static(TEST_MANAGEMENT_ORIGIN),
+        );
+        headers
+    }
+
+    fn padded_json(prefix: &str, suffix: &str, size: usize) -> String {
+        let padding = size
+            .checked_sub(prefix.len() + suffix.len())
+            .expect("requested JSON size");
+        let mut body = String::with_capacity(size);
+        body.push_str(prefix);
+        body.extend(std::iter::repeat_n('a', padding));
+        body.push_str(suffix);
+        assert_eq!(body.len(), size);
+        body
+    }
+
+    async fn assert_api_error(response: reqwest::Response, status: StatusCode, message: &str) {
+        assert_eq!(response.status(), status);
+        let body: Value = serde_json::from_str(
+            &response
+                .text()
+                .await
+                .expect("read management error response"),
+        )
+        .expect("management error response JSON");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], message);
+    }
+
+    #[test]
+    fn provider_mutations_require_super_admin() {
+        let session = |role| AuthenticatedSession {
+            session_id: SessionId::new("provider-role-test").expect("session ID"),
+            user: UserSummary {
+                id: UserId::new("provider-role-user").expect("user ID"),
+                username: "provider-role-user".to_owned(),
+                role,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+            },
+        };
+        assert!(require_super_admin(&session(UserRole::SuperAdmin)).is_ok());
+        let error = require_super_admin(&session(UserRole::User)).expect_err("ordinary user");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn management_requests_reject_unknown_fields() {
@@ -992,6 +1126,87 @@ mod tests {
         r#"{"data":[{"id":"model-a","owned_by":"test"}]}"#
     }
 
+    async fn spawn_compatible_tls_upstream(
+        authorization: Arc<Mutex<Vec<String>>>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["api.example.test".to_owned()])
+            .expect("compatible test certificate");
+        let certificate = certified.cert.der().clone();
+        let private_key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .expect("compatible TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compatible TLS upstream");
+        let address = listener
+            .local_addr()
+            .expect("compatible TLS upstream address");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let authorization = authorization.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let mut lines = request.lines();
+                    let path = lines
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default();
+                    let request_authorization = lines
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("authorization")
+                                    .then(|| value.trim().to_owned())
+                            })
+                        })
+                        .unwrap_or_default();
+                    let (status, body) = if path == "/broken/models" {
+                        ("502 Bad Gateway", r#"{"error":"failed"}"#)
+                    } else {
+                        authorization
+                            .lock()
+                            .expect("authorization lock")
+                            .push(request_authorization);
+                        ("200 OK", r#"{"data":[{"id":"model-a","owned_by":"test"}]}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (address, server)
+    }
+
     #[derive(Clone, Default)]
     struct QuotaUpstreamState {
         billing_calls: Arc<AtomicUsize>,
@@ -1028,8 +1243,9 @@ mod tests {
         manager: ProviderManager,
         auth: AuthService,
         owner: UserSummary,
+        owner_session_token: SecretString,
         member: UserSummary,
-        member_access_token: SecretString,
+        member_session_token: SecretString,
         account_id: AccountId,
         now: i64,
     }
@@ -1099,11 +1315,13 @@ mod tests {
         let created = manager
             .create_credential_account(
                 owner_grant.user.id.as_str(),
-                ProviderKind::Grok,
-                "shared Grok".to_owned(),
-                "default".to_owned(),
-                credential_json,
-                provider_core::ProviderVisibility::Shared,
+                CredentialProviderAccountInput {
+                    kind: ProviderKind::Grok,
+                    label: "shared Grok".to_owned(),
+                    group_label: "default".to_owned(),
+                    credential_json,
+                    visibility: provider_core::ProviderVisibility::Shared,
+                },
                 now,
             )
             .await
@@ -1118,8 +1336,9 @@ mod tests {
             manager,
             auth,
             owner: owner_grant.user,
+            owner_session_token: owner_grant.session_token,
             member,
-            member_access_token: member_grant.access_token,
+            member_session_token: member_grant.session_token,
             account_id: created.account.id,
             now,
         }
@@ -1129,15 +1348,22 @@ mod tests {
     async fn enforces_provider_ownership_without_returning_credentials() {
         let authorization = Arc::new(Mutex::new(Vec::<String>::new()));
         let upstream = Router::new()
-            .route("/models", get(captured_models))
             .route("/codex/models", get(captured_models))
-            .route("/broken/models", get(|| async { StatusCode::BAD_GATEWAY }))
             .with_state(authorization.clone());
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
         let upstream_address = upstream_listener.local_addr().expect("upstream address");
         let upstream_server = tokio::spawn(axum::serve(upstream_listener, upstream).into_future());
+        let (compatible_address, compatible_server) =
+            spawn_compatible_tls_upstream(authorization.clone()).await;
+        let compatible_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs("api.example.test", &[compatible_address])
+            .build()
+            .expect("compatible test client");
 
         let oauth_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1176,7 +1402,7 @@ mod tests {
         );
         let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
         runtime
-            .register_driver(Arc::new(OpenAiCompatibleDriver::new()))
+            .register_driver(OpenAiCompatibleDriver::for_test(compatible_client))
             .expect("register driver");
         runtime
             .register_driver(GrokDriver::for_test_with_oauth(
@@ -1215,8 +1441,8 @@ mod tests {
             )
             .await
             .expect("member login");
-        let access_token = grant.access_token.expose_secret().to_owned();
-        let member_access_token = member_grant.access_token.expose_secret().to_owned();
+        let session_token = grant.session_token.expose_secret().to_owned();
+        let member_session_token = member_grant.session_token.expose_secret().to_owned();
         let api_keys = ApiKeyAuthenticator::load(repository.clone())
             .await
             .expect("API key index");
@@ -1235,11 +1461,131 @@ mod tests {
         );
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/api/v1/providers");
-        let base_url = format!("http://{upstream_address}");
+        let codex_base_url = format!("http://{upstream_address}");
+        let compatible_base_url = format!("https://api.example.test:{}", compatible_address.port());
+
+        let exact_auth_body = padded_json(
+            r#"{"username":""#,
+            r#"","password":"secret"}"#,
+            MAX_AUTH_BODY_BYTES,
+        );
+        let exact_auth = client
+            .post(format!("http://{address}/api/v1/auth/login"))
+            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(exact_auth_body)
+            .send()
+            .await
+            .expect("auth request at body limit");
+        assert_eq!(exact_auth.status(), StatusCode::BAD_REQUEST);
+        let oversized_auth_body = padded_json(
+            r#"{"username":""#,
+            r#"","password":"secret"}"#,
+            MAX_AUTH_BODY_BYTES + 1,
+        );
+        let oversized_auth = client
+            .post(format!("http://{address}/api/v1/auth/login"))
+            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized_auth_body)
+            .send()
+            .await
+            .expect("oversized auth request");
+        assert_eq!(oversized_auth.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let compressed_auth = client
+            .post(format!("http://{address}/api/v1/auth/login"))
+            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(r#"{"username":"admin","password":"secret"}"#)
+            .send()
+            .await
+            .expect("compressed auth request");
+        assert_eq!(compressed_auth.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let exact_management_body =
+            padded_json(r#"{"label":""#, r#""}"#, MAX_MANAGEMENT_BODY_BYTES);
+        let exact_management = client
+            .patch(format!("{endpoint}/missing-account"))
+            .headers(management_headers(&session_token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(exact_management_body)
+            .send()
+            .await
+            .expect("management request at body limit");
+        assert_eq!(exact_management.status(), StatusCode::NOT_FOUND);
+        let oversized_management_body =
+            padded_json(r#"{"label":""#, r#""}"#, MAX_MANAGEMENT_BODY_BYTES + 1);
+        let oversized_management = client
+            .patch(format!("{endpoint}/missing-account"))
+            .headers(management_headers(&session_token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized_management_body)
+            .send()
+            .await
+            .expect("oversized management request");
+        assert_eq!(oversized_management.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let malformed_management = client
+            .patch(format!("{endpoint}/missing-account"))
+            .headers(management_headers(&session_token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .expect("malformed management request");
+        assert_api_error(
+            malformed_management,
+            StatusCode::BAD_REQUEST,
+            "request body must be valid JSON",
+        )
+        .await;
+
+        let unknown_management_field = client
+            .patch(format!("{endpoint}/missing-account"))
+            .headers(management_headers(&session_token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"label":"updated","extra":true}"#)
+            .send()
+            .await
+            .expect("management request with unknown field");
+        assert_api_error(
+            unknown_management_field,
+            StatusCode::BAD_REQUEST,
+            "request body must be valid JSON",
+        )
+        .await;
+
+        let invalid_health_query = client
+            .get(format!("{endpoint}/health?from_ms=invalid"))
+            .headers(management_headers(&session_token))
+            .send()
+            .await
+            .expect("invalid provider health query");
+        assert_api_error(
+            invalid_health_query,
+            StatusCode::BAD_REQUEST,
+            "query parameters are invalid",
+        )
+        .await;
+
+        let compressed_management = client
+            .patch(format!("{endpoint}/missing-account"))
+            .headers(management_headers(&session_token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(r#"{"label":"compressed"}"#)
+            .send()
+            .await
+            .expect("compressed management request");
+        assert_eq!(
+            compressed_management.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
 
         let codex_direct = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1247,7 +1593,7 @@ mod tests {
                     "provider": "codex",
                     "label": "unsupported direct Codex",
                     "group_label": "default",
-                    "base_url": base_url,
+                    "base_url": codex_base_url,
                     "api_key": "not-an-oauth-credential"
                 })
                 .to_string(),
@@ -1259,7 +1605,7 @@ mod tests {
 
         let compatible_credential = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1278,7 +1624,7 @@ mod tests {
 
         let unsupported_oauth = client
             .post(format!("http://{address}/api/v1/oauth/sessions"))
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 r#"{"provider":"openai_compatible","label":"unsupported oauth","group_label":"default"}"#,
@@ -1290,7 +1636,7 @@ mod tests {
 
         let failed_discovery = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1298,7 +1644,7 @@ mod tests {
                     "provider": "openai_compatible",
                     "label": "failed discovery",
                     "group_label": "default",
-                    "base_url": format!("http://{upstream_address}/broken"),
+                    "base_url": format!("{compatible_base_url}/broken"),
                     "api_key": "failed-discovery-key"
                 })
                 .to_string(),
@@ -1309,7 +1655,7 @@ mod tests {
         assert_eq!(failed_discovery.status(), StatusCode::BAD_GATEWAY);
         let accounts_after_failure = client
             .get(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .send()
             .await
             .expect("list accounts after failed creation");
@@ -1331,7 +1677,7 @@ mod tests {
 
         let codex = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1369,7 +1715,7 @@ mod tests {
 
         let codex_base_url_update = client
             .patch(format!("{endpoint}/{codex_account_id}"))
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"base_url":"https://example.invalid"}"#)
             .send()
@@ -1379,7 +1725,7 @@ mod tests {
 
         let with_key = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1387,7 +1733,7 @@ mod tests {
                     "provider": "openai_compatible",
                     "label": "with key",
                     "group_label": "default",
-                    "base_url": base_url,
+                    "base_url": compatible_base_url,
                     "api_key": "do-not-return"
                 })
                 .to_string(),
@@ -1412,7 +1758,7 @@ mod tests {
 
         let empty_update_key = client
             .patch(format!("{endpoint}/{private_account_id}"))
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"api_key":"  "}"#)
             .send()
@@ -1422,7 +1768,7 @@ mod tests {
 
         let updated_compatible = client
             .patch(format!("{endpoint}/{private_account_id}"))
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1447,7 +1793,7 @@ mod tests {
 
         let refreshed_compatible = client
             .post(format!("{endpoint}/{private_account_id}/models/refresh"))
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .send()
             .await
             .expect("refresh compatible models with replacement API key");
@@ -1455,7 +1801,7 @@ mod tests {
 
         let empty_key = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1463,7 +1809,7 @@ mod tests {
                     "provider": "openai_compatible",
                     "label": "empty key",
                     "group_label": "default",
-                    "base_url": base_url,
+                    "base_url": compatible_base_url,
                     "api_key": ""
                 })
                 .to_string(),
@@ -1475,7 +1821,7 @@ mod tests {
 
         let shared_account = client
             .post(&endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1483,7 +1829,7 @@ mod tests {
                     "provider": "openai_compatible",
                     "label": "shared account",
                     "group_label": "default",
-                    "base_url": base_url,
+                    "base_url": compatible_base_url,
                     "api_key": "shared-provider-key",
                     "visibility": "shared"
                 })
@@ -1505,9 +1851,9 @@ mod tests {
             .expect("shared account ID")
             .to_owned();
 
-        let member_private = client
+        let member_create = client
             .post(&endpoint)
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::json!({
@@ -1515,30 +1861,19 @@ mod tests {
                     "provider": "openai_compatible",
                     "label": "member private",
                     "group_label": "default",
-                    "base_url": base_url,
+                    "base_url": compatible_base_url,
                     "api_key": "member-provider-key"
                 })
                 .to_string(),
             )
             .send()
             .await
-            .expect("create member private account");
-        assert_eq!(member_private.status(), StatusCode::CREATED);
-        let member_private_body: Value = serde_json::from_slice(
-            &member_private
-                .bytes()
-                .await
-                .expect("member private response body"),
-        )
-        .expect("member private response JSON");
-        let member_private_id = member_private_body["data"]["account"]["id"]
-            .as_str()
-            .expect("member private account ID")
-            .to_owned();
+            .expect("reject member provider creation");
+        assert_eq!(member_create.status(), StatusCode::FORBIDDEN);
 
         let member_accounts = client
             .get(&endpoint)
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .send()
             .await
             .expect("member provider list");
@@ -1558,11 +1893,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!member_account_ids.contains(&private_account_id.as_str()));
         assert!(member_account_ids.contains(&shared_account_id.as_str()));
-        assert!(member_account_ids.contains(&member_private_id.as_str()));
 
         let hidden_private = client
             .get(format!("{endpoint}/{private_account_id}"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .send()
             .await
             .expect("hidden private provider");
@@ -1570,7 +1904,7 @@ mod tests {
 
         let visible_shared = client
             .get(format!("{endpoint}/{shared_account_id}"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .send()
             .await
             .expect("visible shared provider");
@@ -1578,7 +1912,7 @@ mod tests {
 
         let shared_models = client
             .get(format!("{endpoint}/{shared_account_id}/models"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .send()
             .await
             .expect("shared models");
@@ -1586,7 +1920,7 @@ mod tests {
 
         let shared_update = client
             .patch(format!("{endpoint}/{shared_account_id}"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"label":"not allowed"}"#)
             .send()
@@ -1596,7 +1930,7 @@ mod tests {
 
         let shared_model_update = client
             .patch(format!("{endpoint}/{shared_account_id}/models"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&member_session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
                 r#"{"upstream_model":"model-a","alias":"no","enabled":true,"pricing_changed":false}"#,
@@ -1606,32 +1940,21 @@ mod tests {
             .expect("shared model update");
         assert_eq!(shared_model_update.status(), StatusCode::FORBIDDEN);
 
-        let admin_cannot_read_member_private = client
-            .get(format!("{endpoint}/{member_private_id}"))
-            .bearer_auth(&access_token)
-            .send()
-            .await
-            .expect("admin private access");
-        assert_eq!(
-            admin_cannot_read_member_private.status(),
-            StatusCode::NOT_FOUND
-        );
-
         let oauth_session = client
             .post(format!("http://{address}/api/v1/oauth/sessions"))
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&session_token))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"provider":"grok","label":"member oauth","group_label":"default","visibility":"shared"}"#)
+            .body(r#"{"provider":"grok","label":"admin oauth","group_label":"default","visibility":"shared"}"#)
             .send()
             .await
-            .expect("start member OAuth");
+            .expect("start admin OAuth");
         assert_eq!(oauth_session.status(), StatusCode::CREATED);
         let oauth_session: Value =
             serde_json::from_slice(&oauth_session.bytes().await.expect("OAuth response body"))
                 .expect("OAuth response JSON");
         assert_eq!(
             oauth_session["data"]["owner_user_id"],
-            member_grant.user.id.as_str()
+            grant.user.id.as_str()
         );
         assert_eq!(oauth_session["data"]["visibility"], "shared");
         let oauth_session_id = oauth_session["data"]["id"]
@@ -1639,32 +1962,41 @@ mod tests {
             .expect("OAuth session ID");
         let oauth_endpoint = format!("http://{address}/api/v1/oauth/sessions/{oauth_session_id}");
 
-        let hidden_oauth = client
+        let forbidden_oauth_read = client
             .get(&oauth_endpoint)
-            .bearer_auth(&access_token)
+            .headers(management_headers(&member_session_token))
             .send()
             .await
-            .expect("hidden OAuth session");
-        assert_eq!(hidden_oauth.status(), StatusCode::NOT_FOUND);
+            .expect("reject member OAuth read");
+        assert_eq!(forbidden_oauth_read.status(), StatusCode::FORBIDDEN);
 
         let visible_oauth = client
             .get(&oauth_endpoint)
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&session_token))
             .send()
             .await
-            .expect("owner OAuth session");
+            .expect("admin OAuth session");
         assert_eq!(visible_oauth.status(), StatusCode::OK);
+
+        let forbidden_oauth_cancel = client
+            .delete(&oauth_endpoint)
+            .headers(management_headers(&member_session_token))
+            .send()
+            .await
+            .expect("reject member OAuth cancellation");
+        assert_eq!(forbidden_oauth_cancel.status(), StatusCode::FORBIDDEN);
 
         let cancelled_oauth = client
             .delete(&oauth_endpoint)
-            .bearer_auth(&member_access_token)
+            .headers(management_headers(&session_token))
             .send()
             .await
-            .expect("cancel OAuth session");
+            .expect("cancel admin OAuth session");
         assert_eq!(cancelled_oauth.status(), StatusCode::OK);
 
         server.abort();
         upstream_server.abort();
+        compatible_server.abort();
         oauth_server.abort();
         runtime.shutdown();
         assert_eq!(
@@ -1673,8 +2005,8 @@ mod tests {
                 "Bearer codex-access",
                 "Bearer do-not-return",
                 "Bearer replacement-provider-key",
+                "Bearer replacement-provider-key",
                 "Bearer shared-provider-key",
-                "Bearer member-provider-key",
             ]
         );
     }
@@ -1688,8 +2020,9 @@ mod tests {
         let manager = context.manager.clone();
         let auth = context.auth.clone();
         let owner = context.owner.clone();
+        let owner_session_token = context.owner_session_token.clone();
         let member = context.member.clone();
-        let member_access_token = context.member_access_token.clone();
+        let member_session_token = context.member_session_token.clone();
         let account_id = context.account_id.clone();
         let now = context.now;
 
@@ -1749,11 +2082,12 @@ mod tests {
             .into_future(),
         );
         let client = reqwest::Client::new();
-        let access_token = member_access_token.expose_secret();
+        let session_token = member_session_token.expose_secret();
+        let owner_session_token = owner_session_token.expose_secret();
         let endpoint = format!("http://{management_address}/api/v1/providers");
         let list_response = client
             .get(&endpoint)
-            .bearer_auth(access_token)
+            .headers(management_headers(session_token))
             .send()
             .await
             .expect("quota provider list");
@@ -1768,7 +2102,7 @@ mod tests {
         assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
         let quota_response = client
             .get(format!("{endpoint}/{account_id}/quota"))
-            .bearer_auth(access_token)
+            .headers(management_headers(session_token))
             .send()
             .await
             .expect("quota endpoint");
@@ -1782,9 +2116,17 @@ mod tests {
             "grok_build"
         );
         assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
+        let forbidden_refresh = client
+            .post(format!("{endpoint}/{account_id}/quota/refresh"))
+            .headers(management_headers(session_token))
+            .send()
+            .await
+            .expect("reject member quota refresh");
+        assert_eq!(forbidden_refresh.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
         let refresh_response = client
             .post(format!("{endpoint}/{account_id}/quota/refresh"))
-            .bearer_auth(access_token)
+            .headers(management_headers(owner_session_token))
             .send()
             .await
             .expect("refresh quota endpoint");

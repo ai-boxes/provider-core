@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use provider_core::{
     AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
-    DiscoveredProviderModel, ManagedProviderDriver, NewCredential, NewProviderAccount,
-    ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError, ProviderDriver,
-    ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest, ProviderStream,
-    RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount, TokenCounter, WireFormat,
+    BoundedBodyError, DiscoveredProviderModel, ManagedProviderDriver, NewCredential,
+    NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
+    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
+    ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount,
+    TokenCounter, WireFormat, collect_bounded_body,
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -22,7 +23,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 
 pub struct AnthropicCompatibleDriver {
-    http: reqwest::Client,
     token_counter: Cl100kTokenCounter,
 }
 
@@ -33,6 +33,7 @@ struct AnthropicCompatibleAccount {
     config: CompatibleConfig,
     credentials: CompatibleCredentials,
     auth_state: AccountAuthState,
+    http: tokio::sync::OnceCell<reqwest::Client>,
 }
 
 impl Default for AnthropicCompatibleDriver {
@@ -45,7 +46,6 @@ impl AnthropicCompatibleDriver {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
             token_counter: Cl100kTokenCounter,
         }
     }
@@ -134,6 +134,7 @@ impl ManagedProviderDriver for AnthropicCompatibleDriver {
             config,
             credentials,
             auth_state: account.auth_state,
+            http: tokio::sync::OnceCell::new(),
         }))
     }
 
@@ -182,8 +183,8 @@ impl ProviderAccount for AnthropicCompatibleAccount {
             ));
         }
         let upstream = self
-            .driver
-            .http
+            .http_client()
+            .await?
             .post(format!("{}/messages", self.config.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -226,8 +227,8 @@ impl ProviderAccount for AnthropicCompatibleAccount {
 
     async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
         let request = self
-            .driver
-            .http
+            .http_client()
+            .await?
             .get(format!("{}/models", self.config.base_url))
             .timeout(Duration::from_secs(10))
             .header(reqwest::header::ACCEPT, "application/json")
@@ -243,18 +244,18 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         if !status.is_success() {
             return Err(status_error("Anthropic-compatible model discovery", status));
         }
-        let body = response.bytes().await.map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Upstream,
-                "failed to read Anthropic-compatible model response",
-            )
-        })?;
-        if body.len() > MAX_MODELS_RESPONSE_SIZE {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Upstream,
-                "Anthropic-compatible model response was too large",
-            ));
-        }
+        let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "failed to read Anthropic-compatible model response",
+                ),
+                BoundedBodyError::TooLarge => ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "Anthropic-compatible model response was too large",
+                ),
+            })?;
         let response: ModelsResponse = serde_json::from_slice(&body).map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,
@@ -271,6 +272,14 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         Ok(RefreshOutcome {
             state: self.runtime_state(),
         })
+    }
+}
+
+impl AnthropicCompatibleAccount {
+    async fn http_client(&self) -> Result<&reqwest::Client, ProviderError> {
+        self.http
+            .get_or_try_init(|| self.config.pinned_client())
+            .await
     }
 }
 

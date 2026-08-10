@@ -127,11 +127,8 @@ pub struct UserSummary {
 pub struct NewSession {
     pub id: SessionId,
     pub user_id: UserId,
-    pub access_token_hash: [u8; 32],
-    pub refresh_token_hash: [u8; 32],
-    pub access_expires_at: i64,
-    pub refresh_expires_at: i64,
-    pub absolute_expires_at: i64,
+    pub token_hash: [u8; 32],
+    pub expires_at: i64,
     pub created_at: i64,
 }
 
@@ -139,11 +136,8 @@ pub struct NewSession {
 pub struct StoredSession {
     pub id: SessionId,
     pub user: UserSummary,
-    pub access_token_hash: [u8; 32],
-    pub refresh_token_hash: [u8; 32],
-    pub access_expires_at: i64,
-    pub refresh_expires_at: i64,
-    pub absolute_expires_at: i64,
+    pub token_hash: [u8; 32],
+    pub expires_at: i64,
     pub revoked_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -173,12 +167,30 @@ pub struct StoredApiKey {
     pub enabled: bool,
     pub expires_at: Option<i64>,
     pub quota_limit_atoms: Option<String>,
-    /// Cumulative fully-accounted catalog cost atoms for this key.
+    /// Cumulative settled catalog cost atoms for this key.
     pub spent_atoms: String,
-    /// False after any dispatched attempt could not be priced completely.
-    pub quota_accounting_ready: bool,
     pub last_used_at: Option<i64>,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApiKeyPatch {
+    pub label: Option<String>,
+    pub group_label: Option<String>,
+    pub enabled: Option<bool>,
+    pub expires_at: Option<Option<i64>>,
+    pub quota_limit_usd: Option<Option<String>>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredApiKeyUpdate {
+    pub group_label: String,
+    pub label: String,
+    pub enabled: bool,
+    pub expires_at: Option<i64>,
+    pub quota_limit_atoms: Option<Option<String>>,
     pub updated_at: i64,
 }
 
@@ -193,7 +205,6 @@ pub struct ApiKeySummary {
     pub expires_at: Option<i64>,
     pub quota_limit_atoms: Option<String>,
     pub spent_atoms: String,
-    pub quota_accounting_ready: bool,
     pub last_used_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -207,17 +218,21 @@ pub struct CreatedApiKey {
 /// Fractional digits of a USD atom, matching observed-usage pricing.
 pub const USD_ATOM_SCALE: u32 = 14;
 
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("invalid USD atom value")]
+pub struct UsdAtomsError;
+
 /// Parse a user-facing USD amount into atom digits.
 ///
 /// Accepts a non-negative decimal with at most [`USD_ATOM_SCALE`] fractional
 /// digits. Zero and empty are rejected so a quota is either unset or positive.
-pub fn parse_quota_limit_usd(input: &str) -> Result<String, ()> {
+pub fn parse_quota_limit_usd(input: &str) -> Result<String, UsdAtomsError> {
     let input = input.trim();
     if input.is_empty() {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     let (whole, fraction) = match input.split_once('.') {
-        Some((_, "")) => return Err(()),
+        Some((_, "")) => return Err(UsdAtomsError),
         Some((whole, fraction)) => (whole, fraction),
         None => (input, ""),
     };
@@ -226,7 +241,7 @@ pub fn parse_quota_limit_usd(input: &str) -> Result<String, ()> {
         || !fraction.bytes().all(|b| b.is_ascii_digit())
         || fraction.len() > USD_ATOM_SCALE as usize
     {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     let whole = whole.trim_start_matches('0');
     let whole = if whole.is_empty() { "0" } else { whole };
@@ -237,16 +252,16 @@ pub fn parse_quota_limit_usd(input: &str) -> Result<String, ()> {
     let atoms = format!("{whole}{fraction}");
     let atoms = atoms.trim_start_matches('0');
     if atoms.is_empty() {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     if atoms.len() > 64 {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     Ok(atoms.to_owned())
 }
 
 /// Format atom digits as a full-precision USD decimal string.
-pub fn format_usd_atoms(atoms: &str) -> Result<String, ()> {
+pub fn format_usd_atoms(atoms: &str) -> Result<String, UsdAtomsError> {
     validate_atoms(atoms)?;
     let width = USD_ATOM_SCALE as usize;
     if atoms.len() <= width {
@@ -258,7 +273,7 @@ pub fn format_usd_atoms(atoms: &str) -> Result<String, ()> {
 }
 
 /// Compare two non-negative atom digit strings without parsing to a fixed int.
-pub fn atoms_ge(left: &str, right: &str) -> Result<bool, ()> {
+pub fn atoms_ge(left: &str, right: &str) -> Result<bool, UsdAtomsError> {
     validate_atoms(left)?;
     validate_atoms(right)?;
 
@@ -276,7 +291,7 @@ pub fn atoms_ge(left: &str, right: &str) -> Result<bool, ()> {
 }
 
 /// Add two non-negative atom digit strings.
-pub fn add_atoms(left: &str, right: &str) -> Result<String, ()> {
+pub fn add_atoms(left: &str, right: &str) -> Result<String, UsdAtomsError> {
     validate_atoms(left)?;
     validate_atoms(right)?;
     let left = left.as_bytes();
@@ -299,16 +314,16 @@ pub fn add_atoms(left: &str, right: &str) -> Result<String, ()> {
         carry = sum / 10;
     }
     out.reverse();
-    let text = String::from_utf8(out).map_err(|_| ())?;
+    let text = String::from_utf8(out).map_err(|_| UsdAtomsError)?;
     if text.len() > 64 {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     Ok(text)
 }
 
-fn validate_atoms(value: &str) -> Result<(), ()> {
+fn validate_atoms(value: &str) -> Result<(), UsdAtomsError> {
     if value.is_empty() || value.len() > 64 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(());
+        return Err(UsdAtomsError);
     }
     Ok(())
 }

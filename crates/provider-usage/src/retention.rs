@@ -10,7 +10,10 @@
 //! 2. **Never touch a request that has not finished.** An in-flight request has no
 //!    terminal time to compare, and deleting it would erase a fact still being
 //!    written.
-//! 3. **Small batches.** Retention shares a database with the proxy's own writes,
+//! 3. **Only resolved quota entries.** Settled and released reservations are
+//!    historical idempotency records; active reservations still protect spend
+//!    and are never eligible for deletion.
+//! 4. **Small batches.** Retention shares a database with the proxy's own writes,
 //!    so it takes many short transactions rather than one long one.
 
 use std::{sync::Arc, time::Duration};
@@ -31,6 +34,7 @@ pub const DEFAULT_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60);
 /// What one retention cycle removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetentionReport {
+    pub quota_ledger_entries_deleted: u64,
     pub logical_requests_deleted: u64,
     pub gap_buckets_deleted: u64,
 }
@@ -77,6 +81,22 @@ impl RetentionWorker {
         loop {
             match self
                 .repository
+                .delete_resolved_quota_ledger_entries_before(cutoff, self.batch)
+                .await
+            {
+                Ok(deleted) => {
+                    report.quota_ledger_entries_deleted += deleted;
+                    if deleted < u64::from(self.batch) {
+                        break;
+                    }
+                }
+                Err(_) => return report,
+            }
+        }
+
+        loop {
+            match self
+                .repository
                 .delete_logical_requests_before(cutoff, self.batch)
                 .await
             {
@@ -92,19 +112,14 @@ impl RetentionWorker {
         }
 
         // Gap buckets use the same bounded statements and must also catch up.
-        loop {
-            match self
-                .repository
-                .delete_tracking_gaps_before(cutoff, self.batch)
-                .await
-            {
-                Ok(deleted) => {
-                    report.gap_buckets_deleted += deleted;
-                    if deleted < u64::from(self.batch) {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(deleted) = self
+            .repository
+            .delete_tracking_gaps_before(cutoff, self.batch)
+            .await
+        {
+            report.gap_buckets_deleted += deleted;
+            if deleted < u64::from(self.batch) {
+                break;
             }
         }
         report
@@ -160,12 +175,21 @@ mod tests {
     async fn one_cycle_drains_backlog_beyond_the_old_fixed_cap_in_small_batches() {
         let repository = Arc::new(TestRepository::default());
         *repository.expired_requests.lock().expect("lock") = vec![NOW - 60 * DAY; 20_501];
+        *repository.expired_quota_entries.lock().expect("lock") = vec![NOW - 60 * DAY; 1_701];
         *repository.expired_gap_buckets.lock().expect("lock") = vec![NOW - 60 * DAY; 1_201];
 
         let report = worker(repository.clone(), 500).run_once().await;
 
+        assert_eq!(report.quota_ledger_entries_deleted, 1_701);
         assert_eq!(report.logical_requests_deleted, 20_501);
         assert_eq!(report.gap_buckets_deleted, 1_201);
+        assert!(
+            repository
+                .expired_quota_entries
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
         assert!(repository.expired_requests.lock().expect("lock").is_empty());
         assert!(
             repository

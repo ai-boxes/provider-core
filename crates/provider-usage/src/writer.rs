@@ -413,8 +413,9 @@ mod tests {
         QuotaLedgerEntry {
             entry_id: id.to_owned(),
             api_key_id: "key-1".to_owned(),
+            dispatched: true,
             cost_atoms: Some("1".to_owned()),
-            recorded_at_ms: AT_MS,
+            resolved_at_ms: AT_MS,
         }
     }
 

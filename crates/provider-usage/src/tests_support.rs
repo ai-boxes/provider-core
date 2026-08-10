@@ -43,6 +43,8 @@ pub(crate) struct TestRepository {
     pub fail_deletes: bool,
     /// Terminal times of requests retention may remove.
     pub expired_requests: Mutex<Vec<i64>>,
+    /// Resolution times of quota-ledger entries retention may remove.
+    pub expired_quota_entries: Mutex<Vec<i64>>,
     /// Bucket times of tracking gaps retention may remove.
     pub expired_gap_buckets: Mutex<Vec<i64>>,
     /// Batch sizes passed to retention delete calls.
@@ -143,6 +145,10 @@ impl UsageRepository for TestRepository {
         Ok(())
     }
 
+    async fn recover_quota_reservations(&self, _now_ms: i64) -> Result<u64, UsageRepositoryError> {
+        Ok(0)
+    }
+
     async fn record_tracking_gap(
         &self,
         owner_user_id: &str,
@@ -173,6 +179,33 @@ impl UsageRepository for TestRepository {
         _request_id: &str,
     ) -> Result<Vec<AttemptFacts>, UsageRepositoryError> {
         Ok(Vec::new())
+    }
+
+    async fn delete_resolved_quota_ledger_entries_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError> {
+        if self.fail_deletes {
+            return Err(unavailable());
+        }
+        guard(&self.retention_batches).push(batch);
+        let mut expired = guard(&self.expired_quota_entries);
+        let deletable = expired
+            .iter()
+            .filter(|resolved_at_ms| **resolved_at_ms < cutoff_ms)
+            .count()
+            .min(batch as usize);
+        let mut deleted = 0;
+        expired.retain(|resolved_at_ms| {
+            if *resolved_at_ms < cutoff_ms && deleted < deletable {
+                deleted += 1;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(deleted as u64)
     }
 
     async fn delete_logical_requests_before(

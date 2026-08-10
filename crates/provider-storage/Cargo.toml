@@ -9,6 +9,9 @@ test-util = []
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 provider-auth.workspace = true
 provider-core.workspace = true
 provider-usage.workspace = true

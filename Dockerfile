@@ -33,6 +33,6 @@ EXPOSE 8317
 VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=5 \
-  CMD curl -fsS http://127.0.0.1:8317/readyz >/dev/null
+  CMD curl -fsS http://127.0.0.1:8317/livez >/dev/null
 
 CMD ["provider-core"]

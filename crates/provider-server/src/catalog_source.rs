@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use provider_core::{BoundedBodyError, collect_bounded_body};
 use provider_usage::{
     CatalogFetch, CatalogFetchError, CatalogSource, MAX_CATALOG_BYTES, MODELS_DEV_URL, reason,
 };
@@ -85,28 +85,15 @@ impl CatalogSource for HttpCatalogSource {
         let etag = header_validator(&response, &ETAG);
         let last_modified = header_validator(&response, &LAST_MODIFIED);
 
-        // Refuse an over-long body before reading it, when the upstream says how
-        // long it is.
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_CATALOG_BYTES as u64)
-        {
-            return Err(CatalogFetchError(reason::BODY_TOO_LARGE));
-        }
-
-        // And cap it while reading, because a declared length cannot be trusted.
-        let mut body = Vec::new();
-        let mut chunks = response.bytes_stream();
-        while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|_| CatalogFetchError(BODY_READ_FAILED))?;
-            if body.len() + chunk.len() > MAX_CATALOG_BYTES {
-                return Err(CatalogFetchError(reason::BODY_TOO_LARGE));
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = collect_bounded_body(response.bytes_stream(), MAX_CATALOG_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => CatalogFetchError(BODY_READ_FAILED),
+                BoundedBodyError::TooLarge => CatalogFetchError(reason::BODY_TOO_LARGE),
+            })?;
 
         Ok(CatalogFetch::Fresh {
-            body: String::from_utf8(body).map_err(|_| CatalogFetchError(BODY_NOT_UTF8))?,
+            body: String::from_utf8(body.to_vec()).map_err(|_| CatalogFetchError(BODY_NOT_UTF8))?,
             etag,
             last_modified,
         })

@@ -1,5 +1,7 @@
 use std::{io, net::IpAddr};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 /// Default bind address for local (non-container) runs.
 pub(crate) const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:8317";
 
@@ -13,6 +15,9 @@ pub(crate) const CATALOG_SYNC_ENV: &str = "PODE_CATALOG_SYNC";
 
 /// Exact reverse-proxy peer allowed to supply the client IP header.
 pub(crate) const TRUSTED_PROXY_IP_ENV: &str = "PODE_TRUSTED_PROXY_IP";
+
+/// Base64-encoded 32-byte key used for the single supported credential ciphertext format.
+pub(crate) const PROVIDER_CREDENTIAL_KEY_ENV: &str = "PODE_PROVIDER_CREDENTIAL_KEY";
 
 /// Resolved listen address. Docker sets `PODE_LISTEN_ADDRESS=0.0.0.0:8317`.
 pub(crate) fn listen_address() -> String {
@@ -48,4 +53,25 @@ pub(crate) fn trusted_proxy_ip() -> Result<Option<IpAddr>, io::Error> {
             format!("{TRUSTED_PROXY_IP_ENV} is invalid: {error}"),
         )),
     }
+}
+
+pub(crate) fn provider_credential_key() -> Result<[u8; 32], io::Error> {
+    let encoded = std::env::var(PROVIDER_CREDENTIAL_KEY_ENV).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PROVIDER_CREDENTIAL_KEY_ENV} is required: {error}"),
+        )
+    })?;
+    let decoded = STANDARD.decode(encoded.trim()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PROVIDER_CREDENTIAL_KEY_ENV} must be valid base64: {error}"),
+        )
+    })?;
+    decoded.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PROVIDER_CREDENTIAL_KEY_ENV} must decode to exactly 32 bytes"),
+        )
+    })
 }

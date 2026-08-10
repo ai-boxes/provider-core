@@ -1,6 +1,9 @@
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, PoisonError, RwLock},
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -28,6 +31,8 @@ struct CatalogInner {
     runtimes: RwLock<BTreeMap<ProviderKind, ProviderRuntime>>,
     router: ProviderModelRouter,
     detached_refresh_limit: Arc<Semaphore>,
+    recovery_failures: RwLock<BTreeSet<AccountId>>,
+    recovery_readiness: RwLock<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +53,8 @@ impl ProviderRuntimeCatalog {
                 runtimes: RwLock::new(BTreeMap::new()),
                 router: ProviderModelRouter::new(),
                 detached_refresh_limit: Arc::new(Semaphore::new(4)),
+                recovery_failures: RwLock::new(BTreeSet::new()),
+                recovery_readiness: RwLock::new(None),
             }),
         }
     }
@@ -86,7 +93,53 @@ impl ProviderRuntimeCatalog {
             removed |= runtime.remove(account_id).await;
         }
         self.inner.router.remove_account(account_id);
+        self.clear_recovery_failure(account_id);
         removed
+    }
+
+    pub fn bind_recovery_readiness(&self, readiness: Arc<AtomicBool>) {
+        *self
+            .inner
+            .recovery_readiness
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(readiness);
+        self.publish_recovery_readiness();
+    }
+
+    pub fn mark_recovery_failed(&self, account_id: AccountId) {
+        self.inner
+            .recovery_failures
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(account_id);
+        self.publish_recovery_readiness();
+    }
+
+    fn clear_recovery_failure(&self, account_id: &AccountId) {
+        self.inner
+            .recovery_failures
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(account_id);
+        self.publish_recovery_readiness();
+    }
+
+    fn publish_recovery_readiness(&self) {
+        let ready = self
+            .inner
+            .recovery_failures
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        if let Some(readiness) = self
+            .inner
+            .recovery_readiness
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            readiness.store(ready, Ordering::Release);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -237,13 +290,13 @@ impl ProviderControl for ProviderRuntimeCatalog {
             .map_err(|error| ProviderControlError::new(error.message()))
     }
 
-    async fn activate_account(
+    async fn install_account(
         &self,
         kind: ProviderKind,
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
         access: ProviderAccountAccess,
-    ) -> Result<(), ProviderControlError> {
+    ) {
         let driver = self
             .inner
             .drivers
@@ -251,7 +304,7 @@ impl ProviderControl for ProviderRuntimeCatalog {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&kind)
             .cloned()
-            .ok_or_else(|| ProviderControlError::new("provider type is not registered"))?;
+            .expect("candidate account provider driver must remain registered");
         let runtime = {
             let mut runtimes = self
                 .inner
@@ -263,16 +316,13 @@ impl ProviderControl for ProviderRuntimeCatalog {
                 .or_insert_with(|| ProviderRuntime::new(driver))
                 .clone()
         };
-        runtime.remove(account.account_id()).await;
-        runtime
-            .register(account.clone())
-            .await
-            .map_err(|error| ProviderControlError::new(error.to_string()))?;
+        let account_id = account.account_id().clone();
+        runtime.replace(account.clone()).await;
         self.inner
             .router
             .replace_account_models(runtime, account, models, access)
-            .map_err(|error| ProviderControlError::new(error.to_string()))?;
-        Ok(())
+            .expect("candidate account must match its provider runtime");
+        self.clear_recovery_failure(&account_id);
     }
 
     fn update_account_access(&self, account_id: &AccountId, access: ProviderAccountAccess) -> bool {
