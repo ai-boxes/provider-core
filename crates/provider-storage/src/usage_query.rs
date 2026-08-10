@@ -37,7 +37,7 @@ fn scoped_from() -> &'static str {
           ON a.logical_request_id = l.request_id
          AND a.id = l.final_attempt_id
         WHERE l.owner_user_id = ?
-          AND l.logical_status = 'succeeded'
+          AND l.logical_status IN ('succeeded', 'incomplete')
           AND (
               a.uncached_input_tokens > 0
               OR a.cache_read_input_tokens > 0
@@ -802,8 +802,28 @@ mod tests {
                 .await
                 .expect("usage overview")
                 .logical_requests,
-            1,
-            "only the succeeded request is user-visible Usage"
+            2,
+            "succeeded and incomplete requests with usage are user-visible"
+        );
+        let usage_requests = repository
+            .requests(&scope("user-1"), None, 10)
+            .await
+            .expect("usage requests");
+        assert_eq!(
+            usage_requests
+                .requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["health-success", "health-incomplete"]
+        );
+        assert!(
+            repository
+                .request_attempt(&scope("user-1"), "health-incomplete")
+                .await
+                .expect("incomplete detail")
+                .is_some(),
+            "an incomplete response with usage has visible detail"
         );
 
         let health = repository
