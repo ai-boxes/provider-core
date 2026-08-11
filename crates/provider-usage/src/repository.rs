@@ -119,9 +119,10 @@ pub struct AttemptFacts {
     pub cost: ObservedCatalogCost,
 }
 
-/// One authoritative logical-request quota result for a reservation created
-/// before dispatch. Only an observed exact cost is settled; an absent cost
-/// releases the reservation without inventing spend.
+/// Terminal result for a legacy pre-dispatch quota reservation.
+/// Only an observed exact cost is settled; an absent cost releases the
+/// reservation without inventing spend. New finite-quota traffic charges via
+/// attempt completion instead of creating reservations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuotaLedgerEntry {
     pub entry_id: String,
@@ -169,12 +170,12 @@ pub trait UsageRepository: Send + Sync {
 
     /// Persist one attempt. Re-submitting the same `attempt_id` is a no-op; a
     /// *different* attempt claiming an already-used sequence is an error,
-    /// because that would silently duplicate upstream usage. Complete costs for
-    /// requests without a quota reservation also advance lifetime key spend.
+    /// because that would silently duplicate upstream usage. Observed complete
+    /// costs advance lifetime key spend unless a legacy reservation still owns
+    /// that request's settlement.
     async fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), UsageRepositoryError>;
 
-    /// Persist a logical request's quota result idempotently and update the API
-    /// key's cumulative ledger in the same transaction.
+    /// Persist a legacy quota-reservation terminal and update lifetime spend.
     async fn record_quota_ledger_entry(
         &self,
         entry: &QuotaLedgerEntry,

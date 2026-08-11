@@ -8,9 +8,9 @@ use chacha20poly1305::{
 };
 use provider_auth::{
     ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey,
-    NewRegistrationCode, NewSession, NewUser, QuotaReservationOutcome, RegisterUserOutcome,
+    NewRegistrationCode, NewSession, NewUser, QuotaAdmissionOutcome, RegisterUserOutcome,
     SessionId, StoredApiKey, StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserRole,
-    UserSummary, add_atoms, atoms_ge,
+    UserSummary, atoms_ge,
 };
 #[cfg(test)]
 use provider_core::ProviderModelPricingTier;
@@ -1571,27 +1571,10 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(account_ids)
     }
 
-    async fn reserve_api_key_quota(
+    async fn admit_api_key_quota(
         &self,
         api_key_id: &ApiKeyId,
-        request_id: &str,
-        maximum_cost_atoms: &str,
-        reserved_at_ms: i64,
-    ) -> Result<QuotaReservationOutcome, AuthRepositoryError> {
-        if provider_auth::format_usd_atoms(maximum_cost_atoms).is_err() {
-            return Err(AuthRepositoryError::new(
-                "invalid maximum quota reservation amount",
-            ));
-        }
-        let mut connection = self.pool.acquire().await.map_err(|error| {
-            auth_repository_error("failed to acquire quota reservation connection", error)
-        })?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                auth_repository_error("failed to start quota reservation transaction", error)
-            })?;
+    ) -> Result<QuotaAdmissionOutcome, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT quota_limit_atoms, spent_atoms
@@ -1600,76 +1583,22 @@ impl AuthRepository for SqliteAccountRepository {
             "#,
         )
         .bind(api_key_id.as_str())
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|error| auth_repository_error("failed to load API key quota", error))?
         .ok_or_else(|| AuthRepositoryError::new("API key quota is unavailable"))?;
         let limit = auth_row_value::<Option<String>>(&row, "quota_limit_atoms")?;
         let Some(limit) = limit else {
-            sqlx::query("COMMIT")
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| {
-                    auth_repository_error("failed to commit unlimited quota admission", error)
-                })?;
-            return Ok(QuotaReservationOutcome::Unlimited);
+            return Ok(QuotaAdmissionOutcome::Unlimited);
         };
         let spent = auth_row_value::<String>(&row, "spent_atoms")?;
-        let reservations = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT reserved_atoms
-            FROM api_key_quota_ledger
-            WHERE api_key_id = ? AND state = 'reserved'
-            ORDER BY entry_id
-            "#,
-        )
-        .bind(api_key_id.as_str())
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            auth_repository_error("failed to load active quota reservations", error)
-        })?;
-        let reserved = reservations
-            .into_iter()
-            .try_fold("0".to_owned(), |total, atoms| {
-                add_atoms(&total, &atoms)
-                    .map_err(|_| AuthRepositoryError::new("active quota reservations overflowed"))
-            })?;
-        let committed = add_atoms(&spent, &reserved)
-            .and_then(|value| add_atoms(&value, maximum_cost_atoms))
-            .map_err(|_| AuthRepositoryError::new("quota admission total overflowed"))?;
-        if !atoms_ge(&limit, &committed)
+        // Reject only after lifetime spent reaches the configured limit.
+        if atoms_ge(&spent, &limit)
             .map_err(|_| AuthRepositoryError::new("invalid quota admission value"))?
         {
-            sqlx::query("COMMIT")
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| {
-                    auth_repository_error("failed to commit rejected quota admission", error)
-                })?;
-            return Ok(QuotaReservationOutcome::Exceeded);
+            return Ok(QuotaAdmissionOutcome::Exceeded);
         }
-        sqlx::query(
-            r#"
-            INSERT INTO api_key_quota_ledger (
-                entry_id, api_key_id, reserved_atoms, settled_atoms,
-                state, reserved_at_ms, resolved_at_ms
-            )
-            VALUES (?, ?, ?, NULL, 'reserved', ?, NULL)
-            "#,
-        )
-        .bind(request_id)
-        .bind(api_key_id.as_str())
-        .bind(maximum_cost_atoms)
-        .bind(reserved_at_ms)
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| auth_repository_error("failed to create quota reservation", error))?;
-        sqlx::query("COMMIT")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| auth_repository_error("failed to commit quota reservation", error))?;
-        Ok(QuotaReservationOutcome::Reserved)
+        Ok(QuotaAdmissionOutcome::Admitted)
     }
 
     async fn quota_ledger_ready(&self) -> Result<(), AuthRepositoryError> {
@@ -3043,7 +2972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_reservations_serialize_concurrent_admission_and_allow_the_exact_limit() {
+    async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
         let repository = SqliteAccountRepository::in_memory()
             .await
             .expect("in-memory repository");
@@ -3079,40 +3008,62 @@ mod tests {
         .expect("create quota key");
 
         let (left, right) = tokio::join!(
-            repository.reserve_api_key_quota(&key_id, "request-left", "60", 1),
-            repository.reserve_api_key_quota(&key_id, "request-right", "60", 1),
+            repository.admit_api_key_quota(&key_id),
+            repository.admit_api_key_quota(&key_id),
         );
-        let outcomes = [
-            left.expect("left admission"),
-            right.expect("right admission"),
-        ];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| **outcome == QuotaReservationOutcome::Reserved)
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| **outcome == QuotaReservationOutcome::Exceeded)
-                .count(),
-            1
-        );
+        assert_eq!(left.expect("left admission"), QuotaAdmissionOutcome::Admitted);
+        assert_eq!(right.expect("right admission"), QuotaAdmissionOutcome::Admitted);
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("set remaining spend");
         assert_eq!(
             repository
-                .reserve_api_key_quota(&key_id, "request-boundary", "40", 2)
+                .admit_api_key_quota(&key_id)
                 .await
-                .expect("exact-limit admission"),
-            QuotaReservationOutcome::Reserved
+                .expect("boundary admission"),
+            QuotaAdmissionOutcome::Admitted
         );
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '100' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("exhaust quota");
         assert_eq!(
             repository
-                .reserve_api_key_quota(&key_id, "request-over", "1", 3)
+                .admit_api_key_quota(&key_id)
                 .await
-                .expect("over-limit admission"),
-            QuotaReservationOutcome::Exceeded
+                .expect("exhausted admission"),
+            QuotaAdmissionOutcome::Exceeded
+        );
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '150' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("overshoot spend");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("overspent admission"),
+            QuotaAdmissionOutcome::Exceeded
+        );
+
+        sqlx::query("UPDATE api_keys SET quota_limit_atoms = NULL, spent_atoms = '0' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("clear quota limit");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("unlimited admission"),
+            QuotaAdmissionOutcome::Unlimited
         );
     }
 

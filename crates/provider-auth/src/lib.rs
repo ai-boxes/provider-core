@@ -20,7 +20,7 @@ pub use model::{
     parse_quota_limit_usd,
 };
 pub use repository::{
-    AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, QuotaReservationOutcome,
+    AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, QuotaAdmissionOutcome,
     RegisterUserOutcome,
 };
 pub use service::{

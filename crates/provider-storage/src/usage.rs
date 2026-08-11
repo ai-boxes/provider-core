@@ -344,8 +344,8 @@ impl UsageRepository for SqliteUsageRepository {
                 CostStatus::CompleteForObservedCatalogComponents
             ) && let Some(cost_atoms) = cost.atoms
             {
-                // A durable reservation owns finite-quota spend. Its absence
-                // remains authoritative if the key's quota changes in flight.
+                // Post-usage billing charges complete costs here when no legacy
+                // reservation row still owns the request's spend lifecycle.
                 let api_key_id = sqlx::query_scalar::<_, String>(
                     r#"
                     SELECT request_row.api_key_id
@@ -1646,7 +1646,7 @@ fn unknown_value(field: &str, value: &str) -> UsageRepositoryError {
 mod tests {
     use std::sync::Arc;
 
-    use provider_auth::{ApiKeyId, AuthRepository, QuotaReservationOutcome};
+    use provider_auth::{ApiKeyId, AuthRepository, QuotaAdmissionOutcome};
     use provider_usage::{
         CatalogInlinePriceRecordV1, ComponentPrices, PRICE_SCALE, QuotaLedgerWriter, UnitPrice,
     };
@@ -2040,16 +2040,12 @@ mod tests {
 
         assert_eq!(
             account_repository
-                .reserve_api_key_quota(
-                    &ApiKeyId::new("key-1").expect("API key ID"),
-                    "req-after-overrun",
-                    "1",
-                    11,
-                )
+                .admit_api_key_quota(&ApiKeyId::new("key-1").expect("API key ID"))
                 .await
                 .expect("check admission after overrun"),
-            QuotaReservationOutcome::Exceeded
+            QuotaAdmissionOutcome::Exceeded
         );
+
     }
 
     #[tokio::test]

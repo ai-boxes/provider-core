@@ -22,7 +22,6 @@ use provider_core::{
 use provider_management::ProviderManager;
 use provider_usage::{
     DeliveryOutcome, ExecutionOutcome, LogicalRequestStart, LogicalTracker, UsageTracking,
-    compute_maximum_text_request_cost,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -326,14 +325,6 @@ async fn responses(
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::OpenAiResponses, &body).await?;
-    let maximum_output_tokens =
-        match quota_output_limit(&key, WireFormat::OpenAiResponses, &payload) {
-            Ok(limit) => limit,
-            Err(error) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
-                return Err(error);
-            }
-        };
     let request =
         match proxy_request_from_payload(WireFormat::OpenAiResponses, &headers, body, payload) {
             Ok(request) => request,
@@ -342,7 +333,7 @@ async fn responses(
                 return Err(error);
             }
         };
-    proxy_prepared_stream(&state, &key, request, logical, maximum_output_tokens).await
+    proxy_prepared_stream(&state, &key, request, logical).await
 }
 
 async fn messages(
@@ -354,14 +345,6 @@ async fn messages(
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::ClaudeMessages, &body).await?;
-    let maximum_output_tokens = match quota_output_limit(&key, WireFormat::ClaudeMessages, &payload)
-    {
-        Ok(limit) => limit,
-        Err(error) => {
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
-            return Err(error);
-        }
-    };
     let request = match proxy_request_for_key_from_payload(
         WireFormat::ClaudeMessages,
         &headers,
@@ -375,7 +358,7 @@ async fn messages(
             return Err(error);
         }
     };
-    proxy_prepared_stream(&state, &key, request, logical, maximum_output_tokens).await
+    proxy_prepared_stream(&state, &key, request, logical).await
 }
 
 async fn count_tokens(
@@ -415,9 +398,35 @@ async fn proxy_prepared_stream(
     key: &AuthenticatedApiKey,
     request: ProxyRequest,
     logical: Option<Arc<LogicalTracker>>,
-    maximum_output_tokens: Option<u64>,
 ) -> Result<Response, HttpError> {
     let protocol = request.format;
+    if key.quota_limit_atoms.is_some() {
+        // Finite keys charge from observed usage. Without tracking there is no
+        // durable spend path, so admission must fail closed.
+        if logical.is_none() || state.usage.is_none() {
+            return Err(HttpError::service_unavailable(
+                protocol,
+                "quota accounting is unavailable",
+            ));
+        }
+        match state.api_keys.admit_quota(key).await {
+            Ok(()) => {}
+            Err(AuthError::QuotaExceeded) => {
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                return Err(HttpError::rate_limited(
+                    protocol,
+                    "API key USD quota has been exhausted",
+                ));
+            }
+            Err(_) => {
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                return Err(HttpError::service_unavailable(
+                    protocol,
+                    "quota accounting is unavailable",
+                ));
+            }
+        }
+    }
     let account_ids = match load_key_account_filter(&state.api_keys, key, protocol).await {
         Ok(account_ids) => account_ids,
         Err(error) => {
@@ -425,7 +434,7 @@ async fn proxy_prepared_stream(
             return Err(error);
         }
     };
-    let mut prepared =
+    let prepared =
         match state
             .service
             .prepare_stream(key.owner_user_id.as_str(), request, Some(&account_ids))
@@ -436,88 +445,6 @@ async fn proxy_prepared_stream(
                 return Err(HttpError::from_provider(protocol, error));
             }
         };
-
-    if let Some(maximum_output_tokens) = maximum_output_tokens {
-        let Some(logical) = logical.as_ref() else {
-            return Err(HttpError::service_unavailable(
-                protocol,
-                "quota accounting is unavailable",
-            ));
-        };
-        let Some(pricing) = prepared.pricing().cloned() else {
-            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-            return Err(HttpError::invalid_request(
-                protocol,
-                "the requested model has no official price for quota admission",
-            ));
-        };
-        let Some(profile) = prepared.usage_profile() else {
-            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-            return Err(HttpError::invalid_request(
-                protocol,
-                "the requested provider cannot account for finite quotas",
-            ));
-        };
-        let input_tokens = match prepared.count_input_tokens().await {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-                return Err(HttpError::from_provider(protocol, error));
-            }
-        };
-        let maximum = match compute_maximum_text_request_cost(
-            &pricing.pricing,
-            &profile.contract,
-            input_tokens,
-            maximum_output_tokens,
-            prepared.maximum_attempts(),
-        ) {
-            Ok(maximum) => maximum,
-            Err(_) => {
-                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-                return Err(HttpError::invalid_request(
-                    protocol,
-                    "the requested model price cannot produce a finite quota maximum",
-                ));
-            }
-        };
-        if logical.reserve_quota_settlement().await.is_err() {
-            finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-            return Err(HttpError::service_unavailable(
-                protocol,
-                "quota accounting is unavailable",
-            ));
-        }
-        match state
-            .api_keys
-            .reserve_quota(
-                key,
-                logical.request_id(),
-                &maximum.as_atoms().to_string(),
-                provider_usage::system_clock_ms(),
-            )
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => logical.cancel_quota_settlement(),
-            Err(AuthError::QuotaExceeded) => {
-                logical.cancel_quota_settlement();
-                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-                return Err(HttpError::rate_limited(
-                    protocol,
-                    "API key USD quota has been exhausted",
-                ));
-            }
-            Err(_) => {
-                logical.cancel_quota_settlement();
-                finish_before_bytes(Some(logical), ExecutionOutcome::StableFailure);
-                return Err(HttpError::service_unavailable(
-                    protocol,
-                    "quota accounting is unavailable",
-                ));
-            }
-        }
-    }
 
     let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
 
@@ -586,30 +513,6 @@ fn finish_before_bytes(logical: Option<&Arc<LogicalTracker>>, execution: Executi
         logical.record_delivery(DeliveryOutcome::ErrorBeforeBytes);
         logical.finish();
     }
-}
-
-fn quota_output_limit(
-    key: &AuthenticatedApiKey,
-    protocol: WireFormat,
-    payload: &Value,
-) -> Result<Option<u64>, HttpError> {
-    if key.quota_limit_atoms.is_none() {
-        return Ok(None);
-    }
-    crate::quota::maximum_text_output_tokens(protocol, payload)
-        .map(Some)
-        .map_err(|error| match error {
-            crate::quota::QuotaRequestError::MissingOutputLimit => HttpError::invalid_request(
-                protocol,
-                "finite-quota requests require a positive output token limit",
-            ),
-            crate::quota::QuotaRequestError::UnsupportedBillableContent => {
-                HttpError::invalid_request(
-                    protocol,
-                    "finite quotas currently support text-only requests",
-                )
-            }
-        })
 }
 
 /// Record the start of a logical request, if usage is being tracked.

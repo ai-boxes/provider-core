@@ -20,8 +20,8 @@ pub enum RegisterUserOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QuotaReservationOutcome {
-    Reserved,
+pub enum QuotaAdmissionOutcome {
+    Admitted,
     Unlimited,
     Exceeded,
 }
@@ -128,15 +128,12 @@ pub trait AuthRepository: Send + Sync {
         group_label: &str,
     ) -> Result<Vec<String>, AuthRepositoryError>;
 
-    /// Atomically reserve the maximum cost of one request against the key's
-    /// current lifetime limit. The repository is the sole admission authority.
-    async fn reserve_api_key_quota(
+    /// Admit a finite-quota key when lifetime spent is still below the limit.
+    /// Spend is charged after observed usage; this check is intentionally soft.
+    async fn admit_api_key_quota(
         &self,
         api_key_id: &ApiKeyId,
-        request_id: &str,
-        maximum_cost_atoms: &str,
-        reserved_at_ms: i64,
-    ) -> Result<QuotaReservationOutcome, AuthRepositoryError>;
+    ) -> Result<QuotaAdmissionOutcome, AuthRepositoryError>;
 
     async fn quota_ledger_ready(&self) -> Result<(), AuthRepositoryError>;
 }

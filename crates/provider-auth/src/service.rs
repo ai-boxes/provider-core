@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::{
     ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey,
     CredentialError, InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
-    QuotaReservationOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
+    QuotaAdmissionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
     UserId, UserRole, UserSummary, digest_secret, hash_password, issue_registration_code,
     issue_session, parse_quota_limit_usd, verify_password,
 };
@@ -572,27 +572,15 @@ impl ApiKeyAuthenticator {
         }
     }
 
-    /// Atomically reserve one request's maximum cost before any upstream call.
-    /// Returns whether a durable reservation was created; unlimited keys need no
-    /// quota writer entry.
-    pub async fn reserve_quota(
-        &self,
-        key: &AuthenticatedApiKey,
-        request_id: &str,
-        maximum_cost_atoms: &str,
-        reserved_at_ms: i64,
-    ) -> Result<bool, AuthError> {
+    /// Soft-admit a finite-quota key when lifetime spent is still under limit.
+    /// Actual USD spend is applied later from observed usage.
+    pub async fn admit_quota(&self, key: &AuthenticatedApiKey) -> Result<(), AuthError> {
         if key.quota_limit_atoms.is_none() {
-            return Ok(false);
+            return Ok(());
         }
-        match self
-            .repository
-            .reserve_api_key_quota(&key.key_id, request_id, maximum_cost_atoms, reserved_at_ms)
-            .await?
-        {
-            QuotaReservationOutcome::Reserved => Ok(true),
-            QuotaReservationOutcome::Unlimited => Ok(false),
-            QuotaReservationOutcome::Exceeded => Err(AuthError::QuotaExceeded),
+        match self.repository.admit_api_key_quota(&key.key_id).await? {
+            QuotaAdmissionOutcome::Admitted | QuotaAdmissionOutcome::Unlimited => Ok(()),
+            QuotaAdmissionOutcome::Exceeded => Err(AuthError::QuotaExceeded),
         }
     }
 
