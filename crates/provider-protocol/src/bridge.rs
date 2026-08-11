@@ -29,10 +29,10 @@ impl ProtocolBridge for DefaultProtocolBridge {
         target: WireFormat,
         input_modalities: Option<&[ProviderModelInputModality]>,
     ) -> Result<PreparedProviderRequest, ProviderError> {
-        let explicitly_text_only = input_modalities == Some(&[ProviderModelInputModality::Text]);
+        let explicitly_without_image = explicitly_without_image(input_modalities);
         if request.format == target {
             let mut request = ProviderRequest::from_proxy(request, target);
-            if target == WireFormat::OpenAiChatCompletions && explicitly_text_only {
+            if target == WireFormat::OpenAiChatCompletions && explicitly_without_image {
                 openai_chat::omit_tool_images(&mut request)?;
             }
             return Ok(PreparedProviderRequest::new(
@@ -68,7 +68,7 @@ impl ProtocolBridge for DefaultProtocolBridge {
             }
             WireFormat::OpenAiChatCompletions => {
                 let (request, response) =
-                    openai_chat::prepare_request(responses_request, explicitly_text_only)?;
+                    openai_chat::prepare_request(responses_request, explicitly_without_image)?;
                 (request, Box::new(response))
             }
             WireFormat::ClaudeMessages => {
@@ -85,6 +85,11 @@ impl ProtocolBridge for DefaultProtocolBridge {
             }),
         ))
     }
+}
+
+fn explicitly_without_image(input_modalities: Option<&[ProviderModelInputModality]>) -> bool {
+    input_modalities
+        .is_some_and(|modalities| !modalities.contains(&ProviderModelInputModality::Image))
 }
 
 fn unsupported_conversion() -> ProviderError {
@@ -111,5 +116,23 @@ impl ResponseTranslator for ComposedResponseTranslator {
     fn translate_stream(self: Box<Self>, stream: ProviderStream) -> ProviderStream {
         self.outer
             .translate_stream(self.inner.translate_stream(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_explicit_modality_set_without_image_omits_tool_images() {
+        assert!(explicitly_without_image(Some(&[
+            ProviderModelInputModality::Audio,
+            ProviderModelInputModality::Pdf,
+        ])));
+        assert!(!explicitly_without_image(Some(&[
+            ProviderModelInputModality::Video,
+            ProviderModelInputModality::Image,
+        ])));
+        assert!(!explicitly_without_image(None));
     }
 }

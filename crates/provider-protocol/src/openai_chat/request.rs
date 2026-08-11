@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn text_only_models_omit_tool_images_but_keep_user_images() {
+    fn models_without_image_input_omit_tool_images_but_keep_user_images() {
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
             model: "upstream-model".to_owned(),

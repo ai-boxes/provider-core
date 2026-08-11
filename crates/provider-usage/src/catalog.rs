@@ -18,7 +18,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use provider_core::{ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingTier};
+use provider_core::{
+    ProviderModelInputModality, ProviderModelPricing, ProviderModelPricingCatalog,
+    ProviderModelPricingTier,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -39,7 +42,13 @@ pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 /// document and most carry no price: sizing every entry for the largest variant
 /// would waste most of the map.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CatalogEntry {
+struct CatalogEntry {
+    pricing: CatalogPricing,
+    input_modalities: Option<Vec<ProviderModelInputModality>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CatalogPricing {
     Priced {
         prices: Box<ComponentPrices>,
         model_tiers: Vec<ProviderModelPricingTier>,
@@ -70,16 +79,20 @@ impl CatalogSnapshot {
         let mut entries = HashMap::new();
         for (provider_id, provider) in raw {
             for (model_id, model) in provider.models {
-                let entry = match model.cost {
-                    None => CatalogEntry::NoCost,
+                let pricing = match model.cost {
+                    None => CatalogPricing::NoCost,
                     Some(cost) => match (component_prices(&cost), parse_model_pricing_tiers(&cost))
                     {
-                        (Some(prices), Some(model_tiers)) => CatalogEntry::Priced {
+                        (Some(prices), Some(model_tiers)) => CatalogPricing::Priced {
                             prices: Box::new(prices),
                             model_tiers,
                         },
-                        _ => CatalogEntry::Invalid,
+                        _ => CatalogPricing::Invalid,
                     },
+                };
+                let entry = CatalogEntry {
+                    pricing,
+                    input_modalities: input_modalities(model.modalities),
                 };
                 entries.insert((provider_id.clone(), model_id), entry);
             }
@@ -101,7 +114,7 @@ impl CatalogSnapshot {
     pub fn priced_model_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| matches!(entry, CatalogEntry::Priced { .. }))
+            .filter(|entry| matches!(&entry.pricing, CatalogPricing::Priced { .. }))
             .count()
     }
 
@@ -127,11 +140,36 @@ impl CatalogSnapshot {
         }
         candidate
     }
+
+    #[must_use]
+    pub fn exact_model_input_modalities(
+        &self,
+        model: &str,
+    ) -> Option<Vec<ProviderModelInputModality>> {
+        if let Some(provider) = official_catalog_provider(model)
+            && let Some(entry) = self.entries.get(&(provider.to_owned(), model.to_owned()))
+        {
+            return entry.input_modalities.clone();
+        }
+
+        let mut candidate: Option<Option<Vec<ProviderModelInputModality>>> = None;
+        for ((_, model_id), entry) in &self.entries {
+            if model_id != model {
+                continue;
+            }
+            match candidate.as_ref() {
+                Some(current) if current != &entry.input_modalities => return None,
+                Some(_) => {}
+                None => candidate = Some(entry.input_modalities.clone()),
+            }
+        }
+        candidate.flatten()
+    }
 }
 
 fn model_pricing_from_entry(entry: &CatalogEntry) -> Option<ProviderModelPricing> {
-    match entry {
-        CatalogEntry::Priced {
+    match &entry.pricing {
+        CatalogPricing::Priced {
             prices,
             model_tiers,
             ..
@@ -140,8 +178,16 @@ fn model_pricing_from_entry(entry: &CatalogEntry) -> Option<ProviderModelPricing
             pricing.tiers = model_tiers.clone();
             Some(pricing)
         }
-        CatalogEntry::NoCost | CatalogEntry::Invalid => None,
+        CatalogPricing::NoCost | CatalogPricing::Invalid => None,
     }
+}
+
+fn input_modalities(modalities: Option<Box<RawValue>>) -> Option<Vec<ProviderModelInputModality>> {
+    let input = serde_json::from_str::<RawModalities>(modalities?.get())
+        .ok()?
+        .input;
+    provider_core::validate_input_modalities(Some(&input)).ok()?;
+    Some(input)
 }
 
 fn official_catalog_provider(model: &str) -> Option<&'static str> {
@@ -227,6 +273,13 @@ impl CatalogPrices {
 impl ProviderModelPricingCatalog for CatalogPrices {
     fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing> {
         self.current()?.exact_model_pricing(upstream_model)
+    }
+
+    fn exact_input_modalities(
+        &self,
+        upstream_model: &str,
+    ) -> Option<Vec<ProviderModelInputModality>> {
+        self.current()?.exact_model_input_modalities(upstream_model)
     }
 }
 
@@ -339,6 +392,12 @@ struct RawProvider {
 #[derive(Deserialize)]
 struct RawModel {
     cost: Option<RawCost>,
+    modalities: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+struct RawModalities {
+    input: Vec<ProviderModelInputModality>,
 }
 
 /// Cost numbers are kept as raw JSON so their digits survive to
@@ -658,6 +717,115 @@ mod tests {
 
     fn snapshot() -> CatalogSnapshot {
         CatalogSnapshot::parse(CATALOG, "r".repeat(64)).expect("catalog parses")
+    }
+
+    #[test]
+    fn input_modalities_are_preserved_independently_from_pricing() {
+        let snapshot = CatalogSnapshot::parse(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-image": {
+                    "modalities": {"input": ["video", "text", "pdf", "image", "audio"]},
+                    "cost": {"input": "invalid"}
+                  },
+                  "gpt-audio": {
+                    "modalities": {"input": ["audio"]}
+                  },
+                  "gpt-empty": {
+                    "modalities": {"input": []},
+                    "cost": {"input": 1, "output": 2}
+                  },
+                  "gpt-duplicate": {
+                    "modalities": {"input": ["text", "text"]},
+                    "cost": {"input": 1, "output": 2}
+                  },
+                  "gpt-unknown": {
+                    "modalities": {"input": ["text", "future"]},
+                    "cost": {"input": 1, "output": 2}
+                  },
+                  "gpt-invalid-modalities": {
+                    "modalities": {"input": "text"},
+                    "cost": {"input": 1, "output": 2}
+                  }
+                }
+              }
+            }"#,
+            "modalities",
+        )
+        .expect("invalid modality data does not invalidate prices");
+
+        assert_eq!(
+            snapshot.exact_model_input_modalities("gpt-image"),
+            Some(vec![
+                ProviderModelInputModality::Video,
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Pdf,
+                ProviderModelInputModality::Image,
+                ProviderModelInputModality::Audio,
+            ])
+        );
+        assert_eq!(snapshot.exact_model_pricing("gpt-image"), None);
+        assert_eq!(
+            snapshot.exact_model_input_modalities("gpt-audio"),
+            Some(vec![ProviderModelInputModality::Audio])
+        );
+        assert_eq!(snapshot.exact_model_input_modalities("gpt-empty"), None);
+        assert!(snapshot.exact_model_pricing("gpt-empty").is_some());
+        assert_eq!(snapshot.exact_model_input_modalities("gpt-duplicate"), None);
+        assert!(snapshot.exact_model_pricing("gpt-duplicate").is_some());
+        assert_eq!(snapshot.exact_model_input_modalities("gpt-unknown"), None);
+        assert!(snapshot.exact_model_pricing("gpt-unknown").is_some());
+        assert_eq!(
+            snapshot.exact_model_input_modalities("gpt-invalid-modalities"),
+            None
+        );
+        assert!(
+            snapshot
+                .exact_model_pricing("gpt-invalid-modalities")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn modality_lookup_uses_the_same_exact_match_rules_as_pricing() {
+        let snapshot = CatalogSnapshot::parse(
+            r#"{
+              "openai": {"models": {
+                "gpt-shared": {"modalities": {"input": ["text", "image"]}},
+                "shared": {"modalities": {"input": ["text"]}}
+              }},
+              "gateway": {"models": {
+                "gpt-shared": {"modalities": {"input": ["text"]}},
+                "shared": {"modalities": {"input": ["text"]}},
+                "conflict": {"modalities": {"input": ["text"]}}
+              }},
+              "other": {"models": {
+                "conflict": {"modalities": {"input": ["text", "image"]}}
+              }}
+            }"#,
+            "matching",
+        )
+        .expect("catalog parses");
+
+        assert_eq!(
+            snapshot.exact_model_input_modalities("gpt-shared"),
+            Some(vec![
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Image,
+            ]),
+            "the official provider wins for an official model ID"
+        );
+        assert_eq!(
+            snapshot.exact_model_input_modalities("shared"),
+            Some(vec![ProviderModelInputModality::Text]),
+            "identical cross-provider entries are unambiguous"
+        );
+        assert_eq!(
+            snapshot.exact_model_input_modalities("conflict"),
+            None,
+            "conflicting cross-provider entries are not guessed"
+        );
     }
 
     #[test]

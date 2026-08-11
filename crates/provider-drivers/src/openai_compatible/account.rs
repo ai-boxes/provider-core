@@ -537,8 +537,8 @@ mod tests {
                 created: None,
                 owned_by: None,
                 input_modalities: Some(vec![
-                    ProviderModelInputModality::Text,
-                    ProviderModelInputModality::Image,
+                    ProviderModelInputModality::Audio,
+                    ProviderModelInputModality::Pdf,
                 ]),
             }],
             "openai_compatible",
@@ -547,8 +547,8 @@ mod tests {
         assert_eq!(
             models[0].input_modalities,
             Some(vec![
-                ProviderModelInputModality::Text,
-                ProviderModelInputModality::Image,
+                ProviderModelInputModality::Audio,
+                ProviderModelInputModality::Pdf,
             ])
         );
 
@@ -558,7 +558,10 @@ mod tests {
                     id: "invalid".to_owned(),
                     created: None,
                     owned_by: None,
-                    input_modalities: Some(vec![ProviderModelInputModality::Image]),
+                    input_modalities: Some(vec![
+                        ProviderModelInputModality::Video,
+                        ProviderModelInputModality::Video,
+                    ]),
                 }],
                 "openai_compatible",
             )

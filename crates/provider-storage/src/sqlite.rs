@@ -2350,6 +2350,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_model_modality_check_accepts_only_unique_supported_strings() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts (id, provider, label, group_label)
+            VALUES ('modality-check', 'openai_compatible', 'Modality Check', 'default')
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert provider account");
+
+        for (model, modalities) in [
+            ("all", r#"["video","text","audio","image","pdf"]"#),
+            ("subset", r#"["audio"]"#),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO provider_models
+                    (account_id, upstream_model, input_modalities_json)
+                VALUES ('modality-check', ?, ?)
+                "#,
+            )
+            .bind(model)
+            .bind(modalities)
+            .execute(&repository.pool)
+            .await
+            .expect("valid modality array");
+        }
+
+        for (model, modalities) in [
+            ("unknown", r#"["future"]"#),
+            ("duplicate", r#"["text","text"]"#),
+            ("non-string", "[1]"),
+            ("empty", "[]"),
+        ] {
+            assert!(
+                sqlx::query(
+                    r#"
+                    INSERT INTO provider_models
+                        (account_id, upstream_model, input_modalities_json)
+                    VALUES ('modality-check', ?, ?)
+                    "#,
+                )
+                .bind(model)
+                .bind(modalities)
+                .execute(&repository.pool)
+                .await
+                .is_err(),
+                "invalid modalities {modalities} must be rejected by SQLite"
+            );
+        }
+    }
+
     #[test]
     fn stored_model_pricing_rejects_invalid_price_semantics() {
         let decode =
@@ -2611,7 +2668,7 @@ mod tests {
                     DiscoveredProviderModel {
                         upstream_model: "grok-b".to_owned(),
                         input_modalities: Some(vec![
-                            provider_core::ProviderModelInputModality::Text,
+                            provider_core::ProviderModelInputModality::Video,
                             provider_core::ProviderModelInputModality::Image,
                         ]),
                         metadata_json: "{}".to_owned(),
@@ -2650,7 +2707,7 @@ mod tests {
                         alias: Some("grok-b-latest".to_owned()),
                         enabled: true,
                         input_modalities: Some(vec![
-                            provider_core::ProviderModelInputModality::Text,
+                            provider_core::ProviderModelInputModality::Video,
                             provider_core::ProviderModelInputModality::Image,
                         ]),
                         pricing: None,
@@ -2713,7 +2770,8 @@ mod tests {
                     DiscoveredProviderModel {
                         upstream_model: "grok-b".to_owned(),
                         input_modalities: Some(vec![
-                            provider_core::ProviderModelInputModality::Text,
+                            provider_core::ProviderModelInputModality::Audio,
+                            provider_core::ProviderModelInputModality::Pdf,
                         ]),
                         metadata_json: "{}".to_owned(),
                         routable: true,
@@ -2740,7 +2798,10 @@ mod tests {
                 .find(|model| model.upstream_model == "grok-b")
                 .expect("refreshed grok-b")
                 .input_modalities,
-            Some(vec![provider_core::ProviderModelInputModality::Text]),
+            Some(vec![
+                provider_core::ProviderModelInputModality::Audio,
+                provider_core::ProviderModelInputModality::Pdf,
+            ]),
             "editing only the alias must not freeze discovered input modalities"
         );
 

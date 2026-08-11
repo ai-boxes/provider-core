@@ -370,13 +370,12 @@ fn conservative_input_modalities(
     let (Some(left), Some(right)) = (left, right) else {
         return None;
     };
-    let mut modalities = vec![ProviderModelInputModality::Text];
-    if left.contains(&ProviderModelInputModality::Image)
-        && right.contains(&ProviderModelInputModality::Image)
-    {
-        modalities.push(ProviderModelInputModality::Image);
-    }
-    Some(modalities)
+    let modalities = left
+        .iter()
+        .filter(|modality| right.contains(modality))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!modalities.is_empty()).then_some(modalities)
 }
 
 fn randomize_routes(inner: &RouterInner, routes: &mut [(AccountId, ProviderRouteCandidate)]) {
@@ -498,6 +497,7 @@ mod tests {
         first_shared.input_modalities = Some(vec![
             ProviderModelInputModality::Text,
             ProviderModelInputModality::Image,
+            ProviderModelInputModality::Audio,
         ]);
         let mut first_metadata: serde_json::Value =
             serde_json::from_str(&first_shared.metadata_json).expect("model metadata");
@@ -516,7 +516,11 @@ mod tests {
             )
             .expect("first routes");
         let mut second_shared = stored_model(&second.id, "upstream-b", "shared");
-        second_shared.input_modalities = Some(vec![ProviderModelInputModality::Text]);
+        second_shared.input_modalities = Some(vec![
+            ProviderModelInputModality::Text,
+            ProviderModelInputModality::Pdf,
+            ProviderModelInputModality::Audio,
+        ]);
         router
             .replace_account_models(
                 runtime.clone(),
@@ -531,7 +535,10 @@ mod tests {
         assert_eq!(models[0].model.id, "shared");
         assert_eq!(
             models[0].model.input_modalities,
-            Some(vec![ProviderModelInputModality::Text])
+            Some(vec![
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Audio,
+            ])
         );
         assert_eq!(models[0].native_formats, [WireFormat::OpenAiResponses]);
         assert!(

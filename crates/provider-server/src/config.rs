@@ -10,7 +10,7 @@ pub(crate) const LISTEN_ADDRESS_ENV: &str = "PODE_LISTEN_ADDRESS";
 
 pub(crate) const DATABASE_PATH: &str = "data/provider-core.db";
 
-/// Set to `0`, `false` or `off` to stop fetching the models.dev price catalog.
+/// Set to `0`, `false` or `off` to stop fetching the models.dev model catalog.
 pub(crate) const CATALOG_SYNC_ENV: &str = "PODE_CATALOG_SYNC";
 
 /// Exact reverse-proxy peer allowed to supply the client IP header.
@@ -24,7 +24,7 @@ pub(crate) fn listen_address() -> String {
     std::env::var(LISTEN_ADDRESS_ENV).unwrap_or_else(|_| DEFAULT_LISTEN_ADDRESS.to_owned())
 }
 
-/// Whether to keep the price catalog up to date over the network.
+/// Whether to keep the model catalog up to date over the network.
 ///
 /// On by default: without a catalog every cost is `unavailable`, which reads like
 /// a bug rather than a choice. The switch exists so an operator who does not want

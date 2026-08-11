@@ -578,12 +578,14 @@ struct InputModalitiesPatch(Value);
 
 impl InputModalitiesPatch {
     fn into_modalities(self) -> Result<Option<Vec<ProviderModelInputModality>>, ApiError> {
-        let input_modalities: Option<Vec<ProviderModelInputModality>> =
-            serde_json::from_value(self.0).map_err(|_| {
-                ApiError::invalid_request(
-                    "input_modalities must be null, [\"text\"], or [\"text\",\"image\"]",
-                )
-            })?;
+        let input_modalities: Option<Vec<ProviderModelInputModality>> = serde_json::from_value(
+            self.0,
+        )
+        .map_err(|_| {
+            ApiError::invalid_request(
+                "input_modalities must be null or a non-empty array of unique supported modalities",
+            )
+        })?;
         provider_core::validate_input_modalities(input_modalities.as_deref())
             .map_err(ApiError::invalid_request)?;
         Ok(input_modalities)
@@ -1156,7 +1158,7 @@ mod tests {
         assert!(matches!(null.pricing, ModelPricingPatch::Null));
 
         let value: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","image"],"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["video","audio","pdf","image","text"],"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
         )
         .expect("complete pricing object");
         let Ok(input_modalities) = value.input_modalities.into_modalities() else {
@@ -1165,8 +1167,11 @@ mod tests {
         assert_eq!(
             input_modalities,
             Some(vec![
-                provider_core::ProviderModelInputModality::Text,
+                provider_core::ProviderModelInputModality::Video,
+                provider_core::ProviderModelInputModality::Audio,
+                provider_core::ProviderModelInputModality::Pdf,
                 provider_core::ProviderModelInputModality::Image,
+                provider_core::ProviderModelInputModality::Text,
             ])
         );
         let ModelPricingPatch::Value(value) = value.pricing else {
@@ -1175,6 +1180,17 @@ mod tests {
         let pricing = value.into_model_pricing().expect("valid pricing fields");
         assert_eq!(pricing.tiers.len(), 1);
         assert_eq!(pricing.tiers[0].threshold_tokens, 200_000);
+
+        let duplicate: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","text"],"pricing_changed":false}"#,
+        )
+        .expect("modality strings parse before contract validation");
+        assert!(duplicate.input_modalities.into_modalities().is_err());
+        let unknown: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","future"],"pricing_changed":false}"#,
+        )
+        .expect("modality payload is validated after request shape parsing");
+        assert!(unknown.input_modalities.into_modalities().is_err());
 
         assert!(
             serde_json::from_str::<UpdateModelRequest>(

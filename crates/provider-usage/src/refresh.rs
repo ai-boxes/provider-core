@@ -1,4 +1,4 @@
-//! Keeping the price catalog current, without ever letting that affect a request.
+//! Keeping the models.dev model catalog current without blocking requests.
 //!
 //! The fetch itself is behind [`CatalogSource`] so this crate needs no HTTP
 //! client: the wiring layer supplies one, and tests supply a fake.
@@ -8,9 +8,9 @@
 //! * Replace a working catalog with a broken one. A body that does not parse
 //!   leaves the last known good snapshot in place and records why.
 //! * Touch the request path. Only provider model refresh reads the installed
-//!   snapshot; requests use prices already saved with their routed model.
+//!   snapshot; requests use catalog data already saved with their routed model.
 //! * Fail startup. With no catalog at all, model prices remain unconfigured and
-//!   the proxy is unaffected.
+//!   model prices and capabilities remain unknown and the proxy is unaffected.
 
 use std::{sync::Arc, time::Duration};
 
@@ -251,7 +251,7 @@ mod tests {
     use super::*;
     use crate::{component_prices_from_model_pricing, tests_support::TestRepository};
 
-    const GOOD: &str = r#"{"openai":{"models":{"gpt-5-codex":{"cost":{"input":1,"output":2}}}}}"#;
+    const GOOD: &str = r#"{"openai":{"models":{"gpt-5-codex":{"modalities":{"input":["text","image","pdf"]},"cost":{"input":1,"output":2}}}}}"#;
 
     /// Serves whatever a test queues.
     struct FakeSource {
@@ -322,6 +322,28 @@ mod tests {
             .and_then(|pricing| component_prices_from_model_pricing(&pricing))
             .and_then(|prices| prices.uncached_input_per_million)
             .map(|price| price.as_scaled())
+    }
+
+    #[tokio::test]
+    async fn refresh_installs_model_modalities_with_prices() {
+        let harness = harness(vec![fresh(GOOD, "\"v1\"")]);
+
+        assert_eq!(
+            harness.refresher.refresh_once().await,
+            RefreshOutcome::Installed
+        );
+        assert_eq!(
+            harness
+                .prices
+                .current()
+                .expect("installed catalog")
+                .exact_model_input_modalities("gpt-5-codex"),
+            Some(vec![
+                provider_core::ProviderModelInputModality::Text,
+                provider_core::ProviderModelInputModality::Image,
+                provider_core::ProviderModelInputModality::Pdf,
+            ])
+        );
     }
 
     #[tokio::test]

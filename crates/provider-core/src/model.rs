@@ -44,11 +44,6 @@ impl ProviderModel {
         self.input_modalities = input_modalities;
         self
     }
-
-    #[must_use]
-    pub fn is_explicitly_text_only(&self) -> bool {
-        self.input_modalities.as_deref() == Some(&[ProviderModelInputModality::Text])
-    }
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -60,22 +55,26 @@ const fn is_false(value: &bool) -> bool {
 pub enum ProviderModelInputModality {
     Text,
     Image,
+    Pdf,
+    Audio,
+    Video,
 }
 
 pub fn validate_input_modalities(
     input_modalities: Option<&[ProviderModelInputModality]>,
 ) -> Result<(), &'static str> {
-    if matches!(
-        input_modalities,
-        None | Some([ProviderModelInputModality::Text])
-            | Some([
-                ProviderModelInputModality::Text,
-                ProviderModelInputModality::Image
-            ])
-    ) {
-        Ok(())
+    let Some(input_modalities) = input_modalities else {
+        return Ok(());
+    };
+    if input_modalities.is_empty()
+        || input_modalities
+            .iter()
+            .enumerate()
+            .any(|(index, modality)| input_modalities[index + 1..].contains(modality))
+    {
+        Err("input_modalities must be null or a non-empty array of unique supported modalities")
     } else {
-        Err("input_modalities must be null, [\"text\"], or [\"text\",\"image\"]")
+        Ok(())
     }
 }
 
@@ -184,6 +183,11 @@ pub struct ProviderModelOverride {
 
 pub trait ProviderModelPricingCatalog: Send + Sync {
     fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing>;
+
+    fn exact_input_modalities(
+        &self,
+        upstream_model: &str,
+    ) -> Option<Vec<ProviderModelInputModality>>;
 }
 
 #[cfg(test)]
@@ -222,17 +226,24 @@ mod tests {
     }
 
     #[test]
-    fn modality_contract_rejects_non_canonical_capabilities() {
+    fn modality_contract_accepts_ordered_unique_supported_modalities() {
         assert!(validate_input_modalities(None).is_ok());
         assert!(validate_input_modalities(Some(&[ProviderModelInputModality::Text])).is_ok());
         assert!(
             validate_input_modalities(Some(&[
-                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Video,
                 ProviderModelInputModality::Image,
+                ProviderModelInputModality::Pdf,
             ]))
             .is_ok()
         );
         assert!(validate_input_modalities(Some(&[])).is_err());
-        assert!(validate_input_modalities(Some(&[ProviderModelInputModality::Image])).is_err());
+        assert!(
+            validate_input_modalities(Some(&[
+                ProviderModelInputModality::Audio,
+                ProviderModelInputModality::Audio,
+            ]))
+            .is_err()
+        );
     }
 }
