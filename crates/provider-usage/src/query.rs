@@ -14,11 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::{
-    attempt::{LogicalStatus, TrackingState},
-    money::UsdAtoms,
-    repository::UsageRepositoryError,
-};
+use crate::{money::UsdAtoms, repository::UsageRepositoryError};
 
 /// Longest range a single query may cover.
 ///
@@ -39,7 +35,8 @@ impl TimeRange {
         if to_ms <= from_ms {
             return Err(TimeRangeError::Empty);
         }
-        let span = i64::try_from(MAX_QUERY_RANGE.as_millis()).unwrap_or(i64::MAX);
+        let span = i64::try_from(MAX_QUERY_RANGE.as_millis())
+            .expect("maximum usage query range must fit i64 milliseconds");
         if to_ms.saturating_sub(from_ms) > span {
             return Err(TimeRangeError::TooWide);
         }
@@ -53,115 +50,51 @@ pub enum TimeRangeError {
     TooWide,
 }
 
-/// Which usage a number describes. The two answer different questions and must
-/// never be presented as one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AttributionBasis {
-    /// What the user's request consumed: the final attempt only. A retry that was
-    /// replaced is not something the user received.
-    UserFinalAttempt,
-    /// What this key caused upstream: every attempt that reached the provider,
-    /// retries included. This is the number that explains provider-side load.
-    KeyTriggeredConfirmedDispatch,
-}
-
 /// The scope of one query. Constructed per request, always with an owner.
 #[derive(Clone, Debug)]
 pub struct UsageScope {
     pub owner_user_id: String,
     /// Narrow to a single API key, when asked.
     pub api_key_id: Option<String>,
+    /// Narrow the request list to the model captured on the request.
+    pub client_model: Option<String>,
+    /// Narrow the request list to the group captured on the request.
+    pub group_label: Option<String>,
     pub range: TimeRange,
-    pub basis: AttributionBasis,
-}
-
-/// Bucket width for a series.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SeriesBucket {
-    Hour,
-    Day,
-}
-
-impl SeriesBucket {
-    #[must_use]
-    pub const fn width_ms(self) -> i64 {
-        match self {
-            Self::Hour => 60 * 60 * 1000,
-            Self::Day => 24 * 60 * 60 * 1000,
-        }
-    }
 }
 
 /// Token sums over a scope.
-///
-/// Only known numbers are summed. `attempts_with_unknown_input` says how many
-/// attempts contributed nothing to `effective_input` because the provider did not
-/// report it — the count that stops a sum from being read as complete.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TokenTotals {
-    pub uncached_input: u64,
     pub cache_read_input: u64,
-    pub cache_write_input: u64,
     pub effective_input: u64,
     pub output: u64,
-    pub reasoning: u64,
-    pub attempts_with_unknown_input: u64,
 }
 
-/// Cache behaviour over a scope, following the contract's three dimensions.
+/// Cache token totals over a scope.
 ///
-/// `hits + misses` counts only attempts that actually reported a cache read;
-/// `expected_but_unreported` is the rest of the denominator, and is not a miss.
+/// The denominator includes only attempts that reported both effective input
+/// and cache-read tokens. Missing cache detail is unknown, never a zero-token
+/// miss. This makes the displayed rate a token ratio rather than the share of
+/// requests that happened to contain any cache hit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheTotals {
-    /// Attempts where the contract supports caching, the request was eligible,
-    /// and a report was expected. Only these can have a meaningful hit rate.
-    pub coverage_denominator: u64,
-    pub hits: u64,
-    pub misses: u64,
-    /// In the denominator, but the provider reported no cache read.
-    pub expected_but_unreported: u64,
-    /// Outside the denominator: unsupported, ineligible, or not expected.
-    pub excluded: u64,
+    pub reported_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
-/// Cost over a scope, split by how trustworthy each part is.
+/// Cost over attempts that were fully priced from the observed catalog.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CostTotals {
-    /// Sum over attempts whose estimate covered every observed component.
-    pub complete_atoms: UsdAtoms,
-    pub complete_attempts: u64,
-    /// Sum of the *known* part of partial estimates, kept apart from
-    /// `complete_atoms` so a partial number is never read as a complete one.
-    pub partial_known_atoms: UsdAtoms,
-    pub partial_attempts: u64,
-    /// Attempts with no amount at all. Never rendered as `$0`.
-    pub unavailable_attempts: u64,
+    pub atoms: Option<UsdAtoms>,
 }
 
 /// Everything an overview shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageOverview {
-    /// When this snapshot was read. Explains concurrent differences; it is not a
-    /// token that can be replayed for a consistent historical read.
-    pub as_of_ms: i64,
     pub logical_requests: u64,
-    pub attempts: u64,
     pub tokens: TokenTotals,
     pub cache: CacheTotals,
-    pub cost: CostTotals,
-    /// Known bookkeeping losses overlapping the range. Their facts are missing
-    /// from every number above, and saying so is the only honest option.
-    pub tracking_gaps: u64,
-}
-
-/// One bucket of a series.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UsageBucket {
-    pub bucket_start_ms: i64,
-    pub logical_requests: u64,
-    pub attempts: u64,
-    pub tokens: TokenTotals,
     pub cost: CostTotals,
 }
 
@@ -170,12 +103,13 @@ pub struct UsageBucket {
 pub struct RequestSummary {
     pub request_id: String,
     pub api_key_id: Option<String>,
+    pub api_key_label: Option<String>,
+    pub api_key_group_label: Option<String>,
     pub client_model_raw: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,
-    pub completed_at_ms: Option<i64>,
-    pub status: LogicalStatus,
-    pub tracking: TrackingState,
-    pub attempts: u64,
+    pub completed_at_ms: i64,
+    pub first_token_at_ms: Option<i64>,
     pub tokens: TokenTotals,
     pub cost: CostTotals,
 }
@@ -198,21 +132,24 @@ pub struct RequestPage {
     pub next: Option<RequestCursor>,
 }
 
-/// Largest page a caller may ask for. Also caps how many keys a summary returns:
-/// a bound that a real key list never reaches, but that keeps one query's cost
-/// predictable.
+/// Largest page a caller may ask for.
 pub const MAX_PAGE_SIZE: u32 = 200;
 
-/// One API key's totals over a scope.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeySummary {
-    /// `None` for requests recorded without a key, which the API keeps distinct
-    /// from a key literally named "none".
-    pub api_key_id: Option<String>,
-    pub logical_requests: u64,
-    pub attempts: u64,
-    pub tokens: TokenTotals,
-    pub cost: CostTotals,
+pub struct UsageFilterOptions {
+    pub client_models: Vec<String>,
+    pub group_labels: Vec<String>,
+}
+
+/// Actual terminal outcomes for requests whose final attempt used one Provider
+/// account. Shared Provider health intentionally aggregates across owners; the
+/// management layer authorizes which visible account ids may be requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderHealthSummary {
+    pub account_id: String,
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
 }
 
 #[async_trait]
@@ -220,22 +157,20 @@ pub trait UsageQuery: Send + Sync {
     /// Totals over the scope.
     async fn overview(&self, scope: &UsageScope) -> Result<UsageOverview, UsageRepositoryError>;
 
-    /// The same totals per UTC bucket. Empty buckets are omitted rather than
-    /// returned as zeroes: nothing happened is not the same as nothing recorded.
-    async fn series(
+    /// Distinct request-list filter values over the complete time range.
+    async fn filter_options(
         &self,
         scope: &UsageScope,
-        bucket: SeriesBucket,
-    ) -> Result<Vec<UsageBucket>, UsageRepositoryError>;
+    ) -> Result<UsageFilterOptions, UsageRepositoryError>;
 
-    /// Totals per API key, busiest first.
-    ///
-    /// Capped at [`MAX_PAGE_SIZE`] keys; the cap is reported by the caller rather
-    /// than silently hiding the rest.
-    async fn key_summaries(
+    /// Actual terminal outcomes for visible Provider accounts over a recent
+    /// window. This is intentionally not owner-scoped because a shared
+    /// Provider's operational health must include all internal users.
+    async fn provider_health(
         &self,
-        scope: &UsageScope,
-    ) -> Result<Vec<KeySummary>, UsageRepositoryError>;
+        account_ids: &[String],
+        range: TimeRange,
+    ) -> Result<Vec<ProviderHealthSummary>, UsageRepositoryError>;
 
     /// One page of requests, newest first.
     async fn requests(
@@ -245,13 +180,13 @@ pub trait UsageQuery: Send + Sync {
         limit: u32,
     ) -> Result<RequestPage, UsageRepositoryError>;
 
-    /// One request's attempts, or `None` when it does not exist *for this owner* —
-    /// the two are deliberately indistinguishable to the caller.
-    async fn request_attempts(
+    /// One request's final attempt, or `None` when it does not exist for this
+    /// owner. The two are deliberately indistinguishable to the caller.
+    async fn request_attempt(
         &self,
         scope: &UsageScope,
         request_id: &str,
-    ) -> Result<Option<Vec<crate::repository::AttemptFacts>>, UsageRepositoryError>;
+    ) -> Result<Option<crate::repository::AttemptFacts>, UsageRepositoryError>;
 }
 
 /// Recombine a cost sum that SQL had to split to stay exact.

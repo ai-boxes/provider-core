@@ -1,27 +1,32 @@
 use std::{error::Error, sync::Arc};
 
 use provider_auth::{ApiKeyAuthenticator, AuthService};
-use provider_core::{AccountRepository, ProviderControl, ProxyService};
+use provider_core::{
+    AccountRepository, ProviderControl, ProviderManagementRepository, ProxyService,
+};
 use provider_drivers::{
     anthropic_compatible::AnthropicCompatibleDriver, codex::CodexDriver, grok::GrokDriver,
     openai_compatible::OpenAiCompatibleDriver,
 };
-use provider_management::{ModelCatalogService, ProviderManager};
+use provider_management::ProviderManager;
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{InstanceGuard, SqliteAccountRepository};
 use provider_usage::{
-    CatalogPrices, CatalogRefresher, DEFAULT_REFRESH_PERIOD, DEFAULT_RETENTION,
-    DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, RetentionWorker, UsageRepository, UsageTracking,
-    UsageWriter, system_clock_ms,
+    CatalogPrices, CatalogRefresher, DEFAULT_QUOTA_QUEUE, DEFAULT_REFRESH_PERIOD,
+    DEFAULT_RETENTION, DEFAULT_RETENTION_PERIOD, DEFAULT_WRITE_QUEUE, QuotaLedgerWriter,
+    RefreshOutcome, RetentionWorker, UsageRepository, UsageTracking, UsageWriter, system_clock_ms,
 };
 use tokio::net::TcpListener;
 
 use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
-    config::{CATALOG_SYNC_ENV, DATABASE_PATH, LISTEN_ADDRESS, catalog_sync_enabled},
-    router_with_management_and_usage,
+    config::{
+        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address,
+        provider_credential_key, trusted_proxy_ip,
+    },
+    http::{ManagementRouterConfig, ProxyReadiness, router_with_management_usage_and_readiness},
 };
 
 /// How long shutdown waits for queued usage facts before giving up on them.
@@ -33,52 +38,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // process is the only one using it. Held until the process exits.
     let _instance = InstanceGuard::acquire(DATABASE_PATH)?;
 
-    let repository = Arc::new(SqliteAccountRepository::connect(DATABASE_PATH).await?);
-    let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
-    runtime.register_driver(Arc::new(GrokDriver::new()))?;
-    runtime.register_driver(Arc::new(CodexDriver::new()))?;
-    runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
-    runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
-    let model_catalog = ModelCatalogService::new(repository.clone());
-    for account in repository.load_enabled_accounts().await? {
-        let kind = account.provider;
-        let access = account.access();
-        let account = runtime.build_account(account)?;
-        let models = model_catalog
-            .refresh(account.as_ref(), unix_timestamp())
-            .await?;
-        if let Some(warning) = models.warning.as_deref() {
-            eprintln!(
-                "provider model discovery used {:?} catalog for account {}: {warning}",
-                models.source,
-                account.account_id()
-            );
-        }
-        runtime
-            .activate_account(kind, account, models.models, access)
-            .await?;
-    }
-
-    let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
-    let auth = AuthService::new(repository.clone());
-    let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
-
-    // Usage facts share the accounts database. Anything a previous run left in
-    // flight has no knowable terminal, so it is closed as incomplete with a gap
-    // before this run records anything new.
+    let repository = Arc::new(
+        SqliteAccountRepository::connect(DATABASE_PATH, provider_credential_key()?).await?,
+    );
     let usage_repository = Arc::new(repository.usage_repository());
-    let recovered = usage_repository
-        .recover_in_flight_requests(unix_timestamp() * 1000)
-        .await?;
-    if recovered > 0 {
-        eprintln!("closed {recovered} usage request(s) left in flight by a previous run");
-    }
-    let writer = Arc::new(UsageWriter::spawn(
-        usage_repository.clone(),
-        DEFAULT_WRITE_QUEUE,
-    ));
-    // Price from whatever catalog is already stored before any fetch, so a
-    // restart does not lose cost estimates while it waits for the network.
     let prices = Arc::new(CatalogPrices::new());
     let refresher = Arc::new(CatalogRefresher::new(
         usage_repository.clone(),
@@ -86,16 +49,76 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         prices.clone(),
         system_clock_ms,
     ));
-    match refresher.install_stored().await {
+    let stored_catalog = refresher.install_stored().await;
+    match stored_catalog.as_deref() {
         Some(revision) => println!("price catalog {} loaded from storage", &revision[..12]),
-        None => println!("no stored price catalog yet; costs stay unavailable until one loads"),
-    }
-    if catalog_sync_enabled() {
-        tokio::spawn(Arc::clone(&refresher).run(DEFAULT_REFRESH_PERIOD));
-    } else {
-        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
+        None if catalog_sync_enabled() => {
+            let outcome = refresher.refresh_once().await;
+            println!("initial price catalog refresh: {outcome:?}");
+        }
+        None => println!("no stored price catalog; model prices remain unconfigured"),
     }
 
+    let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+    runtime.register_driver(Arc::new(GrokDriver::new()))?;
+    runtime.register_driver(Arc::new(CodexDriver::new()))?;
+    runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
+    runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
+    let proxy_readiness = ProxyReadiness::new(true);
+    runtime.bind_recovery_readiness(proxy_readiness.signal());
+    for account in repository.load_enabled_accounts().await? {
+        let account_id = account.id.clone();
+        let kind = account.provider;
+        let access = account.access();
+        let account = match runtime.build_account(account) {
+            Ok(account) => account,
+            Err(error) => {
+                eprintln!("failed to build provider account {account_id}: {error}");
+                runtime.mark_recovery_failed(account_id);
+                continue;
+            }
+        };
+        let models = match repository.list_provider_models(Some(&account_id)).await {
+            Ok(models) => models,
+            Err(error) => {
+                eprintln!(
+                    "failed to load persisted models for provider account {account_id}: {error}"
+                );
+                runtime.mark_recovery_failed(account_id);
+                continue;
+            }
+        };
+        runtime.install_account(kind, account, models, access).await;
+    }
+
+    let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+    let auth = AuthService::new(repository.clone());
+
+    // Usage facts share the accounts database. A prior run's unresolved quota
+    // reservations are released because no terminal cost can be invented.
+    let recovered_quota = usage_repository
+        .recover_quota_reservations(system_clock_ms())
+        .await?;
+    if recovered_quota > 0 {
+        eprintln!("released {recovered_quota} unresolved quota reservation(s)");
+    }
+    let recovered = usage_repository
+        .recover_in_flight_requests(unix_timestamp() * 1000)
+        .await?;
+    if recovered > 0 {
+        eprintln!(
+            "discarded {recovered} usage request(s) left in flight and recorded tracking gaps"
+        );
+    }
+    let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
+    let writer = Arc::new(UsageWriter::spawn(
+        usage_repository.clone(),
+        DEFAULT_WRITE_QUEUE,
+    ));
+    let quota_writer = Arc::new(QuotaLedgerWriter::spawn(
+        usage_repository.clone(),
+        DEFAULT_QUOTA_QUEUE,
+    ));
     // Raw facts expire on their own so the database does not grow without bound.
     // In-flight requests are never touched, and each cycle deletes in small
     // batches rather than one long transaction.
@@ -110,31 +133,82 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     tokio::spawn(retention.run(DEFAULT_RETENTION_PERIOD));
 
     let usage = UsageServices {
-        tracking: Arc::new(UsageTracking::new(
+        tracking: Arc::new(UsageTracking::with_quota_writer(
             usage_repository.clone(),
             writer.clone(),
-            prices.clone(),
+            quota_writer.clone(),
         )),
-        query: usage_repository.clone(),
-        repository: usage_repository,
-        catalog: prices,
-        writer: writer.clone(),
+        query: usage_repository,
     };
 
-    let manager = ProviderManager::new(repository, runtime.clone());
-    let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
+    let manager = ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices);
+    if catalog_sync_enabled() {
+        let refresher = Arc::clone(&refresher);
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
+            loop {
+                ticker.tick().await;
+                if refresher.refresh_once().await == RefreshOutcome::Installed
+                    && let Err(error) = manager
+                        .refresh_enabled_model_catalogs(unix_timestamp())
+                        .await
+                {
+                    eprintln!("failed to apply refreshed prices to routed models: {error}");
+                }
+            }
+        });
+    } else {
+        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
+    }
+    let listen_address = listen_address();
+    let listener = TcpListener::bind(&listen_address).await?;
 
-    println!("provider-core listening on http://{LISTEN_ADDRESS}");
+    println!("provider-core listening on http://{listen_address}");
     let result = axum::serve(
         listener,
-        router_with_management_and_usage(service, manager, auth, api_keys, Some(usage)),
+        router_with_management_usage_and_readiness(
+            service,
+            manager,
+            auth,
+            api_keys,
+            ManagementRouterConfig {
+                usage: Some(usage),
+                trusted_proxy_ip: trusted_proxy_ip()?,
+                proxy_readiness,
+            },
+        )
+        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await;
     runtime.shutdown();
+    if !quota_writer.drain().await {
+        return Err("quota ledger writer stopped before shutdown drain completed".into());
+    }
     // Best-effort: a slow database must not hold up shutdown.
     writer.drain(USAGE_DRAIN).await;
     result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must install");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("Ctrl-C handler must install");
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Ctrl-C handler must install");
 }
 
 fn unix_timestamp() -> i64 {

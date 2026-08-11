@@ -49,10 +49,15 @@ pub struct LogicalRequestStart {
     pub request_id: String,
     pub owner_user_id: String,
     pub api_key_id: Option<String>,
+    /// API key identity at request time. These are snapshots, not lookups.
+    pub api_key_label: Option<String>,
+    pub api_key_group_label: Option<String>,
     /// The model string the client sent, before any alias resolution.
     pub client_model_raw: Option<String>,
     /// The model the router selected.
     pub routing_model: Option<String>,
+    /// The reasoning level requested by the client, when one was supplied.
+    pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,
 }
 
@@ -101,15 +106,30 @@ pub struct AttemptFacts {
     /// The model the provider said it used, when it said anything.
     pub provider_reported_model: Option<String>,
     pub started_at_ms: i64,
+    /// When the first output token was observed on the upstream stream.
+    pub first_token_at_ms: Option<i64>,
     pub completed_at_ms: i64,
     pub dispatch_evidence: DispatchEvidence,
     pub tracking: TrackingState,
     pub contract: UsageContractSnapshot,
     pub observation: ProviderUsageObservation,
-    /// Resolved at attempt time from the in-memory catalog snapshot and stored
-    /// inline, so this attempt's cost never depends on the current catalog.
+    /// Frozen from the routed provider model at attempt start and stored inline,
+    /// so this attempt's cost never depends on later model-price changes.
     pub price: PriceResolution,
     pub cost: ObservedCatalogCost,
+}
+
+/// Terminal result for a legacy pre-dispatch quota reservation.
+/// Only an observed exact cost is settled; an absent cost releases the
+/// reservation without inventing spend. New finite-quota traffic charges via
+/// attempt completion instead of creating reservations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaLedgerEntry {
+    pub entry_id: String,
+    pub api_key_id: String,
+    pub dispatched: bool,
+    pub cost_atoms: Option<String>,
+    pub resolved_at_ms: i64,
 }
 
 /// The stored models.dev catalog. Exactly one is kept; an absent row means the
@@ -139,6 +159,10 @@ pub trait UsageRepository: Send + Sync {
     ) -> Result<LogicalWriteOutcome, UsageRepositoryError>;
 
     /// Persist a logical request's terminal state.
+    ///
+    /// Operational outcomes are retained even when they are not user-visible
+    /// Usage. Read queries apply the Usage eligibility contract separately;
+    /// quota settlement remains independent.
     async fn complete_logical_request(
         &self,
         terminal: &LogicalRequestTerminal,
@@ -146,8 +170,20 @@ pub trait UsageRepository: Send + Sync {
 
     /// Persist one attempt. Re-submitting the same `attempt_id` is a no-op; a
     /// *different* attempt claiming an already-used sequence is an error,
-    /// because that would silently duplicate upstream usage.
+    /// because that would silently duplicate upstream usage. Observed complete
+    /// costs advance lifetime key spend unless a legacy reservation still owns
+    /// that request's settlement.
     async fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), UsageRepositoryError>;
+
+    /// Persist a legacy quota-reservation terminal and update lifetime spend.
+    async fn record_quota_ledger_entry(
+        &self,
+        entry: &QuotaLedgerEntry,
+    ) -> Result<(), UsageRepositoryError>;
+
+    /// Release every reservation left by a prior process. Without terminal
+    /// usage facts, restart recovery cannot invent a billable amount.
+    async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError>;
 
     /// Add `count` lost facts to a bucket, creating it if needed. Counting rather
     /// than inserting per loss is what keeps a saturated writer from turning
@@ -175,6 +211,14 @@ pub trait UsageRepository: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<AttemptFacts>, UsageRepositoryError>;
 
+    /// Delete up to `batch` settled or released quota-ledger entries resolved
+    /// before `cutoff_ms`. Active reservations are never eligible.
+    async fn delete_resolved_quota_ledger_entries_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError>;
+
     /// Delete up to `batch` finished logical requests that ended before
     /// `cutoff_ms`, together with everything belonging to them.
     ///
@@ -187,7 +231,7 @@ pub trait UsageRepository: Send + Sync {
         batch: u32,
     ) -> Result<u64, UsageRepositoryError>;
 
-    /// Delete up to `batch` tracking-gap buckets that started before `cutoff_ms`.
+    /// Delete up to `batch` tracking-gap buckets that end at or before `cutoff_ms`.
     async fn delete_tracking_gaps_before(
         &self,
         cutoff_ms: i64,

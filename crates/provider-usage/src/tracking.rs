@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use provider_core::{
-    ProviderKind,
+    ProviderKind, ProviderModelPricingRecord,
     usage::{
         AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
         RequestTracking, UsageContractSnapshot, normalize_usage,
@@ -27,77 +27,78 @@ use provider_core::{
 
 use crate::{
     attempt::{AttemptSequence, DispatchEvidence, TrackingGapReason, TrackingState},
-    cost::{ObservedCatalogCost, compute_observed_catalog_cost},
+    catalog::{component_prices_from_model_pricing, context_price_tiers_from_model_pricing},
+    cost::{CostStatus, ObservedCatalogCost, compute_observed_catalog_cost},
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
-    price::PriceResolution,
+    price::{InlinePriceRecord, ModelInlinePriceRecordV2, PriceResolution},
     repository::{
         AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
         UsageRepository,
     },
-    writer::{UsageFact, UsageWrite, UsageWriter},
+    writer::{
+        QuotaLedgerPermit, QuotaLedgerReceipt, QuotaLedgerWriter, UsageFact, UsageWrite,
+        UsageWriter,
+    },
 };
 
 /// Wall-clock source. A function pointer rather than a trait object: the only
 /// thing needed is "now in unix milliseconds", and tests want to pin it.
 pub type ClockMs = fn() -> i64;
 
-/// Reads the system clock, saturating rather than panicking on an absurd value.
+/// Reads the system clock as unix milliseconds.
 #[must_use]
 pub fn system_clock_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(i64::MAX)
-}
-
-/// Supplies the price for a model from the catalog snapshot held right now.
-///
-/// A separate trait so the catalog can land later without touching attempt
-/// tracking: until it does, [`NoCatalog`] reports the honest answer.
-pub trait PriceResolver: Send + Sync {
-    fn resolve(&self, provider: ProviderKind, configured_model: Option<&str>) -> PriceResolution;
-}
-
-/// No catalog is loaded, so nothing can be priced. Costs come out `unavailable`
-/// with a reason — never as `$0`.
-pub struct NoCatalog;
-
-impl PriceResolver for NoCatalog {
-    fn resolve(&self, _provider: ProviderKind, _configured_model: Option<&str>) -> PriceResolution {
-        PriceResolution::CatalogUnavailable
-    }
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("unix timestamp must fit i64")
 }
 
 /// Entry point held by the server and the runtime.
 pub struct UsageTracking {
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
-    prices: Arc<dyn PriceResolver>,
+    quota_writer: Option<Arc<QuotaLedgerWriter>>,
     now_ms: ClockMs,
 }
 
 impl UsageTracking {
     #[must_use]
-    pub fn new(
+    pub fn new(repository: Arc<dyn UsageRepository>, writer: Arc<UsageWriter>) -> Self {
+        Self::with_clock_and_quota_writer(repository, writer, None, system_clock_ms)
+    }
+
+    #[must_use]
+    pub fn with_quota_writer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
+        quota_writer: Arc<QuotaLedgerWriter>,
     ) -> Self {
-        Self::with_clock(repository, writer, prices, system_clock_ms)
+        Self::with_clock_and_quota_writer(repository, writer, Some(quota_writer), system_clock_ms)
     }
 
     #[must_use]
     pub fn with_clock(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
-        prices: Arc<dyn PriceResolver>,
+        now_ms: ClockMs,
+    ) -> Self {
+        Self::with_clock_and_quota_writer(repository, writer, None, now_ms)
+    }
+
+    #[must_use]
+    fn with_clock_and_quota_writer(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        quota_writer: Option<Arc<QuotaLedgerWriter>>,
         now_ms: ClockMs,
     ) -> Self {
         Self {
             repository,
             writer,
-            prices,
+            quota_writer,
             now_ms,
         }
     }
@@ -119,7 +120,7 @@ impl UsageTracking {
         Arc::new(LogicalTracker {
             start,
             writer: Arc::clone(&self.writer),
-            prices: Arc::clone(&self.prices),
+            quota_writer: self.quota_writer.clone(),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
                 start_gap,
@@ -129,9 +130,20 @@ impl UsageTracking {
                 final_attempt_execution: None,
                 execution: None,
                 delivery: None,
+                quota_permit: None,
+                quota_atoms: 0,
+                quota_dispatched: false,
+                quota_cost_unknown: false,
                 finished: false,
             }),
         })
+    }
+
+    #[must_use]
+    pub fn quota_ledger_ready(&self) -> bool {
+        self.quota_writer
+            .as_ref()
+            .is_none_or(|writer| writer.is_ready())
     }
 }
 
@@ -158,13 +170,17 @@ struct LogicalState {
     final_attempt_execution: Option<ExecutionOutcome>,
     execution: Option<ExecutionOutcome>,
     delivery: Option<DeliveryOutcome>,
+    quota_permit: Option<QuotaLedgerPermit>,
+    quota_atoms: i128,
+    quota_dispatched: bool,
+    quota_cost_unknown: bool,
     finished: bool,
 }
 
 pub struct LogicalTracker {
     start: LogicalRequestStart,
     writer: Arc<UsageWriter>,
-    prices: Arc<dyn PriceResolver>,
+    quota_writer: Option<Arc<QuotaLedgerWriter>>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
 }
@@ -185,6 +201,23 @@ impl LogicalTracker {
     #[must_use]
     pub fn request_tracking(self: &Arc<Self>) -> Arc<dyn RequestTracking> {
         Arc::new(RequestTrackingHandle(Arc::clone(self)))
+    }
+
+    /// Reserve bounded quota-ledger capacity before dispatch. Holding the permit
+    /// makes the eventual terminal enqueue infallible, including on client drop.
+    pub async fn reserve_quota_settlement(&self) -> Result<(), ()> {
+        let Some(writer) = self.quota_writer.as_ref() else {
+            return Ok(());
+        };
+        let permit = writer.reserve().await.ok_or(())?;
+        self.lock().quota_permit = Some(permit);
+        Ok(())
+    }
+
+    /// Drop unused writer capacity when the durable admission transaction finds
+    /// that the key became unlimited before the reservation was committed.
+    pub fn cancel_quota_settlement(&self) {
+        self.lock().quota_permit = None;
     }
 
     /// Allocate the next attempt. Nothing is persisted yet; an attempt is written
@@ -209,6 +242,7 @@ impl LogicalTracker {
                 evidence: DispatchEvidence::NotInvoked,
                 raw_usage: None,
                 provider_reported_model: None,
+                first_token_at_ms: None,
                 tracking: TrackingState::Complete,
                 success_terminal: false,
                 closed: false,
@@ -238,11 +272,11 @@ impl LogicalTracker {
     ///
     /// Safe to call from both the normal end of a response and a drop; only the
     /// first call writes.
-    pub fn finish(&self) {
-        let terminal = {
+    pub fn finish(&self) -> Option<QuotaLedgerReceipt> {
+        let (terminal, quota) = {
             let mut state = self.lock();
             if state.finished {
-                return;
+                return None;
             }
             state.finished = true;
 
@@ -254,7 +288,7 @@ impl LogicalTracker {
                 .or(state.final_attempt_execution)
                 .unwrap_or(ExecutionOutcome::EofWithoutSuccessTerminal);
             let delivery = state.delivery.unwrap_or(DeliveryOutcome::Unknown);
-            LogicalRequestTerminal {
+            let terminal = LogicalRequestTerminal {
                 request_id: self.start.request_id.clone(),
                 completed_at_ms: (self.now_ms)(),
                 status: merge_logical_terminal(execution, delivery),
@@ -267,14 +301,33 @@ impl LogicalTracker {
                 },
                 // The start row is version 0, so any terminal is newer.
                 state_version: 1,
-            }
+            };
+            let quota = state.quota_permit.take().map(|permit| {
+                let entry = crate::repository::QuotaLedgerEntry {
+                    entry_id: self.start.request_id.clone(),
+                    api_key_id: self
+                        .start
+                        .api_key_id
+                        .clone()
+                        .expect("a reserved quota entry must belong to an API key"),
+                    dispatched: state.quota_dispatched,
+                    cost_atoms: (state.quota_dispatched && !state.quota_cost_unknown)
+                        .then(|| state.quota_atoms.to_string()),
+                    resolved_at_ms: terminal.completed_at_ms,
+                };
+                (permit, entry)
+            });
+            (terminal, quota)
         };
+
+        let receipt = quota.map(|(permit, entry)| permit.submit(entry));
 
         self.writer.submit(UsageWrite {
             owner_user_id: self.start.owner_user_id.clone(),
             at_ms: terminal.completed_at_ms,
             fact: UsageFact::LogicalTerminal(terminal),
         });
+        receipt
     }
 
     /// The highest-numbered attempt is the one the user's response came from, so
@@ -297,6 +350,28 @@ impl LogicalTracker {
         }
     }
 
+    fn note_quota_result(&self, facts: &AttemptFacts) {
+        let mut state = self.lock();
+        if !facts.dispatch_evidence.is_confirmed_dispatch() {
+            return;
+        }
+        state.quota_dispatched = true;
+        if matches!(
+            facts.cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        ) {
+            match state
+                .quota_atoms
+                .checked_add(facts.cost.total_known.as_atoms())
+            {
+                Some(total) => state.quota_atoms = total,
+                None => state.quota_cost_unknown = true,
+            }
+        } else {
+            state.quota_cost_unknown = true;
+        }
+    }
+
     /// A poisoned lock must not take down a proxy request, so recover the guard
     /// and keep going: worst case a fact is slightly stale, which is a gap-level
     /// concern, not a reason to fail a response.
@@ -311,6 +386,7 @@ struct AttemptState {
     /// usage, which is unknown rather than zero.
     raw_usage: Option<Option<RawUsageFields>>,
     provider_reported_model: Option<String>,
+    first_token_at_ms: Option<i64>,
     tracking: TrackingState,
     /// Whether the upstream stream reached its documented successful terminal.
     success_terminal: bool,
@@ -350,6 +426,16 @@ impl AttemptTracker {
         }
     }
 
+    /// Record the first output token only once. The observer calls this while
+    /// the response is still flowing, so the timestamp is measured before the
+    /// terminal usage write rather than reconstructed from completion time.
+    pub fn first_token_observed(&self) {
+        let mut state = self.lock();
+        if state.first_token_at_ms.is_none() {
+            state.first_token_at_ms = Some((self.logical.now_ms)());
+        }
+    }
+
     /// The response could not be inspected, so its usage was never seen.
     ///
     /// Without this the attempt would store "the provider reported no usage",
@@ -360,6 +446,21 @@ impl AttemptTracker {
         state.tracking = TrackingState::Gap {
             reason: TrackingGapReason::ObservationLost,
         };
+    }
+
+    pub fn cancel(&self, raw: Option<RawUsageFields>) {
+        {
+            let mut state = self.lock();
+            if state.raw_usage.is_none() {
+                state.raw_usage = Some(raw);
+            }
+            if matches!(state.tracking, TrackingState::Complete) {
+                state.tracking = TrackingState::Gap {
+                    reason: TrackingGapReason::AmbiguousCancel,
+                };
+            }
+        }
+        self.close();
     }
 
     /// What this attempt proved about the upstream side.
@@ -391,6 +492,7 @@ impl AttemptTracker {
             let mut observation =
                 normalize_usage(state.raw_usage.take().flatten(), &self.spec.contract);
             if model_disagrees(
+                self.spec.provider,
                 self.spec.configured_model.as_deref(),
                 state.provider_reported_model.as_deref(),
             ) && !observation
@@ -424,6 +526,7 @@ impl AttemptTracker {
                 configured_model: self.spec.configured_model.clone(),
                 provider_reported_model: state.provider_reported_model.clone(),
                 started_at_ms: self.started_at_ms,
+                first_token_at_ms: state.first_token_at_ms,
                 completed_at_ms: (self.logical.now_ms)(),
                 dispatch_evidence: state.evidence,
                 tracking: state.tracking,
@@ -437,6 +540,7 @@ impl AttemptTracker {
 
         self.logical
             .note_final_attempt(&self.attempt_id, self.sequence, execution);
+        self.logical.note_quota_result(&facts);
         self.logical.writer.submit(UsageWrite {
             owner_user_id: self.logical.start.owner_user_id.clone(),
             at_ms: facts.completed_at_ms,
@@ -492,11 +596,9 @@ impl RequestTracking for RequestTrackingHandle {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing: Option<&ProviderModelPricingRecord>,
     ) -> Option<Arc<dyn AttemptTracking>> {
-        // Resolved now, from the catalog snapshot held at this moment, and
-        // carried with the attempt: completion must never re-read "current"
-        // prices, or a catalog refresh would silently rewrite history.
-        let price = self.0.prices.resolve(profile.provider, configured_model);
+        let price = model_price_resolution(pricing);
         Some(self.0.open_attempt(AttemptSpec {
             provider: profile.provider,
             account_id: account_id.to_owned(),
@@ -507,10 +609,34 @@ impl RequestTracking for RequestTrackingHandle {
     }
 }
 
+fn model_price_resolution(pricing: Option<&ProviderModelPricingRecord>) -> PriceResolution {
+    let Some(pricing) = pricing else {
+        return PriceResolution::ModelMappingMissing;
+    };
+    let Some(prices) = component_prices_from_model_pricing(&pricing.pricing) else {
+        return PriceResolution::CatalogEntryInvalid;
+    };
+    let Some(tiers) = context_price_tiers_from_model_pricing(&pricing.pricing) else {
+        return PriceResolution::CatalogEntryInvalid;
+    };
+    PriceResolution::Resolved(Box::new(InlinePriceRecord::ModelV2(
+        ModelInlinePriceRecordV2 {
+            format_version: 2,
+            source: pricing.source,
+            prices,
+            tiers,
+        },
+    )))
+}
+
 impl AttemptTracking for AttemptTracker {
     fn stream_opened(&self) {
         // A stream to read is proof the provider answered.
         self.advance(DispatchEvidence::ResponseObserved);
+    }
+
+    fn first_token_observed(&self) {
+        AttemptTracker::first_token_observed(self);
     }
 
     fn success_terminal_observed(&self) {
@@ -528,6 +654,10 @@ impl AttemptTracking for AttemptTracker {
     fn finished(&self, fields: Option<RawUsageFields>) {
         self.record_usage(fields);
         self.close();
+    }
+
+    fn cancelled(&self, fields: Option<RawUsageFields>) {
+        self.cancel(fields);
     }
 
     fn failed(&self, answered: bool) {
@@ -559,11 +689,47 @@ impl AttemptTracking for AttemptTracker {
 /// Trimmed on both sides because drivers trim the model before sending it, so
 /// whitespace a client happened to include is not a disagreement. An unnamed
 /// model on either side is an absence, not a disagreement.
-fn model_disagrees(configured: Option<&str>, reported: Option<&str>) -> bool {
+fn model_disagrees(
+    provider: ProviderKind,
+    configured: Option<&str>,
+    reported: Option<&str>,
+) -> bool {
     matches!(
         (configured, reported),
-        (Some(configured), Some(reported)) if configured.trim() != reported.trim()
+        (Some(configured), Some(reported))
+            if !reported_model_matches(provider, configured.trim(), reported.trim())
     )
+}
+
+fn reported_model_matches(provider: ProviderKind, configured: &str, reported: &str) -> bool {
+    configured == reported
+        || (matches!(provider, ProviderKind::Grok)
+            && reported.strip_suffix("-build") == Some(configured))
+}
+
+#[cfg(test)]
+mod reported_model_tests {
+    use super::reported_model_matches;
+    use provider_core::ProviderKind;
+
+    #[test]
+    fn grok_build_suffix_is_the_same_reported_model() {
+        assert!(reported_model_matches(
+            ProviderKind::Grok,
+            "grok-4.5",
+            "grok-4.5-build",
+        ));
+        assert!(!reported_model_matches(
+            ProviderKind::Codex,
+            "gpt-5",
+            "gpt-5-build",
+        ));
+        assert!(!reported_model_matches(
+            ProviderKind::Grok,
+            "grok-4.5",
+            "grok-4.5-mini-build",
+        ));
+    }
 }
 
 const fn rank(evidence: DispatchEvidence) -> u8 {
@@ -588,7 +754,7 @@ mod tests {
         attempt::LogicalStatus,
         cost::{CostReason, CostStatus},
         money::{PRICE_SCALE, UnitPrice},
-        price::{ComponentPrices, InlinePriceRecord},
+        price::{CatalogInlinePriceRecordV1, ComponentPrices, InlinePriceRecord},
         writer::DEFAULT_WRITE_QUEUE,
     };
 
@@ -611,6 +777,7 @@ mod tests {
                 reasoning_applicable: true,
                 audio_applicable: false,
                 cache_write_applicable: false,
+                missing_cache_read_means_zero: false,
                 total_source: TotalSource::Reported,
             },
             cache_capability: CacheCapability::Supported,
@@ -623,23 +790,26 @@ mod tests {
 
     fn priced() -> PriceResolution {
         let per_million = 10i128.pow(PRICE_SCALE);
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "a".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(per_million)),
-                cache_read_per_million: Some(UnitPrice::from_scaled(per_million / 10)),
-                output_per_million: Some(UnitPrice::from_scaled(10 * per_million)),
-                ..ComponentPrices::default()
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "a".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 1,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(per_million)),
+                    cache_read_per_million: Some(UnitPrice::from_scaled(per_million / 10)),
+                    output_per_million: Some(UnitPrice::from_scaled(10 * per_million)),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
             },
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }))
+        )))
     }
 
     fn spec(price: PriceResolution) -> AttemptSpec {
@@ -657,8 +827,11 @@ mod tests {
             request_id: request_id.to_owned(),
             owner_user_id: "user-1".to_owned(),
             api_key_id: Some("key-1".to_owned()),
+            api_key_label: None,
+            api_key_group_label: None,
             client_model_raw: Some("gpt-5-codex".to_owned()),
             routing_model: Some("gpt-5-codex".to_owned()),
+            reasoning_effort: None,
             started_at_ms: 1_700_000_000_000,
         }
     }
@@ -688,12 +861,7 @@ mod tests {
     async fn harness() -> Harness {
         let repository = Arc::new(crate::tests_support::TestRepository::default());
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
-        let tracking = UsageTracking::with_clock(
-            repository.clone(),
-            writer.clone(),
-            Arc::new(NoCatalog),
-            ticking_clock,
-        );
+        let tracking = UsageTracking::with_clock(repository.clone(), writer.clone(), ticking_clock);
         Harness {
             tracking,
             writer,
@@ -733,6 +901,39 @@ mod tests {
             facts.cost.total_known.to_decimal_string(),
             "0.00011000000000"
         );
+    }
+
+    #[tokio::test]
+    async fn client_drop_with_partial_cost_releases_the_reservation() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
+        let tracking = UsageTracking::with_clock_and_quota_writer(
+            repository.clone(),
+            writer,
+            Some(quota_writer),
+            ticking_clock,
+        );
+        let logical = tracking.begin_request(start("req-client-drop")).await;
+        logical
+            .reserve_quota_settlement()
+            .await
+            .expect("quota permit");
+
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.record_provider_model("gpt-4o-mini");
+        attempt.finished(Some(codex_usage()));
+        logical.record_delivery(DeliveryOutcome::ClientDrop);
+
+        let receipt = logical.finish().expect("quota receipt");
+        assert!(receipt.persisted().await);
+        let entries = repository.quota_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_id, "req-client-drop");
+        assert_eq!(entries[0].api_key_id, "key-1");
+        assert!(entries[0].dispatched);
+        assert_eq!(entries[0].cost_atoms, None);
     }
 
     #[tokio::test]
@@ -884,12 +1085,7 @@ mod tests {
             ..crate::tests_support::TestRepository::default()
         });
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
-        let tracking = UsageTracking::with_clock(
-            repository.clone(),
-            writer.clone(),
-            Arc::new(NoCatalog),
-            ticking_clock,
-        );
+        let tracking = UsageTracking::with_clock(repository.clone(), writer.clone(), ticking_clock);
 
         // begin_request must not fail: statistics never block a proxy request.
         let logical = tracking.begin_request(start("req-1")).await;

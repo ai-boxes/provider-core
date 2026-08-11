@@ -1,10 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::StreamExt;
 use provider_core::{
-    ProviderKind, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaSnapshot, QuotaAmount,
-    QuotaBreakdown, QuotaGroup, QuotaGroupAudience, QuotaGroupScope, QuotaMetric, QuotaMetricKind,
-    QuotaPeriod, QuotaPeriodKind, QuotaUnit,
+    BoundedBodyError, ProviderKind, ProviderQuotaError, ProviderQuotaErrorKind,
+    ProviderQuotaSnapshot, QuotaAmount, QuotaBreakdown, QuotaGroup, QuotaGroupAudience,
+    QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod, QuotaPeriodKind, QuotaUnit,
+    collect_bounded_body,
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -18,6 +18,8 @@ use super::{
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 const USER_TIMEOUT: Duration = Duration::from_secs(10);
 const BILLING_TIMEOUT: Duration = Duration::from_secs(15);
+const BILLING_TRANSPORT_ATTEMPTS: usize = 5;
+const BILLING_RETRY_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Clone)]
 pub(crate) struct GrokQuotaClient {
@@ -68,16 +70,30 @@ impl GrokQuotaClient {
         credentials: &GrokCredentials,
         user_id: &str,
     ) -> Result<ProviderQuotaSnapshot, ProviderQuotaError> {
-        let response = session_headers(
-            self.http
-                .get(format!("{}/billing?format=credits", self.base_url))
-                .bearer_auth(credentials.access_token().expose_secret()),
-        )
-        .header("x-userid", user_id)
-        .timeout(BILLING_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| upstream_error("Grok billing request failed"))?;
+        let mut attempt = 1;
+        let response = loop {
+            match session_headers(
+                self.http
+                    .get(format!("{}/billing?format=credits", self.base_url))
+                    .bearer_auth(credentials.access_token().expose_secret()),
+            )
+            .header("x-userid", user_id)
+            .timeout(BILLING_TIMEOUT)
+            .send()
+            .await
+            {
+                Ok(received) => break received,
+                Err(error) if attempt < BILLING_TRANSPORT_ATTEMPTS => {
+                    eprintln!("Grok billing transport attempt {attempt} failed: {error}");
+                    attempt += 1;
+                    tokio::time::sleep(BILLING_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    eprintln!("Grok billing transport failed: {error}");
+                    return Err(upstream_error("Grok billing request failed"));
+                }
+            }
+        };
         let response: BillingResponse = response_json(response, "Grok billing").await?;
         normalize_billing(account_id, response)
     }
@@ -319,19 +335,17 @@ async fn response_json<T: for<'de> Deserialize<'de>>(
     if !status.is_success() {
         return Err(status_error(operation, status));
     }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| upstream_error(format!("failed to read {operation} response")))?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
-            return Err(ProviderQuotaError::new(
+    let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => {
+                upstream_error(format!("failed to read {operation} response"))
+            }
+            BoundedBodyError::TooLarge => ProviderQuotaError::new(
                 ProviderQuotaErrorKind::InvalidResponse,
                 format!("{operation} response was too large"),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
+            ),
+        })?;
     serde_json::from_slice(&body).map_err(|_| {
         ProviderQuotaError::new(
             ProviderQuotaErrorKind::InvalidResponse,

@@ -8,6 +8,7 @@
 //! another owner's usage.
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     future::IntoFuture,
     sync::{
@@ -17,6 +18,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -25,24 +27,27 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-use provider_auth::{ApiKeyAuthenticator, AuthService};
+use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
 use provider_core::{
-    ProviderKind, ProviderVisibility, ProxyService,
-    usage::{TokenMetric, TokenUnknownReason},
+    AccountId, ProviderError, ProviderKind, ProviderModel, ProviderModelPricingSource,
+    ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
+    ProviderVisibility, ProxyService, RoutableProviderModel, WireFormat,
+    usage::{ProviderUsageProfile, RequestTracking, TokenMetric, TokenUnknownReason},
 };
 use provider_drivers::codex::CodexDriver;
-use provider_management::ProviderManager;
-use provider_protocol::DefaultProtocolBridge;
+use provider_management::{CredentialProviderAccountInput, ProviderManager};
+use provider_protocol::{DefaultProtocolBridge, observe_chat_completions_usage};
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, CostReason, CostStatus, DEFAULT_WRITE_QUEUE, DeliveryOutcome,
-    DispatchEvidence, ExecutionOutcome, LogicalStatus, NoCatalog, PriceResolution, RefreshOutcome,
-    TrackingState, UsageRepository, UsageTracking, UsageWriter, content_revision,
+    DispatchEvidence, ExecutionOutcome, LogicalStatus, PriceResolution, RefreshOutcome,
+    TrackingGapReason, TrackingState, UsageRepository, UsageTracking, UsageWriter,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
 
 /// A Codex `response.completed` reporting input and output but no cache details
 /// and no total, which is exactly the shape that must not become zeroes. It names
@@ -52,6 +57,10 @@ const COMPLETED_STREAM: &[u8] = b"event: response.completed\ndata: {\"type\":\"r
 /// The shape Codex actually sends: the cached portion of the input is broken out,
 /// which is what makes the two input rates separable.
 const COMPLETED_WITH_CACHE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":8,\"total_tokens\":128}}}\n\n";
+
+const INCOMPLETE_WITH_USAGE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
+
+const CHAT_LENGTH_WITH_USAGE: &[u8] = b"data: {\"id\":\"chat_1\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
 
 const PARTIAL_STREAM: &[u8] =
     b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
@@ -64,6 +73,8 @@ struct Upstream {
     with_cache_details: bool,
     /// Send one content event and then wait, so a test can disconnect mid-stream.
     stall_after_chunk: bool,
+    /// End with positive usage but an explicitly unsuccessful Responses terminal.
+    incomplete_with_usage: bool,
     calls: Arc<AtomicUsize>,
 }
 
@@ -89,7 +100,9 @@ async fn responses(State(state): State<Upstream>, _request: Request) -> Response
             .body(Body::from_stream(body))
             .expect("partial stream response");
     }
-    let stream = if state.with_cache_details {
+    let stream = if state.incomplete_with_usage {
+        INCOMPLETE_WITH_USAGE
+    } else if state.with_cache_details {
         COMPLETED_WITH_CACHE
     } else {
         COMPLETED_STREAM
@@ -126,6 +139,82 @@ struct Harness {
     upstream_calls: Arc<AtomicUsize>,
 }
 
+struct ChatLengthRouter;
+
+#[async_trait]
+impl ProviderRoute for ChatLengthRouter {
+    fn provider_name(&self) -> &'static str {
+        "openai_compatible"
+    }
+
+    fn native_format(&self) -> WireFormat {
+        WireFormat::OpenAiChatCompletions
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::OpenAiCompatible,
+            contract: provider_drivers::openai_compatible::openai_compatible_usage_contract(),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn RequestTracking>>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let attempt = tracking
+            .zip(self.usage_profile())
+            .and_then(|(tracking, profile)| {
+                tracking.begin_attempt(profile, "chat-account", Some(&request.model), pricing)
+            });
+        let upstream: ProviderStream = Box::pin(stream::iter([Ok(Bytes::from_static(
+            CHAT_LENGTH_WITH_USAGE,
+        ))]));
+        let Some(attempt) = attempt else {
+            return Ok(upstream);
+        };
+        attempt.stream_opened();
+        Ok(observe_chat_completions_usage(upstream, attempt))
+    }
+
+    async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
+        Ok(1)
+    }
+}
+
+impl ProviderRouter for ChatLengthRouter {
+    fn models(
+        &self,
+        _user_id: &str,
+        _account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel> {
+        vec![RoutableProviderModel {
+            model: ProviderModel::new("gpt-5.5", "openai_compatible"),
+            native_formats: vec![WireFormat::OpenAiChatCompletions],
+        }]
+    }
+
+    fn routes(
+        &self,
+        _user_id: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        _session_id: Option<&str>,
+        _account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<ProviderRouteCandidate> {
+        if model != "gpt-5.5" || !native_formats.contains(&WireFormat::OpenAiChatCompletions) {
+            return Vec::new();
+        }
+        vec![ProviderRouteCandidate {
+            upstream_model: model.to_owned(),
+            pricing: None,
+            route: Arc::new(Self),
+        }]
+    }
+}
+
 /// Everything below the HTTP router: storage, runtime, one Codex account and one
 /// API key. Tests compose their own tracking on top so they can choose how prices
 /// are resolved.
@@ -135,6 +224,8 @@ struct Deployment {
     api_key: String,
     auth: AuthService,
     manager: ProviderManager,
+    owner_user_id: String,
+    account_id: AccountId,
     usage: Arc<SqliteUsageRepository>,
     writer: Arc<UsageWriter>,
 }
@@ -144,10 +235,19 @@ async fn harness(always_unauthorized: bool) -> Harness {
 }
 
 async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool) -> Harness {
+    harness_with_terminal(always_unauthorized, stall_after_chunk, false).await
+}
+
+async fn harness_with_terminal(
+    always_unauthorized: bool,
+    stall_after_chunk: bool,
+    incomplete_with_usage: bool,
+) -> Harness {
     let upstream_state = Upstream {
         always_unauthorized,
         with_cache_details: false,
         stall_after_chunk,
+        incomplete_with_usage,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_calls = upstream_state.calls.clone();
@@ -164,7 +264,6 @@ async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        Arc::new(NoCatalog),
     ));
     let server_url = spawn(provider_server::router_with_usage(
         deployment.service.clone(),
@@ -182,7 +281,45 @@ async fn harness_with_options(always_unauthorized: bool, stall_after_chunk: bool
     }
 }
 
+async fn chat_length_harness() -> Harness {
+    let upstream_url = spawn(
+        Router::new()
+            .route("/codex/models", get(models))
+            .route("/codex/responses", post(responses))
+            .route("/oauth/token", post(refresh))
+            .with_state(Upstream::default()),
+    )
+    .await;
+    let deployment = deployment(&upstream_url).await;
+    let tracking = Arc::new(UsageTracking::new(
+        deployment.usage.clone(),
+        deployment.writer.clone(),
+    ));
+    let service =
+        ProxyService::with_router(Arc::new(ChatLengthRouter), Arc::new(DefaultProtocolBridge));
+    let server_url = spawn(provider_server::router_with_usage(
+        service,
+        deployment.api_keys,
+        Some(tracking),
+    ))
+    .await;
+    Harness {
+        server_url,
+        api_key: deployment.api_key,
+        usage: deployment.usage,
+        writer: deployment.writer,
+        upstream_calls: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
 async fn deployment(upstream_url: &str) -> Deployment {
+    deployment_with_pricing(upstream_url, None).await
+}
+
+async fn deployment_with_pricing(
+    upstream_url: &str,
+    pricing: Option<Arc<CatalogPrices>>,
+) -> Deployment {
     let repository = Arc::new(
         SqliteAccountRepository::in_memory()
             .await
@@ -203,40 +340,51 @@ async fn deployment(upstream_url: &str) -> Deployment {
     runtime
         .register_driver(CodexDriver::for_test(upstream_url, upstream_url))
         .expect("register Codex driver");
-    let manager = ProviderManager::new(repository.clone(), runtime.clone());
-    manager
+    let manager = match pricing {
+        Some(pricing) => ProviderManager::with_model_pricing_catalog(
+            repository.clone(),
+            runtime.clone(),
+            pricing,
+        ),
+        None => ProviderManager::new(repository.clone(), runtime.clone()),
+    };
+    let created_account = manager
         .create_credential_account(
             grant.user.id.as_str(),
-            ProviderKind::Codex,
-            "Codex".to_owned(),
-            SecretString::from(
-                json!({
-                    "type": "codex",
-                    "auth_kind": "oauth",
-                    "access_token": "old-access",
-                    "refresh_token": "old-refresh",
-                    "id_token": "e30.e30.sig",
-                    "last_refreshed_at": now
-                })
-                .to_string(),
-            ),
-            ProviderVisibility::Private,
+            CredentialProviderAccountInput {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_owned(),
+                group_label: "default".to_owned(),
+                credential_json: SecretString::from(
+                    json!({
+                        "type": "codex",
+                        "auth_kind": "oauth",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "id_token": "e30.e30.sig",
+                        "last_refreshed_at": now
+                    })
+                    .to_string(),
+                ),
+                visibility: ProviderVisibility::Private,
+            },
             now,
         )
         .await
         .expect("create Codex account");
-
     let api_keys = ApiKeyAuthenticator::load(repository.clone())
         .await
         .expect("API key index");
     let created_key = api_keys
-        .create(
-            &grant.user.id,
-            "test".to_owned(),
-            Some(SecretString::from("test-api-key-123".to_owned())),
-            None,
+        .create(CreateApiKeyInput {
+            owner_user_id: &grant.user.id,
+            secret: SecretString::from("test-api-key"),
+            group_label: "default".to_owned(),
+            label: "test".to_owned(),
+            expires_at: None,
+            quota_limit_usd: None,
             now,
-        )
+        })
         .await
         .expect("create API key");
 
@@ -250,6 +398,8 @@ async fn deployment(upstream_url: &str) -> Deployment {
         api_key: created_key.key.expose_secret().to_owned(),
         auth,
         manager,
+        owner_user_id: grant.user.id.as_str().to_owned(),
+        account_id: created_account.account.id,
         usage,
         writer,
     }
@@ -365,10 +515,92 @@ async fn a_successful_response_records_what_the_provider_actually_reported() {
         "an unreported total stays unreported rather than being invented"
     );
 
-    // No catalog is loaded yet, so the cost is honestly unavailable, not $0.
-    assert_eq!(attempt.price, PriceResolution::CatalogUnavailable);
+    // The selected provider model has no saved price, so the cost is honestly
+    // unavailable rather than falling back to a request-time catalog lookup.
+    assert_eq!(attempt.price, PriceResolution::ModelMappingMissing);
     assert_eq!(attempt.cost.status, CostStatus::Unavailable);
-    assert_eq!(attempt.cost.reasons, vec![CostReason::CatalogUnavailable]);
+    assert_eq!(attempt.cost.reasons, vec![CostReason::ModelMappingMissing]);
+}
+
+#[tokio::test]
+async fn an_incomplete_response_with_positive_usage_is_retained_as_an_outcome() {
+    let harness = harness_with_terminal(false, false, true).await;
+    let body = harness
+        .post_responses()
+        .await
+        .text()
+        .await
+        .expect("response body");
+    assert!(
+        body.contains("response.incomplete"),
+        "the proxy response is unchanged"
+    );
+
+    assert!(harness.writer.drain(Duration::from_secs(10)).await);
+    let request_id = harness
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("incomplete operational outcome retained");
+    let stored = harness
+        .usage
+        .load_logical_request(&request_id)
+        .await
+        .expect("load logical")
+        .expect("logical present");
+    assert_eq!(stored.status, LogicalStatus::Incomplete);
+}
+
+#[tokio::test]
+async fn chat_length_translated_to_response_incomplete_is_retained_as_an_outcome() {
+    let harness = chat_length_harness().await;
+    let body = harness
+        .post_responses()
+        .await
+        .text()
+        .await
+        .expect("response body");
+    assert!(
+        body.contains("response.incomplete"),
+        "the Chat length terminal must remain incomplete after Responses translation"
+    );
+
+    assert!(harness.writer.drain(Duration::from_secs(10)).await);
+    let request_id = harness
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("incomplete operational outcome retained");
+    let stored = harness
+        .usage
+        .load_logical_request(&request_id)
+        .await
+        .expect("load logical")
+        .expect("logical present");
+    assert_eq!(stored.status, LogicalStatus::Incomplete);
+
+    let attempts = harness
+        .usage
+        .load_attempts(&request_id)
+        .await
+        .expect("load attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].observation.cache_read_input_tokens,
+        TokenMetric::DerivedFromReported {
+            value: 0,
+            rule_version: 2,
+        }
+    );
+    assert_eq!(
+        attempts[0].observation.uncached_input_tokens,
+        TokenMetric::DerivedFromReported {
+            value: 2,
+            rule_version: 2,
+        }
+    );
 }
 
 #[tokio::test]
@@ -460,6 +692,12 @@ async fn a_client_drop_closes_the_attempt_before_the_logical_request() {
         stored.final_attempt_id.as_deref(),
         Some(attempts[0].attempt_id.as_str()),
         "the attempt must close before logical terminal snapshots final_attempt_id"
+    );
+    assert_eq!(
+        attempts[0].tracking,
+        TrackingState::Gap {
+            reason: TrackingGapReason::AmbiguousCancel,
+        }
     );
 }
 
@@ -555,6 +793,7 @@ async fn a_priced_response_records_an_exact_cost() {
         always_unauthorized: false,
         with_cache_details: true,
         stall_after_chunk: false,
+        incomplete_with_usage: false,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
@@ -567,10 +806,11 @@ async fn a_priced_response_records_an_exact_cost() {
     )
     .await;
 
-    let deployment = deployment(&upstream_url).await;
-
-    // Refresh from the mock catalog, then confirm it is what prices requests.
     let prices = Arc::new(CatalogPrices::new());
+    let deployment = deployment_with_pricing(&upstream_url, Some(prices.clone())).await;
+
+    // Refresh from the mock catalog, then refresh the provider model so the
+    // exact-id price is saved and loaded into runtime before the request.
     let refresher = CatalogRefresher::new(
         deployment.usage.clone(),
         Arc::new(
@@ -581,11 +821,19 @@ async fn a_priced_response_records_an_exact_cost() {
         provider_usage::system_clock_ms,
     );
     assert_eq!(refresher.refresh_once().await, RefreshOutcome::Installed);
+    deployment
+        .manager
+        .refresh_models(
+            &deployment.owner_user_id,
+            &deployment.account_id,
+            unix_timestamp(),
+        )
+        .await
+        .expect("refresh provider models with catalog pricing");
 
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        prices,
     ));
     let server_url = spawn(provider_server::router_with_usage(
         deployment.service.clone(),
@@ -638,8 +886,9 @@ async fn a_priced_response_records_an_exact_cost() {
     );
 
     let record = attempt.price.resolved().expect("prices were resolved");
-    assert_eq!(record.catalog_model_id, "gpt-5.5");
-    assert_eq!(record.catalog_revision, content_revision(CATALOG_BODY));
+    assert_eq!(record.source(), Some(ProviderModelPricingSource::Catalog));
+    assert_eq!(record.catalog_model_id(), None);
+    assert_eq!(record.catalog_revision(), None);
 
     // 20 @ $1.25/M + 100 @ $0.125/M + 8 @ $10/M = $0.0001175 exactly.
     //
@@ -658,30 +907,30 @@ async fn a_priced_response_records_an_exact_cost() {
     );
 }
 
-/// Log in and return the access token, so the usage endpoints can be called the
-/// way a dashboard calls them.
+/// Log in and return the cookie header used by the management UI.
 async fn login(server_url: &str, username: &str, password: &str) -> String {
-    let text = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/auth/login"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": username, "password": password }).to_string())
         .send()
         .await
-        .expect("login request")
-        .text()
-        .await
-        .expect("login body");
-    let body: Value = serde_json::from_str(&text).expect("login json");
-    body["data"]["access_token"]
-        .as_str()
-        .expect("access token")
+        .expect("login request");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| value.starts_with("pode_session="))
+        .expect("session cookie")
         .to_owned()
 }
 
-async fn get_usage(server_url: &str, token: &str, path: &str) -> (StatusCode, Value) {
+async fn get_usage(server_url: &str, cookie: &str, path: &str) -> (StatusCode, Value) {
     let response = reqwest::Client::new()
         .get(format!("{server_url}{path}"))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, cookie)
         .send()
         .await
         .expect("usage request");
@@ -699,6 +948,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         always_unauthorized: false,
         with_cache_details: true,
         stall_after_chunk: false,
+        incomplete_with_usage: false,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
@@ -714,14 +964,10 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let tracking = Arc::new(UsageTracking::new(
         deployment.usage.clone(),
         deployment.writer.clone(),
-        Arc::new(NoCatalog),
     ));
     let services = provider_server::UsageServices {
         tracking,
         query: deployment.usage.clone(),
-        repository: deployment.usage.clone(),
-        catalog: Arc::new(CatalogPrices::new()),
-        writer: deployment.writer.clone(),
     };
     let server_url = spawn(provider_server::router_with_management_and_usage(
         deployment.service.clone(),
@@ -729,6 +975,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         deployment.auth.clone(),
         deployment.api_keys.clone(),
         Some(services),
+        None,
     ))
     .await;
 
@@ -743,25 +990,19 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .expect("proxy request");
     assert!(deployment.writer.drain(Duration::from_secs(10)).await);
 
-    let admin_token = login(&server_url, "admin", "secret").await;
-    let (status, body) = get_usage(&server_url, &admin_token, "/api/v1/usage/overview").await;
+    let admin_cookie = login(&server_url, "admin", "secret").await;
+    let (status, body) = get_usage(&server_url, &admin_cookie, "/api/v1/usage/overview").await;
     assert_eq!(status, StatusCode::OK);
     let overview = &body["data"];
     assert_eq!(overview["logical_requests"], 1);
-    assert_eq!(overview["attempts"], 1);
     assert_eq!(overview["tokens"]["effective_input"], 120);
     assert_eq!(overview["tokens"]["cache_read_input"], 100);
-    assert_eq!(overview["attribution_basis"], "user_final_attempt");
-    // No catalog in this deployment, so nothing is priced and nothing pretends to
-    // be zero: the amount is a separate, explicitly unavailable count.
-    assert_eq!(overview["cost"]["unavailable_attempts"], 1);
-    assert_eq!(overview["cost"]["complete_attempts"], 0);
-    assert_eq!(overview["tracking_gaps"], 0);
+    assert!(overview["cost"]["usd"].is_null());
 
     // A second user with no usage of their own sees nothing, not the admin's.
     let created_text = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/users"))
-        .bearer_auth(&admin_token)
+        .header(reqwest::header::COOKIE, &admin_cookie)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": "other", "password": "other-secret" }).to_string())
         .send()
@@ -776,14 +1017,13 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         "second user was created: {created}"
     );
 
-    let other_token = login(&server_url, "other", "other-secret").await;
-    let (status, body) = get_usage(&server_url, &other_token, "/api/v1/usage/overview").await;
+    let other_cookie = login(&server_url, "other", "other-secret").await;
+    let (status, body) = get_usage(&server_url, &other_cookie, "/api/v1/usage/overview").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["data"]["logical_requests"], 0,
         "another user's usage must be invisible"
     );
-    assert_eq!(body["data"]["attempts"], 0);
 
     // And the admin's own request is not readable by id either.
     let request_id = deployment
@@ -794,7 +1034,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .expect("a request was recorded");
     let (status, _) = get_usage(
         &server_url,
-        &other_token,
+        &other_cookie,
         &format!("/api/v1/usage/requests/{request_id}"),
     )
     .await;
@@ -806,30 +1046,17 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
 
     let (status, body) = get_usage(
         &server_url,
-        &admin_token,
+        &admin_cookie,
         &format!("/api/v1/usage/requests/{request_id}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let attempt = &body["data"]["attempts"][0];
-    assert_eq!(attempt["dispatch_evidence"], "response_observed");
-    assert_eq!(attempt["provider"], "codex");
-    // The metric kinds travel to the client, so it can tell a zero from an absence.
-    assert_eq!(
-        attempt["tokens"]["effective_input"]["kind"],
-        "provider_reported"
-    );
-    assert_eq!(attempt["tokens"]["effective_input"]["value"], 120);
-    assert_eq!(
-        attempt["tokens"]["cache_write_input"]["kind"],
-        "not_applicable"
-    );
-    assert_eq!(attempt["cost"]["status"], "unavailable");
+    let attempt = &body["data"]["attempt"];
     assert!(
         attempt["cost"]["usd"].is_null(),
         "an unavailable cost is absent, never 0"
     );
-    assert_eq!(attempt["price"]["resolution"], "catalog_unavailable");
+    assert!(attempt["price"]["input_per_million_usd"].is_null());
 }
 
 #[tokio::test]
@@ -847,12 +1074,8 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         tracking: Arc::new(UsageTracking::new(
             deployment.usage.clone(),
             deployment.writer.clone(),
-            Arc::new(NoCatalog),
         )),
         query: deployment.usage.clone(),
-        repository: deployment.usage.clone(),
-        catalog: Arc::new(CatalogPrices::new()),
-        writer: deployment.writer.clone(),
     };
     let server_url = spawn(provider_server::router_with_management_and_usage(
         deployment.service.clone(),
@@ -860,6 +1083,7 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         deployment.auth.clone(),
         deployment.api_keys.clone(),
         Some(services),
+        None,
     ))
     .await;
 
@@ -884,12 +1108,12 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         "a proxy key must not read the dashboard"
     );
 
-    let token = login(&server_url, "admin", "secret").await;
+    let cookie = login(&server_url, "admin", "secret").await;
 
     // A range wider than retention is refused rather than silently truncated.
     let (status, body) = get_usage(
         &server_url,
-        &token,
+        &cookie,
         "/api/v1/usage/overview?from_ms=0&to_ms=99999999999999",
     )
     .await;
@@ -898,25 +1122,52 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
 
     let (status, _) = get_usage(
         &server_url,
-        &token,
+        &cookie,
         "/api/v1/usage/overview?from_ms=100&to_ms=100",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty range is refused");
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/overview?basis=whatever").await;
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/overview?unknown=1").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown fields are refused"
+    );
+
+    let (status, _) = get_usage(
+        &server_url,
+        &cookie,
+        "/api/v1/usage/series?bucket=fortnight",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "removed usage APIs stay removed"
+    );
+
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/requests?limit=10").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "page size is server-owned");
+
+    for filter in ["api_key_id", "model", "group"] {
+        let path = format!("/api/v1/usage/requests?{filter}=%20");
+        let (status, _) = get_usage(&server_url, &cookie, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty {filter} is refused");
+    }
+
+    let (status, _) = get_usage(
+        &server_url,
+        &cookie,
+        "/api/v1/usage/requests?cursor=garbage",
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/series?bucket=fortnight").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    let (status, _) = get_usage(&server_url, &token, "/api/v1/usage/requests?cursor=garbage").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    // Health reports the catalog as inactive rather than omitting the question.
-    let (status, body) = get_usage(&server_url, &token, "/api/v1/usage/health").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["catalog"]["pricing_active"], false);
-    assert!(body["data"]["catalog"]["revision"].is_null());
-    assert_eq!(body["data"]["writer"]["unrecorded_facts"], 0);
+    let (status, _) = get_usage(&server_url, &cookie, "/api/v1/usage/health").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "removed usage APIs stay removed"
+    );
 }

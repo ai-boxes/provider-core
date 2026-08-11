@@ -8,11 +8,14 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::{
-    ApiKeyId, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey, CredentialError,
-    InitialUserCreateOutcome, NewApiKey, NewSession, NewUser, RefreshSessionOutcome, SessionId,
-    StoredApiKey, UserId, UserRole, UserSummary, digest_secret, hash_password, issue_api_key,
-    issue_session_tokens, rotate_session_tokens, verify_password,
+    ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey,
+    CredentialError, InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
+    QuotaAdmissionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
+    UserId, UserRole, UserSummary, digest_secret, hash_password, issue_registration_code,
+    issue_session, parse_quota_limit_usd, verify_password,
 };
+
+pub const REGISTRATION_CODE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -21,10 +24,13 @@ pub struct AuthService {
 
 pub struct SessionGrant {
     pub user: UserSummary,
-    pub access_token: SecretString,
-    pub refresh_token: SecretString,
-    pub access_expires_at: i64,
-    pub refresh_expires_at: i64,
+    pub session_token: SecretString,
+    pub expires_at: i64,
+}
+
+pub struct CreatedRegistrationCode {
+    pub code: SecretString,
+    pub expires_at: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +43,19 @@ pub struct AuthenticatedSession {
 pub struct AuthenticatedApiKey {
     pub key_id: ApiKeyId,
     pub owner_user_id: UserId,
+    pub label: String,
+    pub group_label: String,
+    pub quota_limit_atoms: Option<String>,
+}
+
+pub struct CreateApiKeyInput<'a> {
+    pub owner_user_id: &'a UserId,
+    pub secret: SecretString,
+    pub group_label: String,
+    pub label: String,
+    pub expires_at: Option<i64>,
+    pub quota_limit_usd: Option<String>,
+    pub now: i64,
 }
 
 impl AuthService {
@@ -66,41 +85,21 @@ impl AuthService {
             enabled: true,
             created_at: now,
         };
-        let tokens = issue_session_tokens(now)?;
-        if self
-            .repository
-            .create_initial_user(
-                user,
-                NewSession {
-                    id: SessionId::random(),
-                    user_id: user_id.clone(),
-                    access_token_hash: tokens.access.digest,
-                    refresh_token_hash: tokens.refresh.digest,
-                    access_expires_at: tokens.access_expires_at,
-                    refresh_expires_at: tokens.refresh_expires_at,
-                    absolute_expires_at: tokens.absolute_expires_at,
-                    created_at: now,
-                },
-            )
-            .await?
+        let user_summary = UserSummary {
+            id: user_id.clone(),
+            username,
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let (session, grant) = new_session_grant(user_summary, now)?;
+        if self.repository.create_initial_user(user, session).await?
             != InitialUserCreateOutcome::Created
         {
             return Err(AuthError::AlreadyConfigured);
         }
-        Ok(SessionGrant {
-            user: UserSummary {
-                id: user_id,
-                username,
-                role: UserRole::SuperAdmin,
-                enabled: true,
-                created_at: now,
-                updated_at: now,
-            },
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
+        Ok(grant)
     }
 
     pub async fn login(
@@ -121,20 +120,19 @@ impl AuthService {
         self.create_session(user_summary(&user), now).await
     }
 
-    pub async fn authenticate_access(
+    pub async fn authenticate_session(
         &self,
-        access_token: &str,
+        session_token: &str,
         now: i64,
     ) -> Result<AuthenticatedSession, AuthError> {
-        let digest = digest_secret(access_token);
+        let digest = digest_secret(session_token);
         let session = self
             .repository
-            .load_session_by_access_hash(&digest)
+            .load_session_by_token_hash(&digest)
             .await?
-            .ok_or(AuthError::InvalidAccessToken)?;
-        if session.revoked_at.is_some() || session.access_expires_at <= now || !session.user.enabled
-        {
-            return Err(AuthError::InvalidAccessToken);
+            .ok_or(AuthError::InvalidSession)?;
+        if session.revoked_at.is_some() || session.expires_at <= now || !session.user.enabled {
+            return Err(AuthError::InvalidSession);
         }
         Ok(AuthenticatedSession {
             session_id: session.id,
@@ -142,52 +140,9 @@ impl AuthService {
         })
     }
 
-    pub async fn refresh(&self, refresh_token: &str, now: i64) -> Result<SessionGrant, AuthError> {
-        let digest = digest_secret(refresh_token);
-        let session = self
-            .repository
-            .load_session_by_refresh_hash(&digest)
-            .await?
-            .ok_or(AuthError::InvalidRefreshToken)?;
-        if session.revoked_at.is_some()
-            || session.refresh_expires_at <= now
-            || session.absolute_expires_at <= now
-            || !session.user.enabled
-        {
-            return Err(AuthError::InvalidRefreshToken);
-        }
-        let tokens = rotate_session_tokens(now, session.absolute_expires_at)?;
-        let outcome = self
-            .repository
-            .rotate_session(
-                &digest,
-                tokens.access.digest,
-                tokens.refresh.digest,
-                tokens.access_expires_at,
-                tokens.refresh_expires_at,
-                now,
-            )
-            .await?;
-        if outcome != RefreshSessionOutcome::Updated {
-            return Err(AuthError::InvalidRefreshToken);
-        }
-        Ok(SessionGrant {
-            user: session.user,
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
-    }
-
-    pub async fn logout(&self, access_token: &str, now: i64) -> Result<(), AuthError> {
-        let session = self.authenticate_access(access_token, now).await?;
-        self.logout_session(&session.session_id, now).await
-    }
-
     pub async fn logout_session(&self, session_id: &SessionId, now: i64) -> Result<(), AuthError> {
         if !self.repository.revoke_session(session_id, now).await? {
-            return Err(AuthError::InvalidAccessToken);
+            return Err(AuthError::InvalidSession);
         }
         Ok(())
     }
@@ -205,27 +160,62 @@ impl AuthService {
         now: i64,
     ) -> Result<UserSummary, AuthError> {
         require_super_admin(actor)?;
-        let username = normalize_username(username)?;
-        let password_hash = password_hash(password).await?;
-        let user = NewUser {
-            id: UserId::random(),
-            username: username.clone(),
-            password_hash,
-            role: UserRole::User,
-            enabled: true,
-            created_at: now,
-        };
+        let user = new_standard_user(username, password, now).await?;
         if !self.repository.create_user(user.clone()).await? {
             return Err(AuthError::Conflict);
         }
-        Ok(UserSummary {
-            id: user.id,
-            username,
-            role: UserRole::User,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
+        Ok(new_user_summary(user))
+    }
+
+    pub async fn create_registration_code(
+        &self,
+        actor: &UserSummary,
+        now: i64,
+    ) -> Result<CreatedRegistrationCode, AuthError> {
+        require_super_admin(actor)?;
+        let issued = issue_registration_code()?;
+        let expires_at = now
+            .checked_add(REGISTRATION_CODE_TTL_SECONDS)
+            .ok_or(CredentialError::TimestampOutOfRange)?;
+        self.repository
+            .create_registration_code(NewRegistrationCode {
+                code_hash: issued.digest,
+                expires_at,
+            })
+            .await?;
+        Ok(CreatedRegistrationCode {
+            code: issued.secret,
+            expires_at,
         })
+    }
+
+    pub async fn register_user(
+        &self,
+        code: &str,
+        username: String,
+        password: SecretString,
+        now: i64,
+    ) -> Result<SessionGrant, AuthError> {
+        let code = normalize_registration_code(code)?;
+        let code_hash = digest_secret(code);
+        if !self
+            .repository
+            .registration_code_valid(&code_hash, now)
+            .await?
+        {
+            return Err(AuthError::InvalidRegistrationCode);
+        }
+        let user = new_standard_user(username, password, now).await?;
+        let (session, grant) = new_session_grant(new_user_summary(user.clone()), now)?;
+        match self
+            .repository
+            .register_user(&code_hash, user, session, now)
+            .await?
+        {
+            RegisterUserOutcome::Created => Ok(grant),
+            RegisterUserOutcome::InvalidCode => Err(AuthError::InvalidRegistrationCode),
+            RegisterUserOutcome::Conflict => Err(AuthError::Conflict),
+        }
     }
 
     pub async fn set_user_enabled(
@@ -265,12 +255,11 @@ impl AuthService {
         let password_hash = password_hash(password).await?;
         if !self
             .repository
-            .update_user_password(user_id, password_hash, now)
+            .reset_user_password(user_id, password_hash, now)
             .await?
         {
             return Err(AuthError::NotFound);
         }
-        self.repository.revoke_user_sessions(user_id, now).await?;
         let user = self
             .repository
             .load_user(user_id)
@@ -280,27 +269,27 @@ impl AuthService {
     }
 
     async fn create_session(&self, user: UserSummary, now: i64) -> Result<SessionGrant, AuthError> {
-        let tokens = issue_session_tokens(now)?;
-        self.repository
-            .create_session(NewSession {
-                id: SessionId::random(),
-                user_id: user.id.clone(),
-                access_token_hash: tokens.access.digest,
-                refresh_token_hash: tokens.refresh.digest,
-                access_expires_at: tokens.access_expires_at,
-                refresh_expires_at: tokens.refresh_expires_at,
-                absolute_expires_at: tokens.absolute_expires_at,
-                created_at: now,
-            })
-            .await?;
-        Ok(SessionGrant {
-            user,
-            access_token: tokens.access.secret,
-            refresh_token: tokens.refresh.secret,
-            access_expires_at: tokens.access_expires_at,
-            refresh_expires_at: tokens.refresh_expires_at,
-        })
+        let (session, grant) = new_session_grant(user, now)?;
+        self.repository.create_session(session).await?;
+        Ok(grant)
     }
+}
+
+fn new_session_grant(user: UserSummary, now: i64) -> Result<(NewSession, SessionGrant), AuthError> {
+    let issued = issue_session(now)?;
+    let session = NewSession {
+        id: SessionId::random(),
+        user_id: user.id.clone(),
+        token_hash: issued.token.digest,
+        expires_at: issued.expires_at,
+        created_at: now,
+    };
+    let grant = SessionGrant {
+        user,
+        session_token: issued.token.secret,
+        expires_at: issued.expires_at,
+    };
+    Ok((session, grant))
 }
 
 #[derive(Clone)]
@@ -314,6 +303,9 @@ pub struct ApiKeyAuthenticator {
 struct ActiveApiKey {
     id: ApiKeyId,
     owner_user_id: UserId,
+    label: String,
+    group_label: String,
+    quota_limit_atoms: Option<String>,
     expires_at: Option<i64>,
 }
 
@@ -337,43 +329,68 @@ impl ApiKeyAuthenticator {
         Ok(AuthenticatedApiKey {
             key_id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
+            label: key.label.clone(),
+            group_label: key.group_label.clone(),
+            quota_limit_atoms: key.quota_limit_atoms.clone(),
         })
     }
 
-    pub async fn create(
-        &self,
-        owner_user_id: &UserId,
-        label: String,
-        custom: Option<SecretString>,
-        expires_at: Option<i64>,
-        now: i64,
-    ) -> Result<CreatedApiKey, AuthError> {
+    pub async fn create(&self, input: CreateApiKeyInput<'_>) -> Result<CreatedApiKey, AuthError> {
+        let CreateApiKeyInput {
+            owner_user_id,
+            secret,
+            group_label,
+            label,
+            expires_at,
+            quota_limit_usd,
+            now,
+        } = input;
         let label = normalize_label(label)?;
+        let group_label = normalize_group_label(group_label)?;
+        validate_api_key_secret(&secret)?;
         if expires_at.is_some_and(|expires_at| expires_at <= now) {
             return Err(AuthError::InvalidExpiry);
         }
-        let issued = issue_api_key(custom)?;
+        let quota_limit_atoms = match quota_limit_usd {
+            None => None,
+            Some(value) => {
+                Some(parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?)
+            }
+        };
+        let digest = digest_secret(secret.expose_secret());
         let key = NewApiKey {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
+            group_label: group_label.clone(),
             label,
-            key: issued.secret.clone(),
+            key: secret.clone(),
             enabled: true,
             expires_at,
+            quota_limit_atoms: quota_limit_atoms.clone(),
             created_at: now,
         };
         let summary = ApiKeySummary {
             id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
+            group_label: group_label.clone(),
             label: key.label.clone(),
             key: mask_api_key(key.key.expose_secret()),
             enabled: true,
             expires_at,
+            quota_limit_atoms: quota_limit_atoms.clone(),
+            spent_atoms: "0".to_owned(),
             last_used_at: None,
             created_at: now,
             updated_at: now,
         };
         let _mutation = self.mutation.lock().await;
+        let account_ids = self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+            .await?;
+        if account_ids.is_empty() {
+            return Err(AuthError::GroupNotFound);
+        }
         if !self.repository.create_api_key(key.clone()).await? {
             return Err(AuthError::Conflict);
         }
@@ -381,16 +398,19 @@ impl ApiKeyAuthenticator {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
-                issued.digest,
+                digest,
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
+                    label: key.label,
+                    group_label,
+                    quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
             );
         Ok(CreatedApiKey {
             summary,
-            key: issued.secret,
+            key: secret,
         })
     }
 
@@ -419,10 +439,16 @@ impl ApiKeyAuthenticator {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
-        enabled: Option<bool>,
-        expires_at: Option<Option<i64>>,
-        now: i64,
+        patch: ApiKeyPatch,
     ) -> Result<ApiKeySummary, AuthError> {
+        let ApiKeyPatch {
+            label,
+            group_label,
+            enabled,
+            expires_at,
+            quota_limit_usd,
+            updated_at,
+        } = patch;
         let _mutation = self.mutation.lock().await;
         let current = self
             .repository
@@ -431,16 +457,49 @@ impl ApiKeyAuthenticator {
             .ok_or(AuthError::NotFound)?;
         if expires_at
             .flatten()
-            .is_some_and(|expires_at| expires_at <= now)
+            .is_some_and(|expires_at| expires_at <= updated_at)
         {
             return Err(AuthError::InvalidExpiry);
         }
+        let label = match label {
+            Some(value) => normalize_label(value)?,
+            None => current.label.clone(),
+        };
+        let group_label = match group_label {
+            Some(value) => normalize_group_label(value)?,
+            None => current.group_label.clone(),
+        };
+        let quota_limit_atoms = match quota_limit_usd {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(value)) => Some(Some(
+                parse_quota_limit_usd(&value).map_err(|_| AuthError::InvalidQuotaLimit)?,
+            )),
+        };
         let enabled = enabled.unwrap_or(current.enabled);
         let expires_at = expires_at.unwrap_or(current.expires_at);
+        let account_ids = self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+            .await?;
+        if account_ids.is_empty() {
+            return Err(AuthError::GroupNotFound);
+        }
         let removed = self.remove_active(owner_user_id, key_id);
         let updated = match self
             .repository
-            .update_api_key(owner_user_id, key_id, enabled, expires_at, now)
+            .update_api_key(
+                owner_user_id,
+                key_id,
+                StoredApiKeyUpdate {
+                    group_label,
+                    label,
+                    enabled,
+                    expires_at,
+                    quota_limit_atoms,
+                    updated_at,
+                },
+            )
             .await
         {
             Ok(Some(key)) => key,
@@ -462,6 +521,9 @@ impl ApiKeyAuthenticator {
                     ActiveApiKey {
                         id: updated.id.clone(),
                         owner_user_id: updated.owner_user_id.clone(),
+                        label: updated.label.clone(),
+                        group_label: updated.group_label.clone(),
+                        quota_limit_atoms: updated.quota_limit_atoms.clone(),
                         expires_at: updated.expires_at,
                     },
                 );
@@ -485,6 +547,58 @@ impl ApiKeyAuthenticator {
         }
     }
 
+    /// Disable admission before committing the durable user/key revocation.
+    /// Requests that already authenticated keep their cloned identity and may finish.
+    pub async fn set_user_enabled(
+        &self,
+        auth: &AuthService,
+        actor: &UserSummary,
+        user_id: &UserId,
+        enabled: bool,
+        now: i64,
+    ) -> Result<UserSummary, AuthError> {
+        let _mutation = self.mutation.lock().await;
+        let removed = if enabled {
+            Vec::new()
+        } else {
+            self.remove_owner_active(user_id)
+        };
+        match auth.set_user_enabled(actor, user_id, enabled, now).await {
+            Ok(user) => Ok(user),
+            Err(error) => {
+                self.restore_many_active(removed);
+                Err(error)
+            }
+        }
+    }
+
+    /// Soft-admit a finite-quota key when lifetime spent is still under limit.
+    /// Actual USD spend is applied later from observed usage.
+    pub async fn admit_quota(&self, key: &AuthenticatedApiKey) -> Result<(), AuthError> {
+        if key.quota_limit_atoms.is_none() {
+            return Ok(());
+        }
+        match self.repository.admit_api_key_quota(&key.key_id).await? {
+            QuotaAdmissionOutcome::Admitted | QuotaAdmissionOutcome::Unlimited => Ok(()),
+            QuotaAdmissionOutcome::Exceeded => Err(AuthError::QuotaExceeded),
+        }
+    }
+
+    pub async fn account_ids_for_key(
+        &self,
+        owner_user_id: &UserId,
+        group_label: &str,
+    ) -> Result<Vec<String>, AuthError> {
+        Ok(self
+            .repository
+            .list_visible_account_ids_by_group_label(owner_user_id, group_label)
+            .await?)
+    }
+
+    pub async fn quota_ledger_ready(&self) -> Result<(), AuthError> {
+        Ok(self.repository.quota_ledger_ready().await?)
+    }
+
     fn remove_active(
         &self,
         owner_user_id: &UserId,
@@ -505,6 +619,25 @@ impl ApiKeyAuthenticator {
                 .insert(digest, key);
         }
     }
+
+    fn remove_owner_active(&self, owner_user_id: &UserId) -> Vec<([u8; 32], ActiveApiKey)> {
+        let mut active = self.active.write().unwrap_or_else(PoisonError::into_inner);
+        let digests = active
+            .iter()
+            .filter_map(|(digest, key)| (key.owner_user_id == *owner_user_id).then_some(*digest))
+            .collect::<Vec<_>>();
+        digests
+            .into_iter()
+            .filter_map(|digest| active.remove_entry(&digest))
+            .collect()
+    }
+
+    fn restore_many_active(&self, removed: Vec<([u8; 32], ActiveApiKey)>) {
+        self.active
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(removed);
+    }
 }
 
 fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
@@ -515,6 +648,9 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
                 ActiveApiKey {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
+                    label: key.label,
+                    group_label: key.group_label,
+                    quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
             )
@@ -526,10 +662,13 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
     ApiKeySummary {
         id: key.id.clone(),
         owner_user_id: key.owner_user_id.clone(),
+        group_label: key.group_label.clone(),
         label: key.label.clone(),
         key: mask_api_key(key.key.expose_secret()),
         enabled: key.enabled,
         expires_at: key.expires_at,
+        quota_limit_atoms: key.quota_limit_atoms.clone(),
+        spent_atoms: key.spent_atoms.clone(),
         last_used_at: key.last_used_at,
         created_at: key.created_at,
         updated_at: key.updated_at,
@@ -547,6 +686,22 @@ fn mask_api_key(key: &str) -> String {
         .collect::<String>();
     let masked = "*".repeat(characters.len() - 6);
     format!("{prefix}{masked}{suffix}")
+}
+
+fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
+    let group_label = group_label.trim().to_owned();
+    if group_label.is_empty() || group_label.chars().count() > 64 {
+        return Err(AuthError::InvalidGroup);
+    }
+    Ok(group_label)
+}
+
+fn validate_api_key_secret(key: &SecretString) -> Result<(), AuthError> {
+    let key = key.expose_secret();
+    if key.is_empty() || key.len() > 1024 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AuthError::InvalidApiKeyValue);
+    }
+    Ok(())
 }
 
 fn normalize_username(username: String) -> Result<String, AuthError> {
@@ -590,6 +745,44 @@ async fn password_hash(password: SecretString) -> Result<String, AuthError> {
         .map_err(AuthError::Credential)
 }
 
+async fn new_standard_user(
+    username: String,
+    password: SecretString,
+    now: i64,
+) -> Result<NewUser, AuthError> {
+    Ok(NewUser {
+        id: UserId::random(),
+        username: normalize_username(username)?,
+        password_hash: password_hash(password).await?,
+        role: UserRole::User,
+        enabled: true,
+        created_at: now,
+    })
+}
+
+fn new_user_summary(user: NewUser) -> UserSummary {
+    UserSummary {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        enabled: user.enabled,
+        created_at: user.created_at,
+        updated_at: user.created_at,
+    }
+}
+
+fn normalize_registration_code(code: &str) -> Result<&str, AuthError> {
+    let code = code.trim();
+    if code.len() != 43
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(AuthError::InvalidRegistrationCode);
+    }
+    Ok(code)
+}
+
 async fn verify_password_async(password: SecretString, encoded: String) -> Result<bool, AuthError> {
     tokio::task::spawn_blocking(move || verify_password(&password, &encoded))
         .await
@@ -608,28 +801,56 @@ pub enum AuthError {
     AlreadyConfigured,
     #[error("invalid username or password")]
     InvalidCredentials,
-    #[error("invalid access token")]
-    InvalidAccessToken,
-    #[error("invalid refresh token")]
-    InvalidRefreshToken,
+    #[error("invalid session")]
+    InvalidSession,
     #[error("invalid API key")]
     InvalidApiKey,
+    #[error("API key must contain 1 to 1024 non-whitespace ASCII characters")]
+    InvalidApiKeyValue,
     #[error("user is not allowed to perform this operation")]
     Forbidden,
     #[error("resource already exists")]
     Conflict,
     #[error("resource was not found")]
     NotFound,
+    #[error("registration code is invalid or expired")]
+    InvalidRegistrationCode,
     #[error("username must contain 1 to 128 characters")]
     InvalidUsername,
     #[error("label must contain 1 to 128 characters")]
     InvalidLabel,
     #[error("expiry must be in the future")]
     InvalidExpiry,
+    #[error("quota limit must be a positive USD amount when set")]
+    InvalidQuotaLimit,
+    #[error("API key USD quota has been exhausted")]
+    QuotaExceeded,
+    #[error("API key quota ledger is unavailable")]
+    QuotaLedgerUnavailable,
+    #[error("provider group label was not found on any visible account")]
+    GroupNotFound,
+    #[error("provider group label is invalid")]
+    InvalidGroup,
     #[error("password processing task failed")]
     PasswordTask,
     #[error(transparent)]
     Credential(#[from] CredentialError),
     #[error(transparent)]
     Repository(#[from] AuthRepositoryError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_metadata_keeps_only_first_and_last_three_characters() {
+        let key = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+        let masked = mask_api_key(key);
+
+        assert_eq!(masked.len(), key.len());
+        assert!(masked.starts_with("abc"));
+        assert!(masked.ends_with("OPQ"));
+        assert!(masked[3..masked.len() - 3].bytes().all(|byte| byte == b'*'));
+    }
 }

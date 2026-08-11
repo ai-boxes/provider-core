@@ -36,6 +36,10 @@ pub(crate) fn prepare_request(
     body.insert("model".to_owned(), Value::String(request.model.clone()));
     body.insert("messages".to_owned(), Value::Array(messages));
     body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert(
+        "stream_options".to_owned(),
+        serde_json::json!({ "include_usage": true }),
+    );
     copy_fields(
         source,
         &mut body,
@@ -115,22 +119,8 @@ fn append_input_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Prov
     {
         "message" => append_message(item, messages),
         "function_call" | "custom_tool_call" => {
-            let call_id = required_string(item, "call_id", "tool call requires call_id")?;
-            let name = required_string(item, "name", "tool call requires name")?;
-            let arguments = item
-                .get("arguments")
-                .or_else(|| item.get("input"))
-                .map(json_string)
-                .unwrap_or_else(|| "{}".to_owned());
-            messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments }
-                }]
-            }));
+            let tool_call = chat_tool_call(item)?;
+            push_assistant_tool_call(messages, tool_call);
             Ok(())
         }
         "function_call_output" | "custom_tool_call_output" => {
@@ -275,6 +265,49 @@ fn copy_fields(source: &Map<String, Value>, target: &mut Map<String, Value>, fie
     }
 }
 
+
+/// Chat Completions requires every `tool_calls` assistant message to be followed by
+/// matching `role=tool` messages. Responses emits each call as its own input item, so
+/// consecutive function calls must collapse into one assistant message.
+fn push_assistant_tool_call(messages: &mut Vec<Value>, tool_call: Value) {
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        if let Some(tool_calls) = last
+            .as_object_mut()
+            .and_then(|message| message.get_mut("tool_calls"))
+            .and_then(Value::as_array_mut)
+        {
+            tool_calls.push(tool_call);
+            return;
+        }
+        if let Some(message) = last.as_object_mut() {
+            message.insert("tool_calls".to_owned(), Value::Array(vec![tool_call]));
+            return;
+        }
+    }
+    messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [tool_call]
+    }));
+}
+
+fn chat_tool_call(item: &Map<String, Value>) -> Result<Value, ProviderError> {
+    let call_id = required_string(item, "call_id", "tool call requires call_id")?;
+    let name = required_string(item, "name", "tool call requires name")?;
+    let arguments = item
+        .get("arguments")
+        .or_else(|| item.get("input"))
+        .map(json_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    Ok(serde_json::json!({
+        "id": call_id,
+        "type": "function",
+        "function": { "name": name, "arguments": arguments }
+    }))
+}
+
 fn required_string<'a>(
     object: &'a Map<String, Value>,
     field: &str,
@@ -336,10 +369,108 @@ mod tests {
         assert_eq!(request.format, WireFormat::OpenAiChatCompletions);
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["max_tokens"], 512);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["tools"][0]["function"]["name"], "shell");
+    }
+
+    #[test]
+    fn merges_parallel_function_calls_into_one_assistant_message() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "upstream-model".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "model":"client-model",
+                    "input":[
+                        {"type":"message","role":"user","content":"run both"},
+                        {"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"pwd\"}"},
+                        {"type":"function_call","call_id":"call_2","name":"shell","arguments":"{\"cmd\":\"ls\"}"},
+                        {"type":"function_call_output","call_id":"call_1","output":"/tmp"},
+                        {"type":"function_call_output","call_id":"call_2","output":"a\nb"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let (request, _) = prepare_request(request).expect("converted request");
+        let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+        let messages = body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[1]["tool_calls"][1]["id"], "call_2");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_2");
+    }
+
+    #[test]
+    fn attaches_tool_calls_to_the_preceding_assistant_message() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "upstream-model".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "model":"client-model",
+                    "input":[
+                        {"type":"message","role":"user","content":"use a tool"},
+                        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking"}]},
+                        {"type":"function_call","call_id":"call_9","name":"shell","arguments":"{\"cmd\":\"true\"}"},
+                        {"type":"function_call_output","call_id":"call_9","output":"ok"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let (request, _) = prepare_request(request).expect("converted request");
+        let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+        let messages = body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["text"], "checking");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_9");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_9");
+    }
+
+    #[test]
+    fn keeps_sequential_tool_turns_as_separate_assistant_messages() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "upstream-model".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "model":"client-model",
+                    "input":[
+                        {"type":"message","role":"user","content":"one then two"},
+                        {"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"call_1","output":"1"},
+                        {"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"call_2","output":"2"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let (request, _) = prepare_request(request).expect("converted request");
+        let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+        let messages = body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(messages[4]["tool_call_id"], "call_2");
     }
 }

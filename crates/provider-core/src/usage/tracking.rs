@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ProviderKind,
+    ProviderKind, ProviderModelPricingRecord,
     usage::{RawUsageFields, UsageContractSnapshot},
 };
 
@@ -39,6 +39,7 @@ pub trait RequestTracking: Send + Sync {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing: Option<&ProviderModelPricingRecord>,
     ) -> Option<Arc<dyn AttemptTracking>>;
 }
 
@@ -52,6 +53,9 @@ pub trait RequestTracking: Send + Sync {
 pub trait AttemptTracking: Send + Sync {
     /// The call returned a stream to read, so the provider answered.
     fn stream_opened(&self);
+
+    /// The first output token was observed on the upstream stream.
+    fn first_token_observed(&self);
 
     /// The upstream stream reached its documented successful terminal.
     ///
@@ -80,6 +84,12 @@ pub trait AttemptTracking: Send + Sync {
     /// Terminal, and applied exactly once: a stream that ends and is then dropped
     /// must not record the attempt twice, which would double-count usage.
     fn finished(&self, fields: Option<RawUsageFields>);
+
+    /// The response stream was dropped before any protocol terminal was seen.
+    ///
+    /// Fields observed before cancellation are retained, but the attempt is
+    /// marked with an ambiguity gap because its upstream terminal is unknowable.
+    fn cancelled(&self, fields: Option<RawUsageFields>);
 
     /// The call failed outright, with no stream to read. Terminal.
     ///

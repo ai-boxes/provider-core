@@ -2,13 +2,12 @@
 //!
 //! Every statement here starts from the same scoped `FROM`/`WHERE`, built by
 //! [`scoped_from`], so the owner filter cannot be forgotten in one query and
-//! present in another. The attribution basis is the only part that varies, and it
-//! varies by swapping one predicate.
+//! present in another. Usage always describes the final attempt returned to the
+//! user.
 //!
-//! The statements are assembled at runtime, which sqlx makes you vouch for. What
-//! gets interpolated is only ever a compile-time constant chosen by a Rust enum —
-//! the basis predicate, a bucket width, a clamped page size. Every value that came
-//! from a caller is a bound parameter, so no input reaches the SQL text.
+//! The statements are assembled at runtime, which sqlx makes you vouch for. Only
+//! compile-time SQL fragments and a clamped page size are interpolated. Every
+//! caller value is a bound parameter, so no input reaches the SQL text.
 //!
 //! Cost sums are split before they are added: `SUM(cost_atoms)` overflows a 64-bit
 //! accumulator at roughly `$92,233`, so each sum is taken over `atoms / 10^6` and
@@ -17,187 +16,183 @@
 
 use async_trait::async_trait;
 use provider_usage::{
-    ATOM_SPLIT, AttemptFacts, AttributionBasis, CacheTotals, CostTotals, KeySummary, MAX_PAGE_SIZE,
-    RequestCursor, RequestPage, RequestSummary, SeriesBucket, TokenTotals, UsageBucket,
-    UsageOverview, UsageQuery, UsageRepositoryError, UsageScope, recombine_atoms, system_clock_ms,
+    ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, MAX_PAGE_SIZE, ProviderHealthSummary,
+    RequestCursor, RequestPage, RequestSummary, TokenTotals, UsageFilterOptions, UsageOverview,
+    UsageQuery, UsageRepositoryError, UsageScope, recombine_atoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{
     SqliteUsageRepository,
-    usage::{attempt_facts, logical_status_from, tracking_from, usage_error},
+    usage::{attempt_facts, usage_error},
 };
 
 /// The scoped source every query reads from.
 ///
-/// Bind order, once per query: owner, key, key, from, to.
-fn scoped_from(basis: AttributionBasis) -> String {
-    // `final_attempt_id` is what the user actually received; confirmed dispatch is
-    // what the provider actually served, retries included.
-    let basis_predicate = match basis {
-        AttributionBasis::UserFinalAttempt => "a.id = l.final_attempt_id",
-        AttributionBasis::KeyTriggeredConfirmedDispatch => {
-            "a.dispatch_evidence IN ('dispatch_invoked', 'response_observed')"
-        }
-    };
-    format!(
-        r#"
+/// Bind order, once per query: owner, key, key, model, model, group, group, from, to.
+fn scoped_from() -> &'static str {
+    r#"
         FROM usage_logical_requests AS l
-        LEFT JOIN usage_attempts AS a
+        INNER JOIN usage_attempts AS a
           ON a.logical_request_id = l.request_id
-         AND {basis_predicate}
+         AND a.id = l.final_attempt_id
         WHERE l.owner_user_id = ?
+          AND l.logical_status IN ('succeeded', 'incomplete')
+          AND (
+              a.uncached_input_tokens > 0
+              OR a.cache_read_input_tokens > 0
+              OR a.cache_write_input_tokens > 0
+              OR a.effective_input_tokens > 0
+              OR a.output_tokens > 0
+              OR a.reasoning_tokens > 0
+              OR a.input_audio_tokens > 0
+              OR a.output_audio_tokens > 0
+              OR a.total_tokens > 0
+              OR EXISTS (
+                  SELECT 1
+                  FROM usage_billable_observations AS billable
+                  WHERE billable.attempt_id = a.id
+                    AND billable.quantity > 0
+              )
+          )
           -- All placeholders are positional. A numbered one here would silently
           -- re-use the owner parameter and shift everything after it.
           AND (? IS NULL OR l.api_key_id = ?)
+          AND (? IS NULL OR l.client_model_raw = ?)
+          AND (? IS NULL OR l.api_key_group_label = ?)
           AND l.completed_at_ms >= ?
           AND l.completed_at_ms < ?
         "#
-    )
 }
 
 /// The aggregate columns shared by the overview and each series bucket.
 const TOTALS_COLUMNS: &str = r#"
-    COUNT(a.id) AS attempts,
     COUNT(DISTINCT l.request_id) AS logical_requests,
-    COALESCE(SUM(a.uncached_input_tokens), 0) AS uncached_input,
     COALESCE(SUM(a.cache_read_input_tokens), 0) AS cache_read_input,
-    COALESCE(SUM(a.cache_write_input_tokens), 0) AS cache_write_input,
     COALESCE(SUM(a.effective_input_tokens), 0) AS effective_input,
     COALESCE(SUM(a.output_tokens), 0) AS output,
-    COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning,
-    COUNT(a.id) - COUNT(a.effective_input_tokens) AS unknown_input,
     COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
         THEN a.cost_atoms / 1000000 ELSE 0 END), 0) AS complete_high,
     COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
         THEN a.cost_atoms % 1000000 ELSE 0 END), 0) AS complete_low,
-    SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
-        THEN 1 ELSE 0 END) AS complete_attempts,
-    COALESCE(SUM(CASE WHEN a.cost_status = 'partial'
-        THEN a.cost_atoms / 1000000 ELSE 0 END), 0) AS partial_high,
-    COALESCE(SUM(CASE WHEN a.cost_status = 'partial'
-        THEN a.cost_atoms % 1000000 ELSE 0 END), 0) AS partial_low,
-    SUM(CASE WHEN a.cost_status = 'partial' THEN 1 ELSE 0 END) AS partial_attempts,
-    SUM(CASE WHEN a.cost_status = 'unavailable' THEN 1 ELSE 0 END) AS unavailable_attempts
+    COALESCE(SUM(CASE WHEN a.cost_status = 'complete_for_observed_catalog_components'
+        THEN 1 ELSE 0 END), 0) AS complete_attempts
 "#;
 
-/// Cache columns, following the contract's three dimensions.
+/// Cache-token columns used to calculate the window hit rate.
+///
+/// Both sides of the ratio come from the same attempts. An absent cache count
+/// remains unknown and does not silently become a miss.
 const CACHE_COLUMNS: &str = r#"
-    SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-        THEN 1 ELSE 0 END) AS coverage_denominator,
-    SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-              AND a.cache_read_input_tokens > 0
-        THEN 1 ELSE 0 END) AS cache_hits,
-    SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-              AND a.cache_read_input_tokens = 0
-        THEN 1 ELSE 0 END) AS cache_misses,
-    SUM(CASE WHEN a.cache_capability = 'supported'
-              AND a.cache_eligibility = 'eligible'
-              AND a.cache_reporting_expectation = 'expected'
-              AND a.cache_read_input_tokens IS NULL
-        THEN 1 ELSE 0 END) AS cache_unreported
+    COALESCE(SUM(CASE WHEN a.effective_input_tokens IS NOT NULL
+                           AND a.cache_read_input_tokens IS NOT NULL
+        THEN a.effective_input_tokens ELSE 0 END), 0) AS cache_reported_input,
+    COALESCE(SUM(CASE WHEN a.effective_input_tokens IS NOT NULL
+                           AND a.cache_read_input_tokens IS NOT NULL
+        THEN a.cache_read_input_tokens ELSE 0 END), 0) AS cache_rate_read_input
 "#;
 
 #[async_trait]
 impl UsageQuery for SqliteUsageRepository {
     async fn overview(&self, scope: &UsageScope) -> Result<UsageOverview, UsageRepositoryError> {
-        let sql = format!(
-            "SELECT {TOTALS_COLUMNS}, {CACHE_COLUMNS} {}",
-            scoped_from(scope.basis)
-        );
+        let sql = format!("SELECT {TOTALS_COLUMNS}, {CACHE_COLUMNS} {}", scoped_from());
         let row = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
             .fetch_one(&self.pool)
             .await
             .map_err(|error| usage_error("failed to read usage overview", error))?;
 
         Ok(UsageOverview {
-            // The read's own clock, used only to explain concurrent differences.
-            // Not the range's end: for a window ending in the future that would
-            // date the snapshot ahead of when it was taken, and for a historical
-            // window it would claim the numbers are as old as the data.
-            as_of_ms: system_clock_ms(),
-            logical_requests: count(&row, "logical_requests"),
-            attempts: count(&row, "attempts"),
-            tokens: token_totals(&row),
-            cache: cache_totals(&row),
-            cost: cost_totals(&row),
-            tracking_gaps: self.tracking_gaps(scope).await?,
+            logical_requests: count(&row, "logical_requests")?,
+            tokens: token_totals(&row)?,
+            cache: cache_totals(&row)?,
+            cost: cost_totals(&row)?,
         })
     }
 
-    async fn series(
+    async fn filter_options(
         &self,
         scope: &UsageScope,
-        bucket: SeriesBucket,
-    ) -> Result<Vec<UsageBucket>, UsageRepositoryError> {
-        let width = bucket.width_ms();
-        // Floored division, so a bucket label is always at or before its facts.
+    ) -> Result<UsageFilterOptions, UsageRepositoryError> {
+        // Filter menus describe the complete range, not only the selected page
+        // and not only the currently visible API keys.
+        let mut unfiltered = scope.clone();
+        unfiltered.client_model = None;
+        unfiltered.group_label = None;
+
+        let model_sql = format!(
+            "SELECT DISTINCT l.client_model_raw AS value {} AND l.client_model_raw IS NOT NULL ORDER BY value",
+            scoped_from()
+        );
+        let model_rows = bind_scope(sqlx::query(AssertSqlSafe(model_sql)), &unfiltered)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage model filters", error))?;
+
+        let group_sql = format!(
+            "SELECT DISTINCT l.api_key_group_label AS value {} AND l.api_key_group_label IS NOT NULL ORDER BY value",
+            scoped_from()
+        );
+        let group_rows = bind_scope(sqlx::query(AssertSqlSafe(group_sql)), &unfiltered)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage group filters", error))?;
+
+        Ok(UsageFilterOptions {
+            client_models: model_rows.iter().map(|row| row.get("value")).collect(),
+            group_labels: group_rows.iter().map(|row| row.get("value")).collect(),
+        })
+    }
+
+    async fn provider_health(
+        &self,
+        account_ids: &[String],
+        range: provider_usage::TimeRange,
+    ) -> Result<Vec<ProviderHealthSummary>, UsageRepositoryError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = vec!["?"; account_ids.len()].join(", ");
         let sql = format!(
             r#"
             SELECT
-                (l.completed_at_ms / {width}) * {width} AS bucket_start_ms,
-                {TOTALS_COLUMNS}
-            {}
-            GROUP BY bucket_start_ms
-            ORDER BY bucket_start_ms
+                a.account_id,
+                COUNT(DISTINCT l.request_id) AS requests,
+                SUM(CASE WHEN l.logical_status = 'succeeded' THEN 1 ELSE 0 END) AS successes,
+                SUM(CASE WHEN l.logical_status = 'failed' THEN 1 ELSE 0 END) AS failures
+            FROM usage_logical_requests AS l
+            INNER JOIN usage_attempts AS a
+                ON a.logical_request_id = l.request_id
+               AND a.id = l.final_attempt_id
+            WHERE a.account_id IN ({placeholders})
+              AND l.completed_at_ms >= ?
+              AND l.completed_at_ms < ?
+              AND l.logical_status IN ('succeeded', 'failed')
+            GROUP BY a.account_id
+            ORDER BY a.account_id
             "#,
-            scoped_from(scope.basis)
         );
-        let rows = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for account_id in account_ids {
+            query = query.bind(account_id);
+        }
+        let rows = query
+            .bind(range.from_ms)
+            .bind(range.to_ms)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| usage_error("failed to read usage series", error))?;
+            .map_err(|error| usage_error("failed to read provider health", error))?;
 
-        Ok(rows
-            .iter()
-            .map(|row| UsageBucket {
-                bucket_start_ms: row.get("bucket_start_ms"),
-                logical_requests: count(row, "logical_requests"),
-                attempts: count(row, "attempts"),
-                tokens: token_totals(row),
-                cost: cost_totals(row),
+        rows.iter()
+            .map(|row| {
+                Ok(ProviderHealthSummary {
+                    account_id: row.get("account_id"),
+                    requests: count(row, "requests")?,
+                    successes: count(row, "successes")?,
+                    failures: count(row, "failures")?,
+                })
             })
-            .collect())
-    }
-
-    async fn key_summaries(
-        &self,
-        scope: &UsageScope,
-    ) -> Result<Vec<KeySummary>, UsageRepositoryError> {
-        // Grouping on the nullable key column yields a NULL group for requests
-        // recorded without one; it is kept as its own row rather than folded into
-        // a named key.
-        let sql = format!(
-            r#"
-            SELECT l.api_key_id AS api_key_id, {TOTALS_COLUMNS}
-            {}
-            GROUP BY l.api_key_id
-            ORDER BY attempts DESC, l.api_key_id
-            LIMIT {MAX_PAGE_SIZE}
-            "#,
-            scoped_from(scope.basis)
-        );
-        let rows = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| usage_error("failed to read usage key summaries", error))?;
-
-        Ok(rows
-            .iter()
-            .map(|row| KeySummary {
-                api_key_id: row.get("api_key_id"),
-                logical_requests: count(row, "logical_requests"),
-                attempts: count(row, "attempts"),
-                tokens: token_totals(row),
-                cost: cost_totals(row),
-            })
-            .collect())
+            .collect()
     }
 
     async fn requests(
@@ -206,7 +201,9 @@ impl UsageQuery for SqliteUsageRepository {
         after: Option<&RequestCursor>,
         limit: u32,
     ) -> Result<RequestPage, UsageRepositoryError> {
-        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(UsageRepositoryError::new("usage page size is invalid"));
+        }
         // One extra row decides whether a next page exists without a second query.
         let fetch = i64::from(limit) + 1;
         // Keyset, not offset: a row inserted while paging cannot shift the window.
@@ -218,16 +215,21 @@ impl UsageQuery for SqliteUsageRepository {
         let sql = format!(
             r#"
             SELECT
-                l.request_id, l.api_key_id, l.client_model_raw, l.started_at_ms,
-                l.completed_at_ms, l.logical_status, l.tracking_state,
-                l.tracking_gap_reason,
+                l.request_id, l.api_key_id, l.api_key_label, l.api_key_group_label,
+                l.client_model_raw, l.reasoning_effort,
+                l.started_at_ms, l.completed_at_ms,
+                (
+                    SELECT first_token_at_ms
+                    FROM usage_attempts AS final_attempt
+                    WHERE final_attempt.id = l.final_attempt_id
+                ) AS first_token_at_ms,
                 {TOTALS_COLUMNS}
             {} {keyset}
             GROUP BY l.request_id
             ORDER BY l.completed_at_ms DESC, l.request_id DESC
             LIMIT {fetch}
             "#,
-            scoped_from(scope.basis)
+            scoped_from()
         );
 
         let mut query = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope);
@@ -247,79 +249,37 @@ impl UsageQuery for SqliteUsageRepository {
         for row in rows.iter().take(limit as usize) {
             requests.push(request_summary(row)?);
         }
-        let next = has_more
-            .then(|| requests.last())
-            .flatten()
-            .and_then(|last| {
-                last.completed_at_ms.map(|completed_at_ms| RequestCursor {
-                    completed_at_ms,
-                    request_id: last.request_id.clone(),
-                })
-            });
+        let next = if has_more {
+            requests.last().map(|last| RequestCursor {
+                completed_at_ms: last.completed_at_ms,
+                request_id: last.request_id.clone(),
+            })
+        } else {
+            None
+        };
         Ok(RequestPage { requests, next })
     }
 
-    async fn request_attempts(
+    async fn request_attempt(
         &self,
         scope: &UsageScope,
         request_id: &str,
-    ) -> Result<Option<Vec<AttemptFacts>>, UsageRepositoryError> {
-        // The owner check is part of the lookup, so another user's request is
-        // indistinguishable from one that does not exist.
-        let owned: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT 1 FROM usage_logical_requests
-            WHERE request_id = ? AND owner_user_id = ?
-              AND (? IS NULL OR api_key_id = ?)
-            "#,
-        )
-        .bind(request_id)
-        .bind(&scope.owner_user_id)
-        .bind(scope.api_key_id.as_deref())
-        .bind(scope.api_key_id.as_deref())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to check usage request owner", error))?;
-        if owned.is_none() {
+    ) -> Result<Option<AttemptFacts>, UsageRepositoryError> {
+        let sql = format!(
+            "SELECT a.* {} AND l.request_id = ? AND a.id IS NOT NULL LIMIT 1",
+            scoped_from()
+        );
+        let row = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage request attempt", error))?;
+        let Some(row) = row else {
             return Ok(None);
-        }
-
-        let rows = sqlx::query(
-            "SELECT * FROM usage_attempts WHERE logical_request_id = ? ORDER BY sequence",
-        )
-        .bind(request_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to read usage request attempts", error))?;
-
-        let mut attempts = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut facts = attempt_facts(row)?;
-            facts.observation.billable = self.billable_for(&facts.attempt_id).await?;
-            attempts.push(facts);
-        }
-        Ok(Some(attempts))
-    }
-}
-
-impl SqliteUsageRepository {
-    /// Known bookkeeping losses whose bucket overlaps the range.
-    async fn tracking_gaps(&self, scope: &UsageScope) -> Result<u64, UsageRepositoryError> {
-        let total: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT SUM(count) FROM usage_tracking_gaps
-            WHERE owner_user_id = ?
-              AND bucket_start_ms >= ?
-              AND bucket_start_ms < ?
-            "#,
-        )
-        .bind(&scope.owner_user_id)
-        .bind(scope.range.from_ms)
-        .bind(scope.range.to_ms)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to read usage tracking gaps", error))?;
-        Ok(u64::try_from(total.unwrap_or(0)).unwrap_or(0))
+        };
+        let mut facts = attempt_facts(row)?;
+        facts.observation.billable = self.billable_for(&facts.attempt_id).await?;
+        Ok(Some(facts))
     }
 }
 
@@ -331,74 +291,82 @@ fn bind_scope<'q>(query: SqliteQuery<'q>, scope: &'q UsageScope) -> SqliteQuery<
         .bind(&scope.owner_user_id)
         .bind(scope.api_key_id.as_deref())
         .bind(scope.api_key_id.as_deref())
+        .bind(scope.client_model.as_deref())
+        .bind(scope.client_model.as_deref())
+        .bind(scope.group_label.as_deref())
+        .bind(scope.group_label.as_deref())
         .bind(scope.range.from_ms)
         .bind(scope.range.to_ms)
 }
 
-/// A count column. Negative is impossible from `COUNT`/`SUM(CASE …)`, so a
-/// nonsensical value reads as zero rather than panicking a dashboard.
-fn count(row: &SqliteRow, column: &str) -> u64 {
-    let value: Option<i64> = row.try_get(column).unwrap_or(Some(0));
-    u64::try_from(value.unwrap_or(0)).unwrap_or(0)
+fn count(row: &SqliteRow, column: &str) -> Result<u64, UsageRepositoryError> {
+    let value: i64 = row
+        .try_get(column)
+        .map_err(|error| usage_error("failed to read usage count", error))?;
+    u64::try_from(value)
+        .map_err(|_| UsageRepositoryError::new(format!("usage count {column} is negative")))
 }
 
-fn token_totals(row: &SqliteRow) -> TokenTotals {
-    TokenTotals {
-        uncached_input: count(row, "uncached_input"),
-        cache_read_input: count(row, "cache_read_input"),
-        cache_write_input: count(row, "cache_write_input"),
-        effective_input: count(row, "effective_input"),
-        output: count(row, "output"),
-        reasoning: count(row, "reasoning"),
-        attempts_with_unknown_input: count(row, "unknown_input"),
-    }
+fn token_totals(row: &SqliteRow) -> Result<TokenTotals, UsageRepositoryError> {
+    Ok(TokenTotals {
+        cache_read_input: count(row, "cache_read_input")?,
+        effective_input: count(row, "effective_input")?,
+        output: count(row, "output")?,
+    })
 }
 
-fn cache_totals(row: &SqliteRow) -> CacheTotals {
-    let denominator = count(row, "coverage_denominator");
-    let attempts = count(row, "attempts");
-    CacheTotals {
-        coverage_denominator: denominator,
-        hits: count(row, "cache_hits"),
-        misses: count(row, "cache_misses"),
-        expected_but_unreported: count(row, "cache_unreported"),
-        excluded: attempts.saturating_sub(denominator),
+fn cache_totals(row: &SqliteRow) -> Result<CacheTotals, UsageRepositoryError> {
+    let reported_input_tokens = count(row, "cache_reported_input")?;
+    let cache_read_input_tokens = count(row, "cache_rate_read_input")?;
+    if cache_read_input_tokens > reported_input_tokens {
+        return Err(UsageRepositoryError::new(
+            "cache-read tokens exceed reported input tokens",
+        ));
     }
+    Ok(CacheTotals {
+        reported_input_tokens,
+        cache_read_input_tokens,
+    })
 }
 
-fn cost_totals(row: &SqliteRow) -> CostTotals {
-    CostTotals {
-        complete_atoms: split_sum(row, "complete_high", "complete_low"),
-        complete_attempts: count(row, "complete_attempts"),
-        partial_known_atoms: split_sum(row, "partial_high", "partial_low"),
-        partial_attempts: count(row, "partial_attempts"),
-        unavailable_attempts: count(row, "unavailable_attempts"),
-    }
+fn cost_totals(row: &SqliteRow) -> Result<CostTotals, UsageRepositoryError> {
+    let complete_attempts = count(row, "complete_attempts")?;
+    Ok(CostTotals {
+        atoms: (complete_attempts > 0)
+            .then(|| split_sum(row, "complete_high", "complete_low"))
+            .transpose()?,
+    })
 }
 
 /// Recombine the two halves SQL summed separately. See the module header.
-fn split_sum(row: &SqliteRow, high: &str, low: &str) -> provider_usage::UsdAtoms {
-    let high: Option<i64> = row.try_get(high).unwrap_or(Some(0));
-    let low: Option<i64> = row.try_get(low).unwrap_or(Some(0));
+fn split_sum(
+    row: &SqliteRow,
+    high: &str,
+    low: &str,
+) -> Result<provider_usage::UsdAtoms, UsageRepositoryError> {
+    let high: i64 = row
+        .try_get(high)
+        .map_err(|error| usage_error("failed to read usage cost high atoms", error))?;
+    let low: i64 = row
+        .try_get(low)
+        .map_err(|error| usage_error("failed to read usage cost low atoms", error))?;
     debug_assert_eq!(ATOM_SPLIT, 1_000_000, "the SQL divisor must match");
-    recombine_atoms(high.unwrap_or(0), low.unwrap_or(0))
+    Ok(recombine_atoms(high, low))
 }
 
 fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryError> {
-    let status: String = row.get("logical_status");
-    let tracking_state: String = row.get("tracking_state");
-    let gap_reason: Option<String> = row.get("tracking_gap_reason");
     Ok(RequestSummary {
         request_id: row.get("request_id"),
         api_key_id: row.get("api_key_id"),
+        api_key_label: row.get("api_key_label"),
+        api_key_group_label: row.get("api_key_group_label"),
         client_model_raw: row.get("client_model_raw"),
+        reasoning_effort: row.get("reasoning_effort"),
         started_at_ms: row.get("started_at_ms"),
         completed_at_ms: row.get("completed_at_ms"),
-        status: logical_status_from(&status)?,
-        tracking: tracking_from(&tracking_state, gap_reason.as_deref())?,
-        attempts: count(row, "attempts"),
-        tokens: token_totals(row),
-        cost: cost_totals(row),
+        first_token_at_ms: row.get("first_token_at_ms"),
+        tokens: token_totals(row)?,
+        cost: cost_totals(row)?,
     })
 }
 
@@ -407,16 +375,17 @@ mod tests {
     use provider_core::{
         ProviderKind,
         usage::{
-            CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
-            PricingMode, ProviderUsageObservation, TokenInclusionRules, TokenMetric, TotalSource,
+            BillableComponentCode, BillableObservation, BillableUnit, CacheCapability,
+            CacheEligibility, CacheReportingExpectation, PricingContextBasis, PricingMode,
+            ProviderUsageObservation, TokenInclusionRules, TokenMetric, TotalSource,
             UsageContractSnapshot,
         },
     };
     use provider_usage::{
-        AttemptSequence, ComponentPrices, CostStatus, DeliveryOutcome, DispatchEvidence,
-        ExecutionOutcome, InlinePriceRecord, LogicalRequestStart, LogicalRequestTerminal,
-        LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution, TimeRange, TrackingState,
-        UnitPrice, UsageRepository, UsdAtoms,
+        AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices, CostStatus, DeliveryOutcome,
+        DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
+        LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution,
+        TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
     };
 
     use super::*;
@@ -443,6 +412,7 @@ mod tests {
                 reasoning_applicable: true,
                 audio_applicable: false,
                 cache_write_applicable: false,
+                missing_cache_read_means_zero: false,
                 total_source: TotalSource::Reported,
             },
             cache_capability: CacheCapability::Supported,
@@ -470,22 +440,44 @@ mod tests {
         }
     }
 
+    fn zero_observation(billable: Vec<BillableObservation>) -> ProviderUsageObservation {
+        ProviderUsageObservation {
+            uncached_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_read_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            cache_write_input_tokens: TokenMetric::NotApplicable,
+            effective_input_tokens: TokenMetric::ProviderReported { value: 0 },
+            output_tokens: TokenMetric::ProviderReported { value: 0 },
+            reasoning_tokens: TokenMetric::ProviderReported { value: 0 },
+            input_audio_tokens: TokenMetric::NotApplicable,
+            output_audio_tokens: TokenMetric::NotApplicable,
+            total_tokens: TokenMetric::ProviderReported { value: 0 },
+            pricing_context_tokens: TokenMetric::ProviderReported { value: 0 },
+            billable,
+            warnings: Vec::new(),
+        }
+    }
+
     fn resolved_price() -> PriceResolution {
-        PriceResolution::Resolved(Box::new(InlinePriceRecord {
-            format_version: 1,
-            parser_version: 1,
-            catalog_revision: "a".repeat(64),
-            catalog_provider_id: "openai".to_owned(),
-            catalog_model_id: "gpt-5-codex".to_owned(),
-            mapping_revision: 1,
-            prices: ComponentPrices {
-                uncached_input_per_million: Some(UnitPrice::from_scaled(10i128.pow(PRICE_SCALE))),
-                ..ComponentPrices::default()
+        PriceResolution::Resolved(Box::new(InlinePriceRecord::CatalogV1(
+            CatalogInlinePriceRecordV1 {
+                format_version: 1,
+                parser_version: 1,
+                catalog_revision: "a".repeat(64),
+                catalog_provider_id: "openai".to_owned(),
+                catalog_model_id: "gpt-5-codex".to_owned(),
+                mapping_revision: 1,
+                prices: ComponentPrices {
+                    uncached_input_per_million: Some(UnitPrice::from_scaled(
+                        10i128.pow(PRICE_SCALE),
+                    )),
+                    ..ComponentPrices::default()
+                },
+                context_tier: None,
+                selected_tier: None,
+                unmodeled_billable_component: false,
+                unmodeled_pricing_rule: false,
             },
-            selected_tier: None,
-            unmodeled_billable_component: false,
-            unmodeled_pricing_rule: false,
-        }))
+        )))
     }
 
     struct Written {
@@ -498,6 +490,7 @@ mod tests {
         cache_read: TokenMetric,
         cache_reporting: CacheReportingExpectation,
         attempts: u32,
+        status: LogicalStatus,
     }
 
     impl Written {
@@ -517,6 +510,7 @@ mod tests {
                 cache_read: TokenMetric::ProviderReported { value: 100 },
                 cache_reporting: CacheReportingExpectation::Expected,
                 attempts: 1,
+                status: LogicalStatus::Succeeded,
             }
         }
     }
@@ -528,8 +522,11 @@ mod tests {
                 request_id: spec.request_id.clone(),
                 owner_user_id: spec.owner.clone(),
                 api_key_id: spec.key.clone(),
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
+                reasoning_effort: None,
                 started_at_ms: spec.completed_at_ms - 1000,
             })
             .await
@@ -550,6 +547,7 @@ mod tests {
                     configured_model: Some("gpt-5-codex".to_owned()),
                     provider_reported_model: None,
                     started_at_ms: spec.completed_at_ms - 1000,
+                    first_token_at_ms: None,
                     completed_at_ms: spec.completed_at_ms,
                     dispatch_evidence: spec.evidence,
                     tracking: TrackingState::Complete,
@@ -567,7 +565,7 @@ mod tests {
             .complete_logical_request(&LogicalRequestTerminal {
                 request_id: spec.request_id.clone(),
                 completed_at_ms: spec.completed_at_ms,
-                status: LogicalStatus::Succeeded,
+                status: spec.status,
                 execution: Some(ExecutionOutcome::StableSuccessTerminal),
                 delivery: Some(DeliveryOutcome::CleanEof),
                 final_attempt_id: Some(final_attempt),
@@ -578,12 +576,80 @@ mod tests {
             .expect("complete");
     }
 
-    fn scope(owner: &str, basis: AttributionBasis) -> UsageScope {
+    async fn write_custom_observation(
+        repository: &SqliteUsageRepository,
+        request_id: &str,
+        status: LogicalStatus,
+        observation: ProviderUsageObservation,
+    ) {
+        let completed_at_ms = T0 + HOUR;
+        repository
+            .begin_logical_request(&LogicalRequestStart {
+                request_id: request_id.to_owned(),
+                owner_user_id: "user-1".to_owned(),
+                api_key_id: Some("key-1".to_owned()),
+                api_key_label: None,
+                api_key_group_label: None,
+                client_model_raw: Some("gpt-5-codex".to_owned()),
+                routing_model: Some("gpt-5-codex".to_owned()),
+                reasoning_effort: None,
+                started_at_ms: completed_at_ms - 1000,
+            })
+            .await
+            .expect("begin custom request");
+        let attempt_id = format!("{request_id}#1");
+        repository
+            .record_attempt(&AttemptFacts {
+                attempt_id: attempt_id.clone(),
+                logical_request_id: request_id.to_owned(),
+                sequence: AttemptSequence(1),
+                provider: ProviderKind::Codex,
+                account_id: "account-1".to_owned(),
+                configured_model: Some("gpt-5-codex".to_owned()),
+                provider_reported_model: None,
+                started_at_ms: completed_at_ms - 1000,
+                first_token_at_ms: None,
+                completed_at_ms,
+                dispatch_evidence: DispatchEvidence::ResponseObserved,
+                tracking: TrackingState::Complete,
+                contract: contract(),
+                observation,
+                price: resolved_price(),
+                cost: ObservedCatalogCost {
+                    total_known: UsdAtoms::ZERO,
+                    status: CostStatus::CompleteForObservedCatalogComponents,
+                    reasons: Vec::new(),
+                    calculator_version: 1,
+                },
+            })
+            .await
+            .expect("record custom attempt");
+        repository
+            .complete_logical_request(&LogicalRequestTerminal {
+                request_id: request_id.to_owned(),
+                completed_at_ms,
+                status,
+                execution: Some(if status == LogicalStatus::Succeeded {
+                    ExecutionOutcome::StableSuccessTerminal
+                } else {
+                    ExecutionOutcome::StableFailure
+                }),
+                delivery: Some(DeliveryOutcome::CleanEof),
+                final_attempt_id: Some(attempt_id),
+                tracking: TrackingState::Complete,
+                state_version: 1,
+            })
+            .await
+            .expect("complete custom request");
+    }
+
+    fn scope(owner: &str) -> UsageScope {
         UsageScope {
             owner_user_id: owner.to_owned(),
             api_key_id: None,
+            client_model: None,
+            group_label: None,
             range: TimeRange::new(T0, T0 + 24 * HOUR).expect("range"),
-            basis,
         }
     }
 
@@ -595,25 +661,20 @@ mod tests {
         write(&repository, &Written::new("theirs", "user-2", T0 + HOUR)).await;
 
         let mine = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-1"))
             .await
             .expect("overview");
         assert_eq!(mine.logical_requests, 1);
-        assert_eq!(mine.attempts, 1);
         assert_eq!(mine.tokens.effective_input, 120);
 
         let theirs = repository
-            .overview(&scope("user-2", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-2"))
             .await
             .expect("overview");
         assert_eq!(theirs.logical_requests, 1);
 
         let page = repository
-            .requests(
-                &scope("user-1", AttributionBasis::UserFinalAttempt),
-                None,
-                50,
-            )
+            .requests(&scope("user-1"), None, 50)
             .await
             .expect("requests");
         assert_eq!(page.requests.len(), 1);
@@ -627,10 +688,7 @@ mod tests {
 
         assert!(
             repository
-                .request_attempts(
-                    &scope("user-1", AttributionBasis::UserFinalAttempt),
-                    "theirs"
-                )
+                .request_attempt(&scope("user-1"), "theirs")
                 .await
                 .expect("lookup")
                 .is_none(),
@@ -638,23 +696,53 @@ mod tests {
         );
         assert!(
             repository
-                .request_attempts(
-                    &scope("user-1", AttributionBasis::UserFinalAttempt),
-                    "never-existed"
-                )
+                .request_attempt(&scope("user-1"), "never-existed")
                 .await
                 .expect("lookup")
                 .is_none()
         );
         assert!(
             repository
-                .request_attempts(
-                    &scope("user-2", AttributionBasis::UserFinalAttempt),
-                    "theirs"
-                )
+                .request_attempt(&scope("user-2"), "theirs")
                 .await
                 .expect("lookup")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_details_obey_the_complete_scope() {
+        let repository = repository().await;
+        write(&repository, &Written::new("inside", "user-1", T0 + HOUR)).await;
+
+        let mut outside_range = scope("user-1");
+        outside_range.range = TimeRange::new(T0 + 2 * HOUR, T0 + 3 * HOUR).expect("range");
+        assert!(
+            repository
+                .request_attempt(&outside_range, "inside")
+                .await
+                .expect("outside range lookup")
+                .is_none()
+        );
+
+        let mut wrong_model = scope("user-1");
+        wrong_model.client_model = Some("another-model".to_owned());
+        assert!(
+            repository
+                .request_attempt(&wrong_model, "inside")
+                .await
+                .expect("wrong model lookup")
+                .is_none()
+        );
+
+        let mut wrong_group = scope("user-1");
+        wrong_group.group_label = Some("another-group".to_owned());
+        assert!(
+            repository
+                .request_attempt(&wrong_group, "inside")
+                .await
+                .expect("wrong group lookup")
+                .is_none()
         );
     }
 
@@ -666,7 +754,7 @@ mod tests {
         write(&repository, &Written::new("mine", "user-1", T0 + HOUR)).await;
         write(&repository, &other_key).await;
 
-        let mut scoped = scope("user-1", AttributionBasis::UserFinalAttempt);
+        let mut scoped = scope("user-1");
         assert_eq!(
             repository
                 .overview(&scoped)
@@ -684,31 +772,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_two_attribution_bases_count_retries_differently() {
-        // Three attempts, one logical request: the user got one response, the
-        // provider served three.
+    async fn usage_counts_only_the_final_attempt() {
         let repository = repository().await;
         let mut spec = Written::new("retried", "user-1", T0 + HOUR);
         spec.attempts = 3;
         write(&repository, &spec).await;
 
-        let user = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
-            .await
-            .expect("user basis");
-        assert_eq!(user.attempts, 1, "the user received one response");
-        assert_eq!(user.tokens.effective_input, 120);
+        let usage = repository.overview(&scope("user-1")).await.expect("usage");
+        assert_eq!(usage.tokens.effective_input, 120);
+        assert_eq!(usage.logical_requests, 1);
+    }
 
-        let resource = repository
-            .overview(&scope(
-                "user-1",
-                AttributionBasis::KeyTriggeredConfirmedDispatch,
-            ))
+    #[tokio::test]
+    async fn provider_health_counts_retained_successes_and_failures() {
+        let repository = repository().await;
+        let succeeded = Written::new("health-success", "user-1", T0 + HOUR);
+        let mut failed = Written::new("health-failed", "user-1", T0 + HOUR);
+        failed.status = LogicalStatus::Failed;
+        let mut incomplete = Written::new("health-incomplete", "user-1", T0 + HOUR);
+        incomplete.status = LogicalStatus::Incomplete;
+        let mut canceled = Written::new("health-canceled", "user-1", T0 + HOUR);
+        canceled.status = LogicalStatus::Canceled;
+        for spec in [&succeeded, &failed, &incomplete, &canceled] {
+            write(&repository, spec).await;
+        }
+
+        assert_eq!(
+            repository
+                .overview(&scope("user-1"))
+                .await
+                .expect("usage overview")
+                .logical_requests,
+            2,
+            "succeeded and incomplete requests with usage are user-visible"
+        );
+        let usage_requests = repository
+            .requests(&scope("user-1"), None, 10)
             .await
-            .expect("resource basis");
-        assert_eq!(resource.attempts, 3, "the provider served three calls");
-        assert_eq!(resource.tokens.effective_input, 360);
-        assert_eq!(resource.logical_requests, 1, "still one request");
+            .expect("usage requests");
+        assert_eq!(
+            usage_requests
+                .requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["health-success", "health-incomplete"]
+        );
+        assert!(
+            repository
+                .request_attempt(&scope("user-1"), "health-incomplete")
+                .await
+                .expect("incomplete detail")
+                .is_some(),
+            "an incomplete response with usage has visible detail"
+        );
+
+        let health = repository
+            .provider_health(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("provider health");
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].requests, 2);
+        assert_eq!(health[0].successes, 1);
+        assert_eq!(health[0].failures, 1);
     }
 
     #[tokio::test]
@@ -723,19 +853,19 @@ mod tests {
         }
 
         let overview = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-1"))
             .await
             .expect("overview");
         assert_eq!(
-            overview.cost.complete_atoms.as_atoms(),
+            overview.cost.atoms.expect("priced cost").as_atoms(),
             per_attempt * 8,
             "the total exceeds i64 and must still be exact"
         );
-        assert!(overview.cost.complete_atoms.as_atoms() > i128::from(i64::MAX));
+        assert!(overview.cost.atoms.expect("priced cost").as_atoms() > i128::from(i64::MAX));
     }
 
     #[tokio::test]
-    async fn cache_coverage_separates_a_miss_from_an_unreported_read() {
+    async fn cache_rate_uses_tokens_and_excludes_unreported_cache_detail() {
         let repository = repository().await;
         let hit = Written::new("hit", "user-1", T0 + HOUR);
 
@@ -750,49 +880,61 @@ mod tests {
         }
 
         let cache = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-1"))
             .await
             .expect("overview")
             .cache;
-        assert_eq!(cache.coverage_denominator, 3);
-        assert_eq!(cache.hits, 1);
-        assert_eq!(cache.misses, 1, "a reported zero is a miss");
-        assert_eq!(
-            cache.expected_but_unreported, 1,
-            "an unreported read is not a miss"
-        );
-        assert_eq!(cache.excluded, 0);
+        assert_eq!(cache.reported_input_tokens, 240);
+        assert_eq!(cache.cache_read_input_tokens, 100);
     }
 
     #[tokio::test]
-    async fn cache_counts_exclude_attempts_without_an_expected_report() {
+    async fn cache_counts_include_unknown_when_a_value_was_reported() {
+        let repository = repository().await;
+        // Default Written cache_read is ProviderReported { 100 }.
+        let mut unknown_hit = Written::new("unknown-hit", "user-1", T0 + HOUR);
+        unknown_hit.cache_reporting = CacheReportingExpectation::Unknown;
+        write(&repository, &unknown_hit).await;
+
+        let cache = repository
+            .overview(&scope("user-1"))
+            .await
+            .expect("overview")
+            .cache;
+        assert_eq!(cache.reported_input_tokens, 120);
+        assert_eq!(cache.cache_read_input_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn cache_counts_exclude_unknown_when_nothing_was_reported() {
         let repository = repository().await;
         let mut unknown = Written::new("unknown", "user-1", T0 + HOUR);
         unknown.cache_reporting = CacheReportingExpectation::Unknown;
+        unknown.cache_read = TokenMetric::NotReported;
         write(&repository, &unknown).await;
 
         let cache = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-1"))
             .await
             .expect("overview")
             .cache;
-        assert_eq!(cache.coverage_denominator, 0);
-        assert_eq!(cache.hits, 0, "an excluded attempt cannot be a hit");
-        assert_eq!(cache.misses, 0, "an excluded attempt cannot be a miss");
-        assert_eq!(cache.expected_but_unreported, 0);
-        assert_eq!(cache.excluded, 1);
+        assert_eq!(cache.reported_input_tokens, 0);
+        assert_eq!(cache.cache_read_input_tokens, 0);
     }
 
     #[tokio::test]
-    async fn a_logical_request_without_attempts_is_still_queryable() {
+    async fn a_logical_request_without_attempts_is_not_usage() {
         let repository = repository().await;
         repository
             .begin_logical_request(&LogicalRequestStart {
                 request_id: "preflight-failure".to_owned(),
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: Some("key-1".to_owned()),
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: None,
                 routing_model: None,
+                reasoning_effort: None,
                 started_at_ms: T0 + HOUR - 1,
             })
             .await
@@ -811,19 +953,86 @@ mod tests {
             .await
             .expect("complete");
 
-        let scope = scope("user-1", AttributionBasis::UserFinalAttempt);
+        let scope = scope("user-1");
         let overview = repository.overview(&scope).await.expect("overview");
-        assert_eq!(overview.logical_requests, 1);
-        assert_eq!(overview.attempts, 0);
-        assert_eq!(overview.tokens.attempts_with_unknown_input, 0);
+        assert_eq!(overview.logical_requests, 0);
 
         let page = repository
             .requests(&scope, None, 10)
             .await
             .expect("requests");
-        assert_eq!(page.requests.len(), 1);
-        assert_eq!(page.requests[0].status, LogicalStatus::Failed);
-        assert_eq!(page.requests[0].attempts, 0);
+        assert!(page.requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_usage_outcome_is_hidden_from_usage_but_counted_as_health_success() {
+        let repository = repository().await;
+        write_custom_observation(
+            &repository,
+            "zero-usage",
+            LogicalStatus::Succeeded,
+            zero_observation(Vec::new()),
+        )
+        .await;
+
+        let scope = scope("user-1");
+        assert_eq!(
+            repository
+                .overview(&scope)
+                .await
+                .expect("overview")
+                .logical_requests,
+            0
+        );
+        assert!(
+            repository
+                .request_attempt(&scope, "zero-usage")
+                .await
+                .expect("detail")
+                .is_none()
+        );
+
+        let health = repository
+            .provider_health(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("health");
+        assert_eq!(health[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn positive_non_token_billable_is_valid_usage() {
+        let repository = repository().await;
+        write_custom_observation(
+            &repository,
+            "tool-call-usage",
+            LogicalStatus::Succeeded,
+            zero_observation(vec![BillableObservation {
+                component_code: BillableComponentCode::ServerToolCall,
+                unit: BillableUnit::Calls,
+                quantity: 1,
+            }]),
+        )
+        .await;
+
+        let scope = scope("user-1");
+        assert_eq!(
+            repository
+                .overview(&scope)
+                .await
+                .expect("overview")
+                .logical_requests,
+            1
+        );
+        let detail = repository
+            .request_attempt(&scope, "tool-call-usage")
+            .await
+            .expect("detail")
+            .expect("billable-only Usage is visible");
+        assert_eq!(detail.observation.billable.len(), 1);
+        assert_eq!(detail.observation.billable[0].quantity, 1);
     }
 
     #[tokio::test]
@@ -838,7 +1047,7 @@ mod tests {
         .await;
 
         let overview = repository
-            .overview(&scope("user-1", AttributionBasis::UserFinalAttempt))
+            .overview(&scope("user-1"))
             .await
             .expect("overview");
         assert_eq!(overview.logical_requests, 1);
@@ -855,7 +1064,7 @@ mod tests {
             .await;
         }
 
-        let scoped = scope("user-1", AttributionBasis::UserFinalAttempt);
+        let scoped = scope("user-1");
         let mut seen = Vec::new();
         let mut cursor = None;
         loop {
@@ -891,8 +1100,11 @@ mod tests {
                 request_id: "still-running".to_owned(),
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: None,
+                api_key_label: None,
+                api_key_group_label: None,
                 client_model_raw: None,
                 routing_model: None,
+                reasoning_effort: None,
                 started_at_ms: T0 - 200 * HOUR,
             })
             .await
@@ -917,30 +1129,6 @@ mod tests {
                 .await
                 .expect("load")
                 .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn usage_without_a_key_is_its_own_row_not_folded_into_another() {
-        let repository = repository().await;
-        let mut keyless = Written::new("keyless", "user-1", T0 + HOUR);
-        keyless.key = None;
-        write(&repository, &keyless).await;
-        write(&repository, &Written::new("keyed", "user-1", T0 + HOUR)).await;
-
-        let summaries = repository
-            .key_summaries(&scope("user-1", AttributionBasis::UserFinalAttempt))
-            .await
-            .expect("keys");
-        assert_eq!(summaries.len(), 2);
-        assert!(
-            summaries.iter().any(|summary| summary.api_key_id.is_none()),
-            "requests recorded without a key keep their own row"
-        );
-        assert!(
-            summaries
-                .iter()
-                .any(|summary| summary.api_key_id.as_deref() == Some("key-1"))
         );
     }
 }

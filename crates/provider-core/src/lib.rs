@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod bounded_body;
 pub mod management;
 pub mod model;
 pub mod protocol;
@@ -18,23 +19,30 @@ pub use account::{
     CredentialUpdate, CredentialWriteOutcome, NewCredential, NewProviderAccount, ProviderAccount,
     ProviderAccountAccess, ProviderAccountCreateOutcome, ProviderAccountSummary,
     ProviderAccountUpdate, ProviderKind, ProviderKindError, ProviderManagementRepository,
-    ProviderVisibility, ProviderVisibilityError, RefreshError, RefreshErrorKind, RefreshOutcome,
-    RefreshTrigger, StoredCredential, StoredProviderAccount,
+    ProviderSnapshot, ProviderSnapshotWriteOutcome, ProviderVisibility, ProviderVisibilityError,
+    RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger, StoredCredential,
+    StoredProviderAccount,
 };
+pub use bounded_body::{BoundedBodyError, collect_bounded_body};
 pub use management::{
     AccountProvisioningInput, ManagedProviderDriver, PendingProviderOAuth,
     ProviderConfigurationError, ProviderControl, ProviderControlError, ProviderOAuthChallenge,
     StartedProviderOAuth,
 };
 pub use model::{
-    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, StoredProviderModel,
+    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, ProviderModelPricing,
+    ProviderModelPricingCatalog, ProviderModelPricingRecord, ProviderModelPricingSource,
+    ProviderModelPricingTier, StoredProviderModel,
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{
     Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderRoute,
     ProviderRouteCandidate, ProviderRouter, ProviderStream, RoutableProviderModel,
 };
-pub use proxy::{ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService, RequestMetadata};
+pub use proxy::{
+    PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,
+    RequestMetadata,
+};
 pub use quota::{
     ProviderQuotaControl, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
     ProviderQuotaFreshness, ProviderQuotaObservation, ProviderQuotaSnapshot, ProviderQuotaSource,

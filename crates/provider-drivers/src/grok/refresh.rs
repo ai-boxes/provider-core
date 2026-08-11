@@ -1,4 +1,4 @@
-use provider_core::{RefreshError, RefreshErrorKind};
+use provider_core::{BoundedBodyError, RefreshError, RefreshErrorKind, collect_bounded_body};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -65,18 +65,18 @@ impl GrokRefreshClient {
                 )
             })?;
         let status = response.status();
-        let body = response.bytes().await.map_err(|_| {
-            RefreshError::new(
-                RefreshErrorKind::Transient,
-                "failed to read Grok token refresh response",
-            )
-        })?;
-        if body.len() > MAX_TOKEN_RESPONSE_SIZE {
-            return Err(RefreshError::new(
-                RefreshErrorKind::Transient,
-                "Grok token refresh response was too large",
-            ));
-        }
+        let body = collect_bounded_body(response.bytes_stream(), MAX_TOKEN_RESPONSE_SIZE)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    "failed to read Grok token refresh response",
+                ),
+                BoundedBodyError::TooLarge => RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    "Grok token refresh response was too large",
+                ),
+            })?;
 
         if !status.is_success() {
             let error_code = serde_json::from_slice::<OAuthErrorResponse>(&body)

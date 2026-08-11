@@ -1,11 +1,11 @@
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashSet, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use thiserror::Error;
 
-use crate::{ProviderModel, ProviderRequest, WireFormat};
+use crate::{AccountId, ProviderModel, ProviderRequest, WireFormat};
 
 /// Byte stream crossing the provider and protocol boundaries.
 pub type ProviderStream =
@@ -86,6 +86,15 @@ pub trait ProviderRoute: Send + Sync {
 
     fn native_format(&self) -> WireFormat;
 
+    fn usage_profile(&self) -> Option<crate::usage::ProviderUsageProfile> {
+        None
+    }
+
+    /// Maximum number of real upstream attempts one execution can make.
+    fn maximum_attempts(&self) -> u32 {
+        1
+    }
+
     /// Execute the request, opening one tracked attempt per real upstream call.
     ///
     /// `tracking` is threaded down here rather than handled by the caller because
@@ -94,6 +103,7 @@ pub trait ProviderRoute: Send + Sync {
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        pricing: Option<&crate::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError>;
 
@@ -103,6 +113,7 @@ pub trait ProviderRoute: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRouteCandidate {
     pub upstream_model: String,
+    pub pricing: Option<crate::ProviderModelPricingRecord>,
     pub route: Arc<dyn ProviderRoute>,
 }
 
@@ -114,7 +125,11 @@ pub struct RoutableProviderModel {
 
 /// In-memory model index used before protocol conversion and provider execution.
 pub trait ProviderRouter: Send + Sync {
-    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel>;
+    fn models(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel>;
 
     fn routes(
         &self,
@@ -122,6 +137,7 @@ pub trait ProviderRouter: Send + Sync {
         model: &str,
         native_formats: &[WireFormat],
         session_id: Option<&str>,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate>;
 }
 

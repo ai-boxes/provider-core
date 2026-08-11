@@ -1,0 +1,8 @@
+.git
+target
+data
+docs
+**/*.md
+.idea
+.vscode
+.cargo-docker

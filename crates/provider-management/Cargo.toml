@@ -13,5 +13,8 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true

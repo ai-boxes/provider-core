@@ -1,4 +1,4 @@
-use provider_core::{CredentialKind, ProviderConfigurationError};
+use provider_core::{CredentialKind, ProviderConfigurationError, ProviderError, ProviderErrorKind};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -24,32 +24,43 @@ impl CompatibleConfig {
             ProviderConfigurationError::new("failed to serialize provider configuration")
         })
     }
+
+    pub(crate) fn build_client(&self) -> Result<reqwest::Client, ProviderError> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "failed to build compatible upstream client",
+                )
+            })
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct CompatibleCredentials {
-    pub api_key: Option<SecretString>,
+    pub api_key: SecretString,
 }
 
 impl CompatibleCredentials {
     pub(crate) fn from_input(
-        api_key: Option<SecretString>,
+        api_key: SecretString,
     ) -> Result<(CredentialKind, SecretString), ProviderConfigurationError> {
-        let api_key = api_key
-            .map(|value| value.expose_secret().trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let kind = if api_key.is_some() {
-            CredentialKind::ApiKey
-        } else {
-            CredentialKind::None
-        };
+        let api_key = api_key.expose_secret().trim().to_owned();
+        if api_key.is_empty() {
+            return Err(ProviderConfigurationError::new(
+                "compatible provider api_key must not be empty",
+            ));
+        }
         let credential_json = serde_json::to_string(&CredentialDocument {
-            auth_kind: kind.as_str(),
-            api_key: api_key.as_deref(),
+            auth_kind: CredentialKind::ApiKey.as_str(),
+            api_key: &api_key,
         })
         .map(SecretString::from)
         .map_err(|_| ProviderConfigurationError::new("failed to serialize provider credential"))?;
-        Ok((kind, credential_json))
+        Ok((CredentialKind::ApiKey, credential_json))
     }
 
     pub(crate) fn parse(
@@ -66,23 +77,20 @@ impl CompatibleCredentials {
                 "{provider} credential type does not match credential_kind"
             )));
         }
-        let api_key = document
-            .api_key
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(SecretString::from);
-        match kind {
-            CredentialKind::ApiKey if api_key.is_none() => Err(ProviderConfigurationError::new(
-                format!("{provider} credential is missing api_key"),
-            )),
-            CredentialKind::None if api_key.is_some() => Err(ProviderConfigurationError::new(
-                format!("{provider} credential_kind none must not contain api_key"),
-            )),
-            CredentialKind::Oauth => Err(ProviderConfigurationError::new(format!(
-                "{provider} does not support OAuth credentials"
-            ))),
-            _ => Ok(Self { api_key }),
+        if kind != CredentialKind::ApiKey {
+            return Err(ProviderConfigurationError::new(format!(
+                "{provider} requires API key credentials"
+            )));
         }
+        let api_key = document.api_key.trim().to_owned();
+        if api_key.is_empty() {
+            return Err(ProviderConfigurationError::new(format!(
+                "{provider} credential is missing api_key"
+            )));
+        }
+        Ok(Self {
+            api_key: SecretString::from(api_key),
+        })
     }
 }
 
@@ -107,23 +115,72 @@ fn normalize_base_url(
     let url = reqwest::Url::parse(&base_url).map_err(|_| {
         ProviderConfigurationError::new(format!("{provider} base_url must be an absolute URL"))
     })?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if url.scheme() != "https" || url.host_str().is_none() {
         return Err(ProviderConfigurationError::new(format!(
-            "{provider} base_url must use HTTP or HTTPS and include a host"
+            "{provider} base_url must use HTTPS and include a host"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ProviderConfigurationError::new(format!(
+            "{provider} base_url must not contain userinfo"
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ProviderConfigurationError::new(format!(
+            "{provider} base_url must not contain a query or fragment"
         )));
     }
     Ok(base_url)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatible_base_url_requires_https_without_userinfo() {
+        for rejected in [
+            "http://api.example.com/v1",
+            "https://user:secret@api.example.com/v1",
+        ] {
+            assert!(
+                normalize_base_url("Compatible", rejected).is_err(),
+                "{rejected}"
+            );
+        }
+        assert_eq!(
+            normalize_base_url("Compatible", " https://api.example.com/v1/ ")
+                .expect("valid HTTPS URL"),
+            "https://api.example.com/v1"
+        );
+
+        for accepted in [
+            "https://127.0.0.1/v1",
+            "https://127.1/v1",
+            "https://2130706433/v1",
+            "https://0x7f000001/v1",
+            "https://10.0.0.1/v1",
+            "https://[::1]/v1",
+            "https://localhost/v1",
+            "https://models.internal/v1",
+        ] {
+            assert!(
+                normalize_base_url("Compatible", accepted).is_ok(),
+                "{accepted}"
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CredentialDocument<'a> {
     auth_kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_key: Option<&'a str>,
+    api_key: &'a str,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CredentialDocumentOwned {
     auth_kind: String,
-    api_key: Option<String>,
+    api_key: String,
 }

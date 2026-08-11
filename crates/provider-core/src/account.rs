@@ -97,7 +97,6 @@ pub struct ProviderKindError;
 pub enum CredentialKind {
     Oauth,
     ApiKey,
-    None,
 }
 
 impl CredentialKind {
@@ -106,7 +105,6 @@ impl CredentialKind {
         match self {
             Self::Oauth => "oauth",
             Self::ApiKey => "api_key",
-            Self::None => "none",
         }
     }
 }
@@ -118,7 +116,6 @@ impl FromStr for CredentialKind {
         match value.trim() {
             "oauth" => Ok(Self::Oauth),
             "api_key" => Ok(Self::ApiKey),
-            "none" => Ok(Self::None),
             _ => Err(CredentialKindError),
         }
     }
@@ -213,6 +210,7 @@ pub struct StoredProviderAccount {
     pub visibility: ProviderVisibility,
     pub provider: ProviderKind,
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
     pub enabled: bool,
     pub auth_state: AccountAuthState,
@@ -261,6 +259,7 @@ pub struct NewProviderAccount {
     pub id: AccountId,
     pub provider: ProviderKind,
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
     pub enabled: bool,
     pub credential: NewCredential,
@@ -273,6 +272,7 @@ pub struct ProviderAccountSummary {
     pub visibility: ProviderVisibility,
     pub provider: ProviderKind,
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
     pub credential_kind: CredentialKind,
     pub credential_revision: u64,
@@ -286,6 +286,7 @@ pub struct ProviderAccountSummary {
 #[derive(Clone, Debug)]
 pub struct ProviderAccountUpdate {
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
     pub visibility: ProviderVisibility,
     pub updated_at: i64,
@@ -312,6 +313,23 @@ pub struct CredentialUpdate {
 pub enum CredentialWriteOutcome {
     Updated { revision: u64 },
     Conflict,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSnapshot {
+    pub account: StoredProviderAccount,
+    pub models: Vec<crate::DiscoveredProviderModel>,
+    pub write_models: bool,
+    pub reset_models: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderSnapshotWriteOutcome {
+    Committed {
+        models: Vec<crate::StoredProviderModel>,
+    },
+    Conflict,
+    NotFound,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,6 +492,16 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         account_id: &AccountId,
     ) -> Result<Option<StoredProviderAccount>, AccountRepositoryError>;
 
+    /// Persist account metadata, credentials and the discovered model snapshot in one transaction.
+    /// Updates with an unchanged credential revision preserve the current authentication state;
+    /// advancing the revision owns the transition to the candidate authentication state.
+    async fn commit_provider_snapshot(
+        &self,
+        snapshot: ProviderSnapshot,
+        create: bool,
+        expected_credential_revision: Option<u64>,
+    ) -> Result<ProviderSnapshotWriteOutcome, AccountRepositoryError>;
+
     async fn create_provider_account(
         &self,
         account: NewProviderAccount,
@@ -486,6 +514,14 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         account_id: &AccountId,
         update: ProviderAccountUpdate,
     ) -> Result<bool, AccountRepositoryError>;
+
+    /// Update account metadata and its credential in one database transaction.
+    async fn update_provider_account_and_credential(
+        &self,
+        account_id: &AccountId,
+        account: ProviderAccountUpdate,
+        credential: CredentialUpdate,
+    ) -> Result<Option<CredentialWriteOutcome>, AccountRepositoryError>;
 
     async fn set_provider_account_enabled(
         &self,

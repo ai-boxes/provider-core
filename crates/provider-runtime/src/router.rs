@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::RandomState},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState},
     hash::BuildHasher,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
@@ -61,6 +61,7 @@ struct RoutedAccount {
 struct RuntimeAccountRoute {
     runtime: ProviderRuntime,
     account_id: AccountId,
+    usage_profile: Option<provider_core::usage::ProviderUsageProfile>,
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +103,7 @@ impl ProviderModelRouter {
         let route = Arc::new(RuntimeAccountRoute {
             runtime,
             account_id: account_id.clone(),
+            usage_profile: account.usage_profile(),
         });
         self.accounts().insert(
             account_id,
@@ -185,11 +187,16 @@ impl ProviderModelRouter {
 }
 
 impl ProviderRouter for ProviderModelRouter {
-    fn models(&self, user_id: &str) -> Vec<RoutableProviderModel> {
+    fn models(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel> {
         let mut models = BTreeMap::new();
         for account in self.account_snapshot().values() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
+                || account_ids.is_some_and(|ids| !ids.contains(account.account.account_id()))
             {
                 continue;
             }
@@ -201,12 +208,9 @@ impl ProviderRouter for ProviderModelRouter {
                 let effective_model = model.effective_model().to_owned();
                 let native_format = account.route.native_format();
                 let entry = models.entry(effective_model.clone()).or_insert_with(|| {
-                    let mut provider_model = serde_json::from_str::<ProviderModel>(
-                        &model.metadata_json,
-                    )
-                    .unwrap_or_else(|_| {
-                        ProviderModel::new(&effective_model, account.account.provider_name())
-                    });
+                    let mut provider_model =
+                        serde_json::from_str::<ProviderModel>(&model.metadata_json)
+                            .expect("stored provider model metadata must be valid");
                     provider_model.id = effective_model;
                     RoutableProviderModel {
                         model: provider_model,
@@ -227,12 +231,14 @@ impl ProviderRouter for ProviderModelRouter {
         model: &str,
         native_formats: &[WireFormat],
         session_id: Option<&str>,
+        account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate> {
         let mut routes = Vec::new();
         for (account_id, account) in self.account_snapshot().iter() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
                 || !native_formats.contains(&account.route.native_format())
+                || account_ids.is_some_and(|ids| !ids.contains(account_id))
             {
                 continue;
             }
@@ -246,6 +252,7 @@ impl ProviderRouter for ProviderModelRouter {
                     account_id.clone(),
                     ProviderRouteCandidate {
                         upstream_model: provider_model.upstream_model.clone(),
+                        pricing: provider_model.pricing.clone(),
                         route: account.route.clone(),
                     },
                 ));
@@ -309,13 +316,22 @@ impl ProviderRoute for RuntimeAccountRoute {
         self.runtime.native_format()
     }
 
+    fn usage_profile(&self) -> Option<provider_core::usage::ProviderUsageProfile> {
+        self.usage_profile
+    }
+
+    fn maximum_attempts(&self) -> u32 {
+        2
+    }
+
     async fn execute_stream(
         &self,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         self.runtime
-            .execute_stream_for(&self.account_id, request, tracking)
+            .execute_stream_for(&self.account_id, request, pricing, tracking)
             .await
     }
 
@@ -339,11 +355,14 @@ fn randomize_routes(inner: &RouterInner, routes: &mut [(AccountId, ProviderRoute
 
 fn random_index(state: &RandomState, counter: &AtomicU64, length: usize) -> usize {
     let value = counter.fetch_add(1, Ordering::Relaxed);
-    usize::try_from(state.hash_one(value)).unwrap_or_default() % length
+    let length = u64::try_from(length).expect("route count must fit u64");
+    usize::try_from(state.hash_one(value) % length).expect("route index must fit usize")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use futures_util::{StreamExt, stream};
     use provider_core::{
         AccountAuthState, AccountRuntimeState, ProviderVisibility, RefreshError, RefreshOutcome,
@@ -458,7 +477,7 @@ mod tests {
             )
             .expect("second routes");
 
-        let models = router.models("owner-a");
+        let models = router.models("owner-a", None);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model.id, "shared");
         assert_eq!(models[0].native_formats, [WireFormat::OpenAiResponses]);
@@ -468,12 +487,19 @@ mod tests {
                     "owner-a",
                     "grok-imagine-image",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None
                 )
                 .is_empty()
         );
 
-        let routes = router.routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None);
+        let routes = router.routes(
+            "owner-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+        );
         assert_eq!(routes.len(), 2);
         let mut outputs = Vec::new();
         for route in routes {
@@ -486,6 +512,7 @@ mod tests {
                         payload: bytes::Bytes::new(),
                         metadata: RequestMetadata::default(),
                     },
+                    None,
                     None,
                 )
                 .await
@@ -506,15 +533,53 @@ mod tests {
             outputs,
             vec!["account-a:upstream-a", "account-b:upstream-b"]
         );
+
+        let only_second = HashSet::from([second.id.clone()]);
+        let filtered_models = router.models("owner-a", Some(&only_second));
+        assert_eq!(filtered_models.len(), 1);
+        assert_eq!(filtered_models[0].model.id, "shared");
+        let filtered_routes = router.routes(
+            "owner-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            Some(&only_second),
+        );
+        assert_eq!(filtered_routes.len(), 1);
+        assert_eq!(filtered_routes[0].upstream_model, "upstream-b");
+        assert!(
+            router
+                .routes(
+                    "owner-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some(&HashSet::new()),
+                )
+                .is_empty()
+        );
+
         assert_eq!(
             router
-                .routes("owner-b", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-b",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .len(),
             1
         );
         assert_eq!(
             router
-                .routes("other-user", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "other-user",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .len(),
             1
         );
@@ -525,12 +590,24 @@ mod tests {
         );
         assert!(
             router
-                .routes("other-user", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "other-user",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .is_empty()
         );
         assert_eq!(
             router
-                .routes("owner-b", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-b",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .len(),
             1
         );
@@ -544,13 +621,25 @@ mod tests {
         ));
         assert!(
             router
-                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .is_empty()
         );
         router.claim_unowned_account_access("owner-a");
         assert_eq!(
             router
-                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .len(),
             1
         );
@@ -560,12 +649,24 @@ mod tests {
         ));
         assert!(
             router
-                .routes("owner-a", "shared", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .is_empty()
         );
         assert_eq!(
             router
-                .routes("owner-a", "updated", &[WireFormat::OpenAiResponses], None)
+                .routes(
+                    "owner-a",
+                    "updated",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None
+                )
                 .len(),
             1
         );
@@ -611,6 +712,7 @@ mod tests {
             "shared",
             &[WireFormat::OpenAiResponses],
             Some("cc_session"),
+            None,
         );
         let selected_model = first_selection[0].upstream_model.clone();
         assert_eq!(
@@ -618,7 +720,8 @@ mod tests {
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
-                Some("cc_session")
+                Some("cc_session"),
+                None
             )[0]
             .upstream_model,
             selected_model
@@ -629,7 +732,8 @@ mod tests {
                     "caller",
                     "shared",
                     &[WireFormat::OpenAiResponses],
-                    Some("different_session")
+                    Some("different_session"),
+                    None
                 )
                 .len(),
             2
@@ -655,7 +759,8 @@ mod tests {
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
-                Some("cc_session")
+                Some("cc_session"),
+                None
             )[0]
             .upstream_model,
             selected_model
@@ -672,6 +777,7 @@ mod tests {
             "shared",
             &[WireFormat::OpenAiResponses],
             Some("cc_session"),
+            None,
         )[0]
         .upstream_model
         .clone();
@@ -685,7 +791,8 @@ mod tests {
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
-                Some("cc_session")
+                Some("cc_session"),
+                None
             )[0]
             .upstream_model,
             replacement
@@ -730,7 +837,8 @@ mod tests {
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
-                Some("active-session")
+                Some("active-session"),
+                None
             )[0]
             .upstream_model,
             "upstream"
@@ -757,7 +865,8 @@ mod tests {
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
-                Some("expired-session")
+                Some("expired-session"),
+                None
             )[0]
             .upstream_model,
             "upstream"
@@ -787,7 +896,9 @@ mod tests {
             enabled: true,
             available: true,
             routable: true,
-            metadata_json: "{}".to_owned(),
+            metadata_json: serde_json::to_string(&ProviderModel::new(upstream_model, "test"))
+                .expect("serialize provider model"),
+            pricing: None,
             last_seen_at: None,
             created_at: 0,
             updated_at: 0,

@@ -1,7 +1,6 @@
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use provider_core::{RefreshError, RefreshErrorKind};
+use provider_core::{BoundedBodyError, RefreshError, RefreshErrorKind, collect_bounded_body};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,23 +69,18 @@ impl CodexRefreshClient {
             )
         })?;
         let status = response.status();
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| {
-                RefreshError::new(
+        let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => RefreshError::new(
                     RefreshErrorKind::Transient,
                     "failed to read Codex token refresh response",
-                )
-            })?;
-            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
-                return Err(RefreshError::new(
+                ),
+                BoundedBodyError::TooLarge => RefreshError::new(
                     RefreshErrorKind::Transient,
                     "Codex token refresh response was too large",
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
+                ),
+            })?;
         if !status.is_success() {
             let code = reviewed_error_code(&body);
             let kind = if status == reqwest::StatusCode::UNAUTHORIZED

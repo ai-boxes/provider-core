@@ -5,12 +5,13 @@ use std::{
 };
 
 use provider_core::{
-    AccountId, AccountProvisioningInput, CredentialKind, CredentialUpdate, CredentialWriteOutcome,
-    ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderControl,
-    ProviderControlError, ProviderKind, ProviderManagementRepository, ProviderModelOverride,
+    AccountAuthState, AccountId, AccountProvisioningInput, CredentialKind, ProviderAccountSummary,
+    ProviderAccountUpdate, ProviderControl, ProviderControlError, ProviderKind,
+    ProviderManagementRepository, ProviderModelOverride, ProviderModelPricingCatalog,
     ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness,
-    ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView, ProviderVisibility,
-    QuotaGroupAudience, StoredProviderAccount, StoredProviderModel, merge_quota_groups,
+    ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView, ProviderSnapshot,
+    ProviderSnapshotWriteOutcome, ProviderVisibility, QuotaGroupAudience, StoredCredential,
+    StoredProviderAccount, StoredProviderModel, merge_quota_groups,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -31,8 +32,17 @@ pub struct CreatedProviderAccount {
 pub struct DirectProviderAccountInput {
     pub kind: ProviderKind,
     pub label: String,
+    pub group_label: String,
     pub config_json: String,
-    pub api_key: Option<SecretString>,
+    pub api_key: SecretString,
+    pub visibility: ProviderVisibility,
+}
+
+pub struct CredentialProviderAccountInput {
+    pub kind: ProviderKind,
+    pub label: String,
+    pub group_label: String,
+    pub credential_json: SecretString,
     pub visibility: ProviderVisibility,
 }
 
@@ -48,6 +58,7 @@ pub struct ProviderCredentialReplacement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OAuthSessionStatus {
     Pending,
+    Provisioning,
     Completed,
     Failed,
     Cancelled,
@@ -61,6 +72,7 @@ pub struct OAuthSessionSnapshot {
     pub provider: ProviderKind,
     pub account_id: AccountId,
     pub label: String,
+    pub group_label: String,
     pub status: OAuthSessionStatus,
     pub challenge: ProviderOAuthChallenge,
     pub error: Option<String>,
@@ -110,7 +122,22 @@ impl ProviderManager {
         control: Arc<dyn ProviderControl>,
     ) -> Self {
         Self {
-            models: ModelCatalogService::new(repository.clone()),
+            models: ModelCatalogService::new(),
+            repository,
+            control,
+            oauth_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
+            quota: Arc::new(QuotaState::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_model_pricing_catalog(
+        repository: Arc<dyn ProviderManagementRepository>,
+        control: Arc<dyn ProviderControl>,
+        pricing: Arc<dyn ProviderModelPricingCatalog>,
+    ) -> Self {
+        Self {
+            models: ModelCatalogService::with_pricing(pricing),
             repository,
             control,
             oauth_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -125,12 +152,14 @@ impl ProviderManager {
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
+        let group_label = normalize_group_label(input.group_label)?;
         self.create_account(
             owner_user_id,
             input.kind,
             AccountProvisioningInput::Direct {
                 id,
                 label: input.label,
+                group_label,
                 config_json: input.config_json,
                 api_key: input.api_key,
             },
@@ -143,22 +172,21 @@ impl ProviderManager {
     pub async fn create_credential_account(
         &self,
         owner_user_id: &str,
-        kind: ProviderKind,
-        label: String,
-        credential_json: SecretString,
-        visibility: ProviderVisibility,
+        input: CredentialProviderAccountInput,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
         let id = generated_account_id();
+        let group_label = normalize_group_label(input.group_label)?;
         self.create_account(
             owner_user_id,
-            kind,
+            input.kind,
             AccountProvisioningInput::CredentialJson {
                 id,
-                label,
-                credential_json,
+                label: input.label,
+                group_label,
+                credential_json: input.credential_json,
             },
-            visibility,
+            input.visibility,
             now,
         )
         .await
@@ -169,14 +197,24 @@ impl ProviderManager {
         owner_user_id: &str,
         kind: ProviderKind,
         label: String,
+        group_label: String,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        if matches!(
+            kind,
+            ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible
+        ) {
+            return Err(ProviderManagerError::InvalidInput(
+                "provider does not support OAuth onboarding",
+            ));
+        }
         let label = label.trim().to_owned();
         if label.is_empty() {
             return Err(ProviderManagerError::InvalidInput(
                 "provider account label must not be empty",
             ));
         }
+        let group_label = normalize_group_label(group_label)?;
         let started = self
             .control
             .start_oauth(kind)
@@ -192,6 +230,7 @@ impl ProviderManager {
             provider: kind,
             account_id: account_id.clone(),
             label: label.clone(),
+            group_label: group_label.clone(),
             status: OAuthSessionStatus::Pending,
             challenge: started.challenge,
             error: None,
@@ -208,21 +247,27 @@ impl ProviderManager {
         let task_session_id = session_id.clone();
         let handle = tokio::spawn(async move {
             let result = match started.pending.complete().await {
-                Ok(credential_json) => manager
-                    .create_account(
-                        &owner_user_id,
-                        kind,
-                        AccountProvisioningInput::CredentialJson {
-                            id: account_id,
-                            label,
-                            credential_json,
-                        },
-                        visibility,
-                        unix_timestamp(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
+                Ok(credential_json) => {
+                    if !manager.begin_oauth_provisioning(&task_session_id) {
+                        return;
+                    }
+                    manager
+                        .create_account(
+                            &owner_user_id,
+                            kind,
+                            AccountProvisioningInput::CredentialJson {
+                                id: account_id,
+                                label,
+                                group_label,
+                                credential_json,
+                            },
+                            visibility,
+                            unix_timestamp(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
                 Err(error) => Err(error.to_string()),
             };
             manager.finish_oauth_session(&task_session_id, result);
@@ -258,13 +303,7 @@ impl ProviderManager {
         if entry.snapshot.owner_user_id != actor_user_id {
             return None;
         }
-        if entry.snapshot.status == OAuthSessionStatus::Pending {
-            if let Some(abort) = entry.abort.take() {
-                abort.abort();
-            }
-            entry.snapshot.status = OAuthSessionStatus::Cancelled;
-            entry.snapshot.error = None;
-        }
+        cancel_pending_oauth(entry);
         Some(entry.snapshot.clone())
     }
 
@@ -340,31 +379,45 @@ impl ProviderManager {
         visibility: ProviderVisibility,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
-        let account = self.control.prepare_account(kind, input)?;
-        match self
-            .repository
-            .create_provider_account(account.clone(), owner_user_id, visibility)
-            .await?
-        {
-            ProviderAccountCreateOutcome::Created => {}
-            ProviderAccountCreateOutcome::Conflict => {
-                return Err(ProviderManagerError::Conflict);
-            }
-        }
-        let stored = self.load_account(&account.id).await?;
+        let prepared = self.control.prepare_account(kind, input)?;
+        let stored = StoredProviderAccount {
+            id: prepared.id,
+            owner_user_id: Some(owner_user_id.to_owned()),
+            visibility,
+            provider: prepared.provider,
+            label: prepared.label,
+            group_label: prepared.group_label,
+            config_json: prepared.config_json,
+            enabled: prepared.enabled,
+            auth_state: AccountAuthState::Active,
+            safe_error_code: None,
+            created_at: now,
+            updated_at: now,
+            credential: StoredCredential {
+                kind: prepared.credential.kind,
+                revision: 0,
+                format_version: prepared.credential.format_version,
+                credential_json: prepared.credential.credential_json,
+                expires_at: prepared.credential.expires_at,
+                last_refreshed_at: prepared.credential.last_refreshed_at,
+                updated_at: now,
+            },
+        };
         let runtime_account = self.control.build_account(stored.clone())?;
-        let models = self.models.refresh(runtime_account.as_ref(), now).await?;
-        self.control
-            .activate_account(
-                stored.provider,
+        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        let models = self
+            .commit_candidate(
+                stored.clone(),
                 runtime_account,
-                models.models.clone(),
-                stored.access(),
+                discovered,
+                true,
+                true,
+                None,
             )
             .await?;
         Ok(CreatedProviderAccount {
             account: account_summary(&stored),
-            models,
+            models: ModelCatalogSnapshot { models },
         })
     }
 
@@ -372,33 +425,91 @@ impl ProviderManager {
         &self,
         actor_user_id: &str,
         account_id: &AccountId,
-        update: ProviderAccountUpdate,
+        mut update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountSummary, ProviderManagerError> {
         self.load_owned_account(actor_user_id, account_id).await?;
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
         let current = self.load_owned_account(actor_user_id, account_id).await?;
+        update.group_label = normalize_group_label(update.group_label)?;
         let update = self
             .control
             .prepare_account_update(current.provider, update)?;
-        let rebuild_required = current.config_json != update.config_json;
-        let access_changed = current.visibility != update.visibility;
-        if !self
-            .repository
-            .update_provider_account(account_id, update)
-            .await?
-        {
-            return Err(ProviderManagerError::NotFound);
+        let reset_models = current.config_json != update.config_json;
+        if !reset_models {
+            let access_changed = current.visibility != update.visibility;
+            if !self
+                .repository
+                .update_provider_account(account_id, update)
+                .await?
+            {
+                return Err(ProviderManagerError::NotFound);
+            }
+            let stored = self.load_account(account_id).await?;
+            if access_changed {
+                self.control
+                    .update_account_access(account_id, stored.access());
+            }
+            return Ok(account_summary(&stored));
         }
-        let stored = self.load_account(account_id).await?;
-        if access_changed {
-            self.control
-                .update_account_access(account_id, stored.access());
-        }
-        if rebuild_required {
-            self.reconcile(stored.clone()).await?;
-        }
-        Ok(account_summary(&stored))
+        let mut candidate = current.clone();
+        candidate.label = update.label;
+        candidate.group_label = update.group_label;
+        candidate.config_json = update.config_json;
+        candidate.visibility = update.visibility;
+        candidate.updated_at = update.updated_at;
+        let runtime_account = self.control.build_account(candidate.clone())?;
+        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        self.commit_candidate(
+            candidate.clone(),
+            runtime_account,
+            discovered,
+            true,
+            reset_models,
+            Some(current.credential.revision),
+        )
+        .await?;
+        Ok(account_summary(&candidate))
+    }
+
+    pub async fn update_account_with_credential(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        mut update: ProviderAccountUpdate,
+        replacement: ProviderCredentialReplacement,
+    ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
+        update.group_label = normalize_group_label(update.group_label)?;
+        let update = self
+            .control
+            .prepare_account_update(current.provider, update)?;
+        let reset_models = current.config_json != update.config_json;
+        let mut candidate = current.clone();
+        candidate.label = update.label;
+        candidate.group_label = update.group_label;
+        candidate.config_json = update.config_json;
+        candidate.visibility = update.visibility;
+        candidate.updated_at = update.updated_at;
+        candidate.auth_state = AccountAuthState::Active;
+        candidate.safe_error_code = None;
+        candidate.credential = replacement_credential(&current, replacement)?;
+        let runtime_account = self.control.build_account(candidate.clone())?;
+        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        self.commit_candidate(
+            candidate.clone(),
+            runtime_account,
+            discovered,
+            true,
+            reset_models,
+            Some(current.credential.revision),
+        )
+        .await?;
+        self.invalidate_quota(account_id);
+        Ok(account_summary(&candidate))
     }
 
     pub async fn update_credential(
@@ -411,28 +522,24 @@ impl ProviderManager {
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
         let current = self.load_owned_account(actor_user_id, account_id).await?;
-        let outcome = self
-            .repository
-            .compare_and_swap_credential(
-                account_id,
-                CredentialUpdate {
-                    expected_revision: current.credential.revision,
-                    kind: replacement.kind,
-                    format_version: replacement.format_version,
-                    credential_json: replacement.credential_json,
-                    expires_at: replacement.expires_at,
-                    last_refreshed_at: replacement.last_refreshed_at,
-                    updated_at: replacement.updated_at,
-                },
-            )
-            .await?;
-        if outcome == CredentialWriteOutcome::Conflict {
-            return Err(ProviderManagerError::Conflict);
-        }
-        let stored = self.load_account(account_id).await?;
+        let mut candidate = current.clone();
+        candidate.updated_at = replacement.updated_at;
+        candidate.auth_state = AccountAuthState::Active;
+        candidate.safe_error_code = None;
+        candidate.credential = replacement_credential(&current, replacement)?;
+        let runtime_account = self.control.build_account(candidate.clone())?;
+        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        self.commit_candidate(
+            candidate.clone(),
+            runtime_account,
+            discovered,
+            true,
+            false,
+            Some(current.credential.revision),
+        )
+        .await?;
         self.invalidate_quota(account_id);
-        self.reconcile(stored.clone()).await?;
-        Ok(account_summary(&stored))
+        Ok(account_summary(&candidate))
     }
 
     pub async fn set_account_enabled(
@@ -445,17 +552,26 @@ impl ProviderManager {
         self.load_owned_account(actor_user_id, account_id).await?;
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
-        self.load_owned_account(actor_user_id, account_id).await?;
-        if !self
-            .repository
-            .set_provider_account_enabled(account_id, enabled, updated_at)
-            .await?
-        {
-            return Err(ProviderManagerError::NotFound);
-        }
-        let stored = self.load_account(account_id).await?;
-        self.reconcile(stored.clone()).await?;
-        Ok(account_summary(&stored))
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
+        let mut candidate = current.clone();
+        candidate.enabled = enabled;
+        candidate.updated_at = updated_at;
+        let runtime_account = self.control.build_account(candidate.clone())?;
+        let discovered = if enabled {
+            self.models.discover(runtime_account.as_ref()).await?
+        } else {
+            Vec::new()
+        };
+        self.commit_candidate(
+            candidate.clone(),
+            runtime_account,
+            discovered,
+            enabled,
+            false,
+            Some(current.credential.revision),
+        )
+        .await?;
+        Ok(account_summary(&candidate))
     }
 
     pub async fn delete_account(
@@ -494,20 +610,65 @@ impl ProviderManager {
         account_id: &AccountId,
         now: i64,
     ) -> Result<ModelCatalogSnapshot, ProviderManagerError> {
-        let stored = self.load_owned_account(actor_user_id, account_id).await?;
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
+        let mut stored = self.load_owned_account(actor_user_id, account_id).await?;
+        stored.updated_at = now;
         let account = self.control.build_account(stored.clone())?;
-        let models = self.models.refresh(account.as_ref(), now).await?;
-        if stored.enabled {
-            self.control
-                .activate_account(
-                    stored.provider,
+        let discovered = self.models.discover(account.as_ref()).await?;
+        let models = self
+            .commit_candidate(
+                stored.clone(),
+                account,
+                discovered,
+                true,
+                false,
+                Some(stored.credential.revision),
+            )
+            .await?;
+        Ok(ModelCatalogSnapshot { models })
+    }
+
+    /// Re-discover every enabled account after the shared price catalog changes.
+    /// The repository synchronization updates catalog-sourced prices and the
+    /// activation replaces the routing snapshot before the cycle completes.
+    pub async fn refresh_enabled_model_catalogs(
+        &self,
+        now: i64,
+    ) -> Result<(), ProviderManagerError> {
+        let mut first_error = None;
+        for stored in self.repository.load_enabled_accounts().await? {
+            let result = async {
+                let account_id = stored.id.clone();
+                let gate = self.account_gate(&account_id);
+                let _guard = gate.lock().await;
+                let mut stored = self.load_account(&account_id).await?;
+                if !stored.enabled {
+                    return Ok(());
+                }
+                stored.updated_at = now;
+                let account = self.control.build_account(stored.clone())?;
+                let discovered = self.models.discover(account.as_ref()).await?;
+                self.commit_candidate(
+                    stored.clone(),
                     account,
-                    models.models.clone(),
-                    stored.access(),
+                    discovered,
+                    true,
+                    false,
+                    Some(stored.credential.revision),
                 )
                 .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(models)
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn update_model(
@@ -517,6 +678,9 @@ impl ProviderManager {
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<Vec<StoredProviderModel>, ProviderManagerError> {
+        self.load_owned_account(actor_user_id, account_id).await?;
+        let gate = self.account_gate(account_id);
+        let _guard = gate.lock().await;
         self.load_owned_account(actor_user_id, account_id).await?;
         if !self
             .repository
@@ -645,6 +809,11 @@ impl ProviderManager {
                 Ok(ProviderQuotaView::unsupported())
             }
             Err(error) => {
+                eprintln!(
+                    "quota fetch failed for account {}: {:?}: {error}",
+                    account_id.as_str(),
+                    error.kind()
+                );
                 let latest = self.load_visible_account(actor_user_id, account_id).await?;
                 let cached =
                     cached.filter(|entry| entry.credential_revision == latest.credential.revision);
@@ -768,20 +937,42 @@ impl ProviderManager {
         }
     }
 
-    async fn reconcile(&self, stored: StoredProviderAccount) -> Result<(), ProviderManagerError> {
-        if !stored.enabled {
-            self.control.remove_account(&stored.id).await;
-            return Ok(());
-        }
-        let models = self
+    async fn commit_candidate(
+        &self,
+        stored: StoredProviderAccount,
+        account: Arc<dyn provider_core::ProviderAccount>,
+        models: Vec<provider_core::DiscoveredProviderModel>,
+        write_models: bool,
+        reset_models: bool,
+        expected_credential_revision: Option<u64>,
+    ) -> Result<Vec<StoredProviderModel>, ProviderManagerError> {
+        let create = expected_credential_revision.is_none();
+        let outcome = self
             .repository
-            .list_provider_models(Some(&stored.id))
+            .commit_provider_snapshot(
+                ProviderSnapshot {
+                    account: stored.clone(),
+                    models,
+                    write_models,
+                    reset_models,
+                },
+                create,
+                expected_credential_revision,
+            )
             .await?;
-        let account = self.control.build_account(stored.clone())?;
-        self.control
-            .activate_account(stored.provider, account, models, stored.access())
-            .await?;
-        Ok(())
+        let models = match outcome {
+            ProviderSnapshotWriteOutcome::Committed { models } => models,
+            ProviderSnapshotWriteOutcome::Conflict => return Err(ProviderManagerError::Conflict),
+            ProviderSnapshotWriteOutcome::NotFound => return Err(ProviderManagerError::NotFound),
+        };
+        if stored.enabled {
+            self.control
+                .install_account(stored.provider, account, models.clone(), stored.access())
+                .await;
+        } else {
+            self.control.remove_account(&stored.id).await;
+        }
+        Ok(models)
     }
 
     fn finish_oauth_session(&self, session_id: &str, result: Result<(), String>) {
@@ -789,7 +980,9 @@ impl ProviderManager {
         let Some(entry) = sessions.get_mut(session_id) else {
             return;
         };
-        if entry.snapshot.status != OAuthSessionStatus::Pending {
+        if entry.snapshot.status != OAuthSessionStatus::Pending
+            && entry.snapshot.status != OAuthSessionStatus::Provisioning
+        {
             return;
         }
         entry.abort = None;
@@ -805,6 +998,14 @@ impl ProviderManager {
         }
     }
 
+    fn begin_oauth_provisioning(&self, session_id: &str) -> bool {
+        let mut sessions = self.oauth_sessions();
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        begin_oauth_provisioning_entry(entry)
+    }
+
     fn oauth_sessions(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, OAuthSessionEntry>> {
         self.oauth_sessions
             .lock()
@@ -812,11 +1013,56 @@ impl ProviderManager {
     }
 }
 
+#[cfg(test)]
+#[path = "manager_update_tests.rs"]
+mod update_tests;
+
+fn begin_oauth_provisioning_entry(entry: &mut OAuthSessionEntry) -> bool {
+    if entry.snapshot.status != OAuthSessionStatus::Pending {
+        return false;
+    }
+    entry.abort = None;
+    entry.snapshot.status = OAuthSessionStatus::Provisioning;
+    true
+}
+
+fn cancel_pending_oauth(entry: &mut OAuthSessionEntry) -> bool {
+    if entry.snapshot.status != OAuthSessionStatus::Pending {
+        return false;
+    }
+    if let Some(abort) = entry.abort.take() {
+        abort.abort();
+    }
+    entry.snapshot.status = OAuthSessionStatus::Cancelled;
+    entry.snapshot.error = None;
+    true
+}
+
 fn generated_account_id() -> AccountId {
     match AccountId::new(Uuid::new_v4().to_string()) {
         Ok(id) => id,
         Err(_) => unreachable!("UUID account ID must not be empty"),
     }
+}
+
+fn replacement_credential(
+    current: &StoredProviderAccount,
+    replacement: ProviderCredentialReplacement,
+) -> Result<StoredCredential, ProviderManagerError> {
+    let revision = current
+        .credential
+        .revision
+        .checked_add(1)
+        .ok_or(ProviderManagerError::Conflict)?;
+    Ok(StoredCredential {
+        kind: replacement.kind,
+        revision,
+        format_version: replacement.format_version,
+        credential_json: replacement.credential_json,
+        expires_at: replacement.expires_at,
+        last_refreshed_at: replacement.last_refreshed_at,
+        updated_at: replacement.updated_at,
+    })
 }
 
 fn unix_timestamp() -> i64 {
@@ -902,6 +1148,16 @@ fn quota_cache_view(
     }
 }
 
+fn normalize_group_label(group_label: String) -> Result<String, ProviderManagerError> {
+    let group_label = group_label.trim().to_owned();
+    if group_label.is_empty() || group_label.chars().count() > 64 {
+        return Err(ProviderManagerError::InvalidInput(
+            "provider group label must contain 1 to 64 characters",
+        ));
+    }
+    Ok(group_label)
+}
+
 fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
     ProviderAccountSummary {
         id: account.id.clone(),
@@ -909,6 +1165,7 @@ fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
         visibility: account.visibility,
         provider: account.provider,
         label: account.label.clone(),
+        group_label: account.group_label.clone(),
         config_json: account.config_json.clone(),
         credential_kind: account.credential.kind,
         credential_revision: account.credential.revision,
@@ -949,6 +1206,36 @@ mod tests {
         ProviderQuotaSnapshot, QuotaAmount, QuotaGroup, QuotaGroupScope, QuotaMetric,
         QuotaMetricKind, QuotaUnit,
     };
+
+    #[test]
+    fn oauth_provisioning_cannot_be_cancelled() {
+        let mut entry = OAuthSessionEntry {
+            snapshot: OAuthSessionSnapshot {
+                id: "session".to_owned(),
+                owner_user_id: "owner".to_owned(),
+                visibility: ProviderVisibility::Private,
+                provider: ProviderKind::Grok,
+                account_id: AccountId::new("account").expect("account ID"),
+                label: "Grok".to_owned(),
+                group_label: "default".to_owned(),
+                status: OAuthSessionStatus::Pending,
+                challenge: ProviderOAuthChallenge {
+                    verification_uri: "https://example.com/device".to_owned(),
+                    verification_uri_complete: None,
+                    user_code: "CODE".to_owned(),
+                    expires_at: 1,
+                    interval_seconds: 1,
+                },
+                error: None,
+            },
+            abort: None,
+        };
+
+        assert!(begin_oauth_provisioning_entry(&mut entry));
+        assert_eq!(entry.snapshot.status, OAuthSessionStatus::Provisioning);
+        assert!(!cancel_pending_oauth(&mut entry));
+        assert_eq!(entry.snapshot.status, OAuthSessionStatus::Provisioning);
+    }
 
     #[test]
     fn observation_updates_snapshot_without_changing_full_fetch_state() {

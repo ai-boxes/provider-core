@@ -3,9 +3,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use provider_core::{
-    PendingProviderOAuth, ProviderConfigurationError, ProviderOAuthChallenge, StartedProviderOAuth,
+    BoundedBodyError, PendingProviderOAuth, ProviderConfigurationError, ProviderOAuthChallenge,
+    StartedProviderOAuth, collect_bounded_body,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -195,19 +195,16 @@ async fn response_json<T: for<'de> Deserialize<'de>>(
     operation: &str,
 ) -> Result<T, ProviderConfigurationError> {
     let status = response.status();
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| {
-            ProviderConfigurationError::new(format!("failed to read {operation} response"))
+    let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => {
+                ProviderConfigurationError::new(format!("failed to read {operation} response"))
+            }
+            BoundedBodyError::TooLarge => {
+                ProviderConfigurationError::new(format!("{operation} response was too large"))
+            }
         })?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
-            return Err(ProviderConfigurationError::new(format!(
-                "{operation} response was too large"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
     if !status.is_success() {
         return Err(ProviderConfigurationError::new(format!(
             "{operation} returned HTTP {status}"

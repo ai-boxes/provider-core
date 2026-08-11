@@ -41,6 +41,20 @@ impl UnitPrice {
     pub const fn as_scaled(self) -> i128 {
         self.0
     }
+
+    /// Canonical USD-per-million decimal string at the catalog price scale.
+    #[must_use]
+    pub fn to_decimal_string(self) -> String {
+        let magnitude = self.0.unsigned_abs();
+        let divisor = 10u128.pow(PRICE_SCALE);
+        let integer = magnitude / divisor;
+        let fraction = magnitude % divisor;
+        let sign = if self.0 < 0 { "-" } else { "" };
+        format!(
+            "{sign}{integer}.{fraction:0width$}",
+            width = PRICE_SCALE as usize
+        )
+    }
 }
 
 /// A USD amount as an integer count of `10^-AMOUNT_SCALE` USD atoms.
@@ -112,6 +126,12 @@ mod tests {
         let cost = component_cost_atoms(1000, price).expect("no overflow");
         assert_eq!(cost.as_atoms(), 1000 * 3 * 10i128.pow(PRICE_SCALE));
         assert_eq!(cost.to_decimal_string(), "0.00300000000000");
+    }
+
+    #[test]
+    fn unit_price_has_a_canonical_decimal_representation() {
+        let price = UnitPrice::from_scaled(5 * 10i128.pow(PRICE_SCALE));
+        assert_eq!(price.to_decimal_string(), "5.00000000");
     }
 
     #[test]

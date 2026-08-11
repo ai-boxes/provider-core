@@ -31,6 +31,14 @@ pub struct TokenInclusionRules {
     pub audio_applicable: bool,
     /// Whether this provider reports a separate cache-write (cache creation) count.
     pub cache_write_applicable: bool,
+    /// Whether an omitted cache-read count on an otherwise usage-bearing response
+    /// is defined by this provider's wire contract to mean zero.
+    ///
+    /// This is intentionally contract-specific: generic OpenAI-shaped extraction
+    /// preserves absence, while a provider that documents omission as a cache miss
+    /// may turn it into a derived zero during normalization.
+    #[serde(default)]
+    pub missing_cache_read_means_zero: bool,
     /// Where a total token count may legitimately come from.
     pub total_source: TotalSource,
 }

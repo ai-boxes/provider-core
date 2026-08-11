@@ -17,7 +17,7 @@ use provider_core::{
     RefreshOutcome, RefreshTrigger, WireFormat,
     usage::{AttemptTracking, RequestTracking},
 };
-use provider_protocol::observe_responses_usage;
+use provider_protocol::{observe_chat_completions_usage, observe_responses_usage};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore, mpsc},
@@ -27,21 +27,22 @@ use tokio_util::{sync::CancellationToken, time::DelayQueue};
 
 /// Attach usage observation to a stream, when the wire format is one we can read.
 ///
-/// Only the OpenAI Responses observer exists so far, and only providers with an
-/// established usage contract report a profile — today just Codex, which is a
-/// Responses provider. The format check keeps a future provider on a different
-/// wire format from being silently mis-parsed: it gets an honest gap instead.
+/// Unsupported formats get an explicit observation gap rather than being
+/// silently parsed as a different protocol.
 fn observe_usage(
     stream: ProviderStream,
     attempt: Arc<dyn AttemptTracking>,
     format: WireFormat,
 ) -> ProviderStream {
-    if matches!(format, WireFormat::OpenAiResponses) {
-        return observe_responses_usage(stream, attempt);
+    match format {
+        WireFormat::OpenAiResponses => observe_responses_usage(stream, attempt),
+        WireFormat::OpenAiChatCompletions => observe_chat_completions_usage(stream, attempt),
+        _ => {
+            attempt.observation_lost();
+            attempt.finished(None);
+            stream
+        }
     }
-    attempt.observation_lost();
-    attempt.finished(None);
-    stream
 }
 
 const DEFAULT_REFRESH_CONCURRENCY: usize = 4;
@@ -140,6 +141,22 @@ impl ProviderRuntime {
         Ok(())
     }
 
+    pub async fn replace(&self, account: Arc<dyn ProviderAccount>) {
+        debug_assert_eq!(account.provider_name(), self.inner.driver.name());
+        let account_id = account.account_id().clone();
+        self.inner.accounts.write().await.insert(
+            account_id.clone(),
+            Arc::new(AccountEntry {
+                account,
+                refresh_gate: Mutex::new(()),
+            }),
+        );
+        let _ = self
+            .inner
+            .scheduler_tx
+            .send(SchedulerCommand::Reschedule(account_id));
+    }
+
     pub async fn remove(&self, account_id: &AccountId) -> bool {
         let removed = self
             .inner
@@ -175,10 +192,11 @@ impl ProviderRuntime {
         &self,
         account_id: &AccountId,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.request_account(account_id).await?;
-        self.execute_entry(entry, request, tracking).await
+        self.execute_entry(entry, request, pricing, tracking).await
     }
 
     pub async fn count_tokens_for(
@@ -274,12 +292,16 @@ impl ProviderRuntime {
         &self,
         entry: Arc<AccountEntry>,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
 
-        match self.execute_attempt(&entry, first_request, tracking).await {
+        match self
+            .execute_attempt(&entry, first_request, pricing, tracking)
+            .await
+        {
             Err(error) if error.upstream_status() == Some(401) => {
                 let account_id = entry.account.account_id().clone();
                 let refresh = self
@@ -289,7 +311,8 @@ impl ProviderRuntime {
                 // A failed refresh is not a model call, so it must not invent a
                 // second attempt.
                 refresh.map_err(refresh_provider_error)?;
-                self.execute_attempt(&entry, request, tracking).await
+                self.execute_attempt(&entry, request, pricing, tracking)
+                    .await
             }
             result => result,
         }
@@ -304,6 +327,7 @@ impl ProviderRuntime {
         &self,
         entry: &AccountEntry,
         request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         let format = request.format;
@@ -315,6 +339,7 @@ impl ProviderRuntime {
                         profile,
                         entry.account.account_id().as_str(),
                         Some(request.model.as_str()),
+                        pricing,
                     )
                 });
 
@@ -422,7 +447,7 @@ impl Provider for ProviderRuntime {
         let entry = self.selected_account().await?;
         // The bare `Provider` entry point picks any available account and carries
         // no request identity, so there is nothing to attribute an attempt to.
-        self.execute_entry(entry, request, None).await
+        self.execute_entry(entry, request, None, None).await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {

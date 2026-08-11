@@ -3,11 +3,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use futures_util::StreamExt;
 use provider_core::{
-    ProviderKind, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaSnapshot, QuotaAmount,
-    QuotaGroup, QuotaGroupAudience, QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod,
-    QuotaPeriodKind, QuotaScalar, QuotaUnit,
+    BoundedBodyError, ProviderKind, ProviderQuotaError, ProviderQuotaErrorKind,
+    ProviderQuotaSnapshot, QuotaAmount, QuotaGroup, QuotaGroupAudience, QuotaGroupScope,
+    QuotaMetric, QuotaMetricKind, QuotaPeriod, QuotaPeriodKind, QuotaScalar, QuotaUnit,
+    collect_bounded_body,
 };
 use serde::Deserialize;
 
@@ -365,20 +365,18 @@ async fn read_limited(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<Vec<u8>, ProviderQuotaError> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| upstream_error(format!("failed to read {operation} response")))?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_SIZE {
-            return Err(ProviderQuotaError::new(
+    collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => {
+                upstream_error(format!("failed to read {operation} response"))
+            }
+            BoundedBodyError::TooLarge => ProviderQuotaError::new(
                 ProviderQuotaErrorKind::InvalidResponse,
                 format!("{operation} response was too large"),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            ),
+        })
 }
 
 fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderQuotaError {

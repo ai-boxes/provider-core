@@ -126,6 +126,7 @@ impl ManagedProviderDriver for CodexDriver {
         let AccountProvisioningInput::CredentialJson {
             id,
             label,
+            group_label,
             credential_json,
         } = input
         else {
@@ -143,6 +144,7 @@ impl ManagedProviderDriver for CodexDriver {
             id,
             provider: ProviderKind::Codex,
             label,
+            group_label,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: NewCredential {

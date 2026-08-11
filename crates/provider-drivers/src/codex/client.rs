@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use futures_util::{StreamExt, TryStreamExt};
-use provider_core::{ProviderError, ProviderErrorKind, ProviderStream};
+use futures_util::TryStreamExt;
+use provider_core::{
+    BoundedBodyError, ProviderError, ProviderErrorKind, ProviderStream, collect_bounded_body,
+};
 use reqwest::StatusCode;
 use serde_json::Value;
 
@@ -143,9 +145,10 @@ fn empty_failure(error: ProviderError) -> CodexClientFailure {
 }
 
 async fn status_error(response: reqwest::Response, status: StatusCode) -> ProviderError {
-    let error_token = read_error_body(response)
-        .await
-        .and_then(|body| reviewed_error_token(&body));
+    let (error_token, body_issue) = match read_error_body(response).await {
+        Ok(body) => (reviewed_error_token(&body), None),
+        Err(issue) => (None, Some(issue)),
+    };
     let rate_limited = error_token.as_deref().is_some_and(|token| {
         token.contains("rate_limit")
             || token.contains("usage_limit")
@@ -163,27 +166,38 @@ async fn status_error(response: reqwest::Response, status: StatusCode) -> Provid
             _ => ProviderErrorKind::Upstream,
         }
     };
-    ProviderError::new(kind, format!("Codex upstream returned HTTP {status}"))
-        .with_upstream_status(status.as_u16())
+    let message = match body_issue {
+        None => format!("Codex upstream returned HTTP {status}"),
+        Some(ErrorBodyIssue::ReadFailed) => {
+            format!("Codex upstream returned HTTP {status} with an unreadable error response")
+        }
+        Some(ErrorBodyIssue::TooLarge) => {
+            format!("Codex upstream returned HTTP {status} with an oversized error response")
+        }
+    };
+    ProviderError::new(kind, message).with_upstream_status(status.as_u16())
 }
 
-async fn read_error_body(response: reqwest::Response) -> Option<Vec<u8>> {
+#[derive(Clone, Copy)]
+enum ErrorBodyIssue {
+    ReadFailed,
+    TooLarge,
+}
+
+async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBodyIssue> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_RESPONSE_SIZE as u64)
     {
-        return None;
+        return Err(ErrorBodyIssue::TooLarge);
     }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.ok()?;
-        if body.len().saturating_add(chunk.len()) > MAX_ERROR_RESPONSE_SIZE {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Some(body)
+    collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE)
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
+            BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
+        })
 }
 
 fn reviewed_error_token(body: &[u8]) -> Option<String> {

@@ -8,8 +8,11 @@ use axum::{
     routing::post,
 };
 use futures_util::stream;
-use provider_auth::{ApiKeyAuthenticator, AuthService};
-use provider_core::ProxyService;
+use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
+use provider_core::{
+    AccountId, CredentialKind, NewCredential, NewProviderAccount, ProviderKind,
+    ProviderManagementRepository, ProviderVisibility, ProxyService,
+};
 use provider_drivers::grok::GrokDriver;
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntime;
@@ -102,17 +105,42 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         )
         .await
         .expect("initial setup");
+    let now = unix_timestamp();
+    repository
+        .create_provider_account(
+            NewProviderAccount {
+                id: AccountId::new("acct-grok-1").expect("account ID"),
+                provider: ProviderKind::Grok,
+                label: "seed".to_owned(),
+                group_label: "default".to_owned(),
+                config_json: "{}".to_owned(),
+                enabled: true,
+                credential: NewCredential {
+                    kind: CredentialKind::ApiKey,
+                    format_version: 1,
+                    credential_json: SecretString::from("seed-secret".to_owned()),
+                    expires_at: None,
+                    last_refreshed_at: None,
+                },
+            },
+            grant.user.id.as_str(),
+            ProviderVisibility::Private,
+        )
+        .await
+        .expect("seed provider account");
     let api_keys = ApiKeyAuthenticator::load(repository)
         .await
         .expect("API key index");
     let created_key = api_keys
-        .create(
-            &grant.user.id,
-            "test".to_owned(),
-            Some(SecretString::from("test-api-key-123".to_owned())),
-            None,
-            unix_timestamp(),
-        )
+        .create(CreateApiKeyInput {
+            owner_user_id: &grant.user.id,
+            secret: SecretString::from("test-api-key"),
+            group_label: "default".to_owned(),
+            label: "test".to_owned(),
+            expires_at: None,
+            quota_limit_usd: None,
+            now,
+        })
         .await
         .expect("create API key");
     let api_key = created_key.key.expose_secret().to_owned();

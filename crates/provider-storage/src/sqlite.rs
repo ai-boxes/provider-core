@@ -1,18 +1,29 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
-use provider_auth::{
-    ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey, NewSession,
-    NewUser, RefreshSessionOutcome, SessionId, StoredApiKey, StoredSession, StoredUser, UserId,
-    UserRole, UserSummary,
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
 };
+use provider_auth::{
+    ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey,
+    NewRegistrationCode, NewSession, NewUser, QuotaAdmissionOutcome, RegisterUserOutcome,
+    SessionId, StoredApiKey, StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserRole,
+    UserSummary, atoms_ge,
+};
+#[cfg(test)]
+use provider_core::ProviderModelPricingTier;
 use provider_core::{
     AccountAuthState, AccountId, AccountRepository, AccountRepositoryError, CredentialKind,
     CredentialUpdate, CredentialWriteOutcome, DiscoveredProviderModel, NewProviderAccount,
     ProviderAccountCreateOutcome, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
-    ProviderManagementRepository, ProviderModelOverride, ProviderVisibility, StoredCredential,
-    StoredProviderAccount, StoredProviderModel,
+    ProviderManagementRepository, ProviderModelOverride, ProviderModelPricing,
+    ProviderModelPricingRecord, ProviderModelPricingSource, ProviderSnapshot,
+    ProviderSnapshotWriteOutcome, ProviderVisibility, StoredCredential, StoredProviderAccount,
+    StoredProviderModel,
 };
+use provider_usage::{component_prices_from_model_pricing, context_price_tiers_from_model_pricing};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{
     ConnectOptions, Row, SqlitePool,
@@ -25,10 +36,22 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct SqliteAccountRepository {
     pool: SqlitePool,
+    credential_cipher: CredentialCipher,
 }
 
+#[derive(Clone)]
+struct CredentialCipher {
+    cipher: XChaCha20Poly1305,
+}
+
+const CREDENTIAL_CIPHERTEXT_VERSION: &str = "v1";
+const CREDENTIAL_NONCE_BYTES: usize = 24;
+
 impl SqliteAccountRepository {
-    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, AccountRepositoryError> {
+    pub async fn connect(
+        path: impl AsRef<Path>,
+        credential_key: [u8; 32],
+    ) -> Result<Self, AccountRepositoryError> {
         let path = path.as_ref();
         prepare_data_directory(path)?;
 
@@ -51,7 +74,10 @@ impl SqliteAccountRepository {
             .map_err(|error| repository_error("failed to run SQLite migrations", error))?;
         restrict_sqlite_permissions(path)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            credential_cipher: CredentialCipher::new(credential_key),
+        })
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -72,7 +98,10 @@ impl SqliteAccountRepository {
             .run(&pool)
             .await
             .map_err(|error| repository_error("failed to run test SQLite migrations", error))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            credential_cipher: CredentialCipher::new([0x5a; 32]),
+        })
     }
 
     /// Observed usage facts live in the same database, so they share this pool
@@ -96,6 +125,7 @@ impl AccountRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -119,7 +149,9 @@ impl AccountRepository for SqliteAccountRepository {
         .await
         .map_err(|error| repository_error("failed to load provider accounts", error))?;
 
-        rows.into_iter().map(stored_account).collect()
+        rows.into_iter()
+            .map(|row| stored_account(row, &self.credential_cipher))
+            .collect()
     }
 
     async fn compare_and_swap_credential(
@@ -155,7 +187,10 @@ impl AccountRepository for SqliteAccountRepository {
         )
         .bind(update.kind.as_str())
         .bind(format_version)
-        .bind(update.credential_json.expose_secret())
+        .bind(
+            self.credential_cipher
+                .encrypt(account_id, &update.credential_json)?,
+        )
         .bind(update.expires_at)
         .bind(update.last_refreshed_at)
         .bind(update.updated_at)
@@ -240,6 +275,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -275,6 +311,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.visibility,
                 a.provider,
                 a.label,
+                a.group_label,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -298,7 +335,242 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .await
         .map_err(|error| repository_error("failed to load provider account", error))?;
 
-        row.map(stored_account).transpose()
+        row.map(|row| stored_account(row, &self.credential_cipher))
+            .transpose()
+    }
+
+    async fn commit_provider_snapshot(
+        &self,
+        snapshot: ProviderSnapshot,
+        create: bool,
+        expected_credential_revision: Option<u64>,
+    ) -> Result<ProviderSnapshotWriteOutcome, AccountRepositoryError> {
+        let account = snapshot.account;
+        let credential_ciphertext = self
+            .credential_cipher
+            .encrypt(&account.id, &account.credential.credential_json)?;
+        let revision = database_integer(account.credential.revision, "credential revision")?;
+        let format_version = i64::from(account.credential.format_version);
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            repository_error("failed to start provider snapshot transaction", error)
+        })?;
+
+        if create {
+            let inserted = sqlx::query(
+                r#"
+                INSERT INTO provider_accounts
+                    (id, owner_user_id, visibility, provider, label, group_label, config_json,
+                     enabled, auth_state, safe_error_code, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                "#,
+            )
+            .bind(account.id.as_str())
+            .bind(account.owner_user_id.as_deref())
+            .bind(account.visibility.as_str())
+            .bind(account.provider.as_str())
+            .bind(&account.label)
+            .bind(&account.group_label)
+            .bind(&account.config_json)
+            .bind(database_bool(account.enabled))
+            .bind(account.auth_state.as_str())
+            .bind(account.safe_error_code.as_deref())
+            .bind(account.created_at)
+            .bind(account.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| repository_error("failed to create provider snapshot", error))?;
+            if inserted.rows_affected() == 0 {
+                transaction.rollback().await.map_err(|error| {
+                    repository_error("failed to roll back provider snapshot conflict", error)
+                })?;
+                return Ok(ProviderSnapshotWriteOutcome::Conflict);
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO provider_credentials
+                    (account_id, credential_kind, revision, format_version, credential_json,
+                     expires_at, last_refreshed_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(account.id.as_str())
+            .bind(account.credential.kind.as_str())
+            .bind(revision)
+            .bind(format_version)
+            .bind(&credential_ciphertext)
+            .bind(account.credential.expires_at)
+            .bind(account.credential.last_refreshed_at)
+            .bind(account.credential.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                repository_error("failed to create provider credential snapshot", error)
+            })?;
+        } else {
+            let Some(expected_revision) = expected_credential_revision else {
+                return Err(AccountRepositoryError::new(
+                    "provider snapshot update requires an expected credential revision",
+                ));
+            };
+            let write_auth_state = account.credential.revision > expected_revision;
+            let expected_revision = database_integer(expected_revision, "credential revision")?;
+            let updated = if write_auth_state {
+                sqlx::query(
+                    r#"
+                    UPDATE provider_accounts
+                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, config_json = ?,
+                        enabled = ?, auth_state = ?, safe_error_code = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(account.owner_user_id.as_deref())
+                .bind(account.visibility.as_str())
+                .bind(&account.label)
+                .bind(&account.group_label)
+                .bind(&account.config_json)
+                .bind(database_bool(account.enabled))
+                .bind(account.auth_state.as_str())
+                .bind(account.safe_error_code.as_deref())
+                .bind(account.updated_at)
+                .bind(account.id.as_str())
+                .execute(&mut *transaction)
+                .await
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE provider_accounts
+                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, config_json = ?,
+                        enabled = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(account.owner_user_id.as_deref())
+                .bind(account.visibility.as_str())
+                .bind(&account.label)
+                .bind(&account.group_label)
+                .bind(&account.config_json)
+                .bind(database_bool(account.enabled))
+                .bind(account.updated_at)
+                .bind(account.id.as_str())
+                .execute(&mut *transaction)
+                .await
+            }
+            .map_err(|error| repository_error("failed to update provider snapshot", error))?;
+            if updated.rows_affected() == 0 {
+                transaction.rollback().await.map_err(|error| {
+                    repository_error("failed to roll back missing provider snapshot", error)
+                })?;
+                return Ok(ProviderSnapshotWriteOutcome::NotFound);
+            }
+            let credential = sqlx::query(
+                r#"
+                UPDATE provider_credentials
+                SET revision = ?, credential_kind = ?, format_version = ?, credential_json = ?,
+                    expires_at = ?, last_refreshed_at = ?, updated_at = ?
+                WHERE account_id = ? AND revision = ?
+                "#,
+            )
+            .bind(revision)
+            .bind(account.credential.kind.as_str())
+            .bind(format_version)
+            .bind(&credential_ciphertext)
+            .bind(account.credential.expires_at)
+            .bind(account.credential.last_refreshed_at)
+            .bind(account.credential.updated_at)
+            .bind(account.id.as_str())
+            .bind(expected_revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                repository_error("failed to update provider credential snapshot", error)
+            })?;
+            if credential.rows_affected() == 0 {
+                transaction.rollback().await.map_err(|error| {
+                    repository_error("failed to roll back provider snapshot conflict", error)
+                })?;
+                return Ok(ProviderSnapshotWriteOutcome::Conflict);
+            }
+        }
+
+        if snapshot.write_models && snapshot.reset_models {
+            sqlx::query("DELETE FROM provider_models WHERE account_id = ?")
+                .bind(account.id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    repository_error("failed to reset provider model snapshot", error)
+                })?;
+        } else if snapshot.write_models {
+            sqlx::query(
+                "UPDATE provider_models SET available = 0, updated_at = ? WHERE account_id = ?",
+            )
+            .bind(account.updated_at)
+            .bind(account.id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                repository_error("failed to invalidate provider model snapshot", error)
+            })?;
+        }
+        for model in snapshot.models {
+            let (pricing_source, pricing_json) = encode_model_pricing(model.pricing.as_ref())?;
+            sqlx::query(
+                r#"
+                INSERT INTO provider_models
+                    (account_id, upstream_model, enabled, available, routable, metadata_json,
+                     pricing_source, pricing_json, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, upstream_model) DO UPDATE SET
+                    available = 1,
+                    routable = excluded.routable,
+                    metadata_json = excluded.metadata_json,
+                    pricing_source = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
+                        ELSE excluded.pricing_source
+                    END,
+                    pricing_json = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_json
+                        ELSE excluded.pricing_json
+                    END,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(account.id.as_str())
+            .bind(model.upstream_model)
+            .bind(database_bool(model.routable))
+            .bind(model.metadata_json)
+            .bind(pricing_source)
+            .bind(pricing_json)
+            .bind(account.updated_at)
+            .bind(account.updated_at)
+            .bind(account.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| repository_error("failed to write provider model snapshot", error))?;
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+                   pricing_source, pricing_json, last_seen_at, created_at, updated_at
+            FROM provider_models
+            WHERE account_id = ?
+            ORDER BY upstream_model
+            "#,
+        )
+        .bind(account.id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to read committed provider models", error))?;
+        let models = rows
+            .into_iter()
+            .map(stored_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().await.map_err(|error| {
+            repository_error("failed to commit provider snapshot transaction", error)
+        })?;
+        Ok(ProviderSnapshotWriteOutcome::Committed { models })
     }
 
     async fn create_provider_account(
@@ -316,8 +588,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let inserted = sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, owner_user_id, visibility, provider, label, config_json, enabled, auth_state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                (id, owner_user_id, visibility, provider, label, group_label, config_json, enabled, auth_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
             ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -326,6 +598,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .bind(visibility.as_str())
         .bind(account.provider.as_str())
         .bind(account.label)
+        .bind(account.group_label)
         .bind(account.config_json)
         .bind(database_bool(account.enabled))
         .execute(&mut *transaction)
@@ -350,7 +623,10 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .bind(account.id.as_str())
         .bind(account.credential.kind.as_str())
         .bind(format_version)
-        .bind(account.credential.credential_json.expose_secret())
+        .bind(
+            self.credential_cipher
+                .encrypt(&account.id, &account.credential.credential_json)?,
+        )
         .bind(account.credential.expires_at)
         .bind(account.credential.last_refreshed_at)
         .execute(&mut *transaction)
@@ -372,11 +648,12 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             UPDATE provider_accounts
-            SET label = ?, config_json = ?, visibility = ?, updated_at = ?
+            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(update.label)
+        .bind(update.group_label)
         .bind(update.config_json)
         .bind(update.visibility.as_str())
         .bind(update.updated_at)
@@ -385,6 +662,104 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .await
         .map_err(|error| repository_error("failed to update provider account", error))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_provider_account_and_credential(
+        &self,
+        account_id: &AccountId,
+        account: ProviderAccountUpdate,
+        credential: CredentialUpdate,
+    ) -> Result<Option<CredentialWriteOutcome>, AccountRepositoryError> {
+        let expected_revision =
+            database_integer(credential.expected_revision, "credential revision")?;
+        let next_revision = credential
+            .expected_revision
+            .checked_add(1)
+            .ok_or_else(|| AccountRepositoryError::new("credential revision overflow"))?;
+        database_integer(next_revision, "credential revision")?;
+        let format_version = i64::from(credential.format_version);
+
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            repository_error("failed to start provider update transaction", error)
+        })?;
+        let account_result = sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(account.label)
+        .bind(account.group_label)
+        .bind(account.config_json)
+        .bind(account.visibility.as_str())
+        .bind(account.updated_at)
+        .bind(account_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider account", error))?;
+        if account_result.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back missing provider update", error)
+            })?;
+            return Ok(None);
+        }
+
+        let credential_result = sqlx::query(
+            r#"
+            UPDATE provider_credentials
+            SET
+                revision = revision + 1,
+                credential_kind = ?,
+                format_version = ?,
+                credential_json = ?,
+                expires_at = ?,
+                last_refreshed_at = ?,
+                updated_at = ?
+            WHERE account_id = ? AND revision = ?
+            "#,
+        )
+        .bind(credential.kind.as_str())
+        .bind(format_version)
+        .bind(
+            self.credential_cipher
+                .encrypt(account_id, &credential.credential_json)?,
+        )
+        .bind(credential.expires_at)
+        .bind(credential.last_refreshed_at)
+        .bind(credential.updated_at)
+        .bind(account_id.as_str())
+        .bind(expected_revision)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider credential", error))?;
+        if credential_result.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                repository_error("failed to roll back credential conflict", error)
+            })?;
+            return Ok(Some(CredentialWriteOutcome::Conflict));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE provider_accounts
+            SET auth_state = 'active', safe_error_code = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(credential.updated_at)
+        .bind(account_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| repository_error("failed to update provider account state", error))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| repository_error("failed to commit provider update", error))?;
+        Ok(Some(CredentialWriteOutcome::Updated {
+            revision: next_revision,
+        }))
     }
 
     async fn set_provider_account_enabled(
@@ -429,7 +804,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
-                       last_seen_at, created_at, updated_at
+                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 WHERE account_id = ?
                 ORDER BY upstream_model
@@ -442,7 +817,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
-                       last_seen_at, created_at, updated_at
+                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 ORDER BY account_id, upstream_model
                 "#,
@@ -499,17 +874,31 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .map_err(|error| repository_error("failed to mark provider models unavailable", error))?;
 
         for model in models {
-            let upstream_model = model.upstream_model.trim();
+            let upstream_model = model.upstream_model.as_str();
+            if upstream_model.is_empty() || upstream_model.trim() != upstream_model {
+                return Err(AccountRepositoryError::new(
+                    "discovered provider model must not be empty or contain surrounding whitespace",
+                ));
+            }
+            let (pricing_source, pricing_json) = encode_model_pricing(model.pricing.as_ref())?;
             sqlx::query(
                 r#"
                 INSERT INTO provider_models
                     (account_id, upstream_model, enabled, available, routable, metadata_json,
-                     last_seen_at, updated_at)
-                VALUES (?, ?, 1, 1, ?, ?, ?, ?)
+                     pricing_source, pricing_json, last_seen_at, updated_at)
+                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, upstream_model) DO UPDATE SET
                     available = 1,
                     routable = excluded.routable,
                     metadata_json = excluded.metadata_json,
+                    pricing_source = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
+                        ELSE excluded.pricing_source
+                    END,
+                    pricing_json = CASE
+                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_json
+                        ELSE excluded.pricing_json
+                    END,
                     last_seen_at = excluded.last_seen_at,
                     updated_at = excluded.updated_at
                 "#,
@@ -518,6 +907,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             .bind(upstream_model)
             .bind(database_bool(model.routable))
             .bind(model.metadata_json)
+            .bind(pricing_source)
+            .bind(pricing_json)
             .bind(synced_at)
             .bind(synced_at)
             .execute(&mut *transaction)
@@ -538,15 +929,37 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<bool, AccountRepositoryError> {
+        let (update_pricing, pricing_json) = match update.pricing {
+            None => (false, None),
+            Some(None) => (true, None),
+            Some(Some(pricing)) => (
+                true,
+                Some(serde_json::to_string(&pricing).map_err(|error| {
+                    repository_error("failed to encode provider model pricing", error)
+                })?),
+            ),
+        };
         let result = sqlx::query(
             r#"
             UPDATE provider_models
-            SET alias = ?, enabled = ?, updated_at = ?
+            SET alias = ?,
+                enabled = ?,
+                pricing_source = CASE
+                    WHEN ? = 0 THEN pricing_source
+                    WHEN ? IS NULL THEN NULL
+                    ELSE 'manual'
+                END,
+                pricing_json = CASE WHEN ? = 0 THEN pricing_json ELSE ? END,
+                updated_at = ?
             WHERE account_id = ? AND upstream_model = ?
             "#,
         )
         .bind(update.alias)
         .bind(database_bool(update.enabled))
+        .bind(database_bool(update_pricing))
+        .bind(pricing_json.as_deref())
+        .bind(database_bool(update_pricing))
+        .bind(pricing_json)
         .bind(update.updated_at)
         .bind(account_id.as_str())
         .bind(upstream_model)
@@ -640,18 +1053,14 @@ impl AuthRepository for SqliteAccountRepository {
         sqlx::query(
             r#"
             INSERT INTO user_sessions
-                (id, user_id, access_token_hash, refresh_token_hash, access_expires_at,
-                 refresh_expires_at, absolute_expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_id, token_hash, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session.id.as_str())
         .bind(session.user_id.as_str())
-        .bind(session.access_token_hash.as_slice())
-        .bind(session.refresh_token_hash.as_slice())
-        .bind(session.access_expires_at)
-        .bind(session.refresh_expires_at)
-        .bind(session.absolute_expires_at)
+        .bind(session.token_hash.as_slice())
+        .bind(session.expires_at)
         .bind(session.created_at)
         .bind(session.created_at)
         .execute(&mut *transaction)
@@ -734,35 +1143,195 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn create_registration_code(
+        &self,
+        code: NewRegistrationCode,
+    ) -> Result<(), AuthRepositoryError> {
+        sqlx::query(
+            r#"
+            INSERT INTO registration_codes
+                (code_hash, expires_at)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(code.code_hash.as_slice())
+        .bind(code.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to create registration code", error))?;
+        Ok(())
+    }
+
+    async fn registration_code_valid(
+        &self,
+        code_hash: &[u8; 32],
+        now: i64,
+    ) -> Result<bool, AuthRepositoryError> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM registration_codes
+                WHERE code_hash = ? AND expires_at > ?
+            )
+            "#,
+        )
+        .bind(code_hash.as_slice())
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to validate registration code", error))?;
+        Ok(exists != 0)
+    }
+
+    async fn register_user(
+        &self,
+        code_hash: &[u8; 32],
+        user: NewUser,
+        session: NewSession,
+        now: i64,
+    ) -> Result<RegisterUserOutcome, AuthRepositoryError> {
+        if session.user_id != user.id {
+            return Err(AuthRepositoryError::new(
+                "registration session must belong to the registered user",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start user registration transaction", error)
+        })?;
+        let consumed =
+            sqlx::query("DELETE FROM registration_codes WHERE code_hash = ? AND expires_at > ?")
+                .bind(code_hash.as_slice())
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    auth_repository_error("failed to consume registration code", error)
+                })?;
+        if consumed.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back invalid registration code", error)
+            })?;
+            return Ok(RegisterUserOutcome::InvalidCode);
+        }
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO users
+                (id, username, password_hash, role, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(user.id.as_str())
+        .bind(user.username)
+        .bind(user.password_hash)
+        .bind(user.role.as_str())
+        .bind(database_bool(user.enabled))
+        .bind(user.created_at)
+        .bind(user.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to register user", error))?;
+        if inserted.rows_affected() == 0 {
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back registration conflict", error)
+            })?;
+            return Ok(RegisterUserOutcome::Conflict);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO user_sessions
+                (id, user_id, token_hash, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(session.id.as_str())
+        .bind(session.user_id.as_str())
+        .bind(session.token_hash.as_slice())
+        .bind(session.expires_at)
+        .bind(session.created_at)
+        .bind(session.created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to create registration session", error))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| auth_repository_error("failed to commit user registration", error))?;
+        Ok(RegisterUserOutcome::Created)
+    }
+
     async fn set_user_enabled(
         &self,
         user_id: &UserId,
         enabled: bool,
         updated_at: i64,
     ) -> Result<bool, AuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start user status transaction", error)
+        })?;
         let result = sqlx::query("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?")
             .bind(database_bool(enabled))
             .bind(updated_at)
             .bind(user_id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| auth_repository_error("failed to update user status", error))?;
+        if result.rows_affected() > 0 && !enabled {
+            sqlx::query(
+                "UPDATE user_sessions SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(updated_at)
+            .bind(updated_at)
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| auth_repository_error("failed to revoke disabled user sessions", error))?;
+            sqlx::query(
+                "UPDATE api_keys SET enabled = 0, updated_at = ? WHERE owner_user_id = ? AND enabled = 1",
+            )
+            .bind(updated_at)
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| auth_repository_error("failed to disable user API keys", error))?;
+        }
+        transaction.commit().await.map_err(|error| {
+            auth_repository_error("failed to commit user status transaction", error)
+        })?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn update_user_password(
+    async fn reset_user_password(
         &self,
         user_id: &UserId,
         password_hash: String,
         updated_at: i64,
     ) -> Result<bool, AuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start password reset transaction", error)
+        })?;
         let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
             .bind(password_hash)
             .bind(updated_at)
             .bind(user_id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| auth_repository_error("failed to update user password", error))?;
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE user_sessions SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(updated_at)
+            .bind(updated_at)
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| auth_repository_error("failed to revoke password-reset sessions", error))?;
+        }
+        transaction.commit().await.map_err(|error| {
+            auth_repository_error("failed to commit password reset transaction", error)
+        })?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -770,18 +1339,14 @@ impl AuthRepository for SqliteAccountRepository {
         sqlx::query(
             r#"
             INSERT INTO user_sessions
-                (id, user_id, access_token_hash, refresh_token_hash, access_expires_at,
-                 refresh_expires_at, absolute_expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_id, token_hash, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session.id.as_str())
         .bind(session.user_id.as_str())
-        .bind(session.access_token_hash.as_slice())
-        .bind(session.refresh_token_hash.as_slice())
-        .bind(session.access_expires_at)
-        .bind(session.refresh_expires_at)
-        .bind(session.absolute_expires_at)
+        .bind(session.token_hash.as_slice())
+        .bind(session.expires_at)
         .bind(session.created_at)
         .bind(session.created_at)
         .execute(&self.pool)
@@ -790,56 +1355,11 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(())
     }
 
-    async fn load_session_by_access_hash(
+    async fn load_session_by_token_hash(
         &self,
-        access_token_hash: &[u8; 32],
+        token_hash: &[u8; 32],
     ) -> Result<Option<StoredSession>, AuthRepositoryError> {
-        load_session(&self.pool, SESSION_BY_ACCESS_SQL, access_token_hash).await
-    }
-
-    async fn load_session_by_refresh_hash(
-        &self,
-        refresh_token_hash: &[u8; 32],
-    ) -> Result<Option<StoredSession>, AuthRepositoryError> {
-        load_session(&self.pool, SESSION_BY_REFRESH_SQL, refresh_token_hash).await
-    }
-
-    async fn rotate_session(
-        &self,
-        refresh_token_hash: &[u8; 32],
-        new_access_token_hash: [u8; 32],
-        new_refresh_token_hash: [u8; 32],
-        access_expires_at: i64,
-        refresh_expires_at: i64,
-        updated_at: i64,
-    ) -> Result<RefreshSessionOutcome, AuthRepositoryError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE user_sessions
-            SET access_token_hash = ?, refresh_token_hash = ?, access_expires_at = ?,
-                refresh_expires_at = ?, updated_at = ?
-            WHERE refresh_token_hash = ?
-              AND revoked_at IS NULL
-              AND refresh_expires_at > ?
-              AND absolute_expires_at > ?
-            "#,
-        )
-        .bind(new_access_token_hash.as_slice())
-        .bind(new_refresh_token_hash.as_slice())
-        .bind(access_expires_at)
-        .bind(refresh_expires_at)
-        .bind(updated_at)
-        .bind(refresh_token_hash.as_slice())
-        .bind(updated_at)
-        .bind(updated_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| auth_repository_error("failed to rotate user session", error))?;
-        Ok(if result.rows_affected() > 0 {
-            RefreshSessionOutcome::Updated
-        } else {
-            RefreshSessionOutcome::Invalid
-        })
+        load_session(&self.pool, SESSION_BY_TOKEN_SQL, token_hash).await
     }
 
     async fn revoke_session(
@@ -863,42 +1383,24 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn revoke_user_sessions(
-        &self,
-        user_id: &UserId,
-        revoked_at: i64,
-    ) -> Result<u64, AuthRepositoryError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE user_sessions
-            SET revoked_at = ?, updated_at = ?
-            WHERE user_id = ? AND revoked_at IS NULL
-            "#,
-        )
-        .bind(revoked_at)
-        .bind(revoked_at)
-        .bind(user_id.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(|error| auth_repository_error("failed to revoke user sessions", error))?;
-        Ok(result.rows_affected())
-    }
-
     async fn create_api_key(&self, key: NewApiKey) -> Result<bool, AuthRepositoryError> {
         let result = sqlx::query(
             r#"
             INSERT INTO api_keys
-                (id, owner_user_id, label, key, enabled, expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, owner_user_id, group_label, label, key, enabled, expires_at,
+                 quota_limit_atoms, spent_atoms, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(key.id.as_str())
         .bind(key.owner_user_id.as_str())
+        .bind(&key.group_label)
         .bind(key.label)
         .bind(key.key.expose_secret())
         .bind(database_bool(key.enabled))
         .bind(key.expires_at)
+        .bind(key.quota_limit_atoms.as_deref())
         .bind(key.created_at)
         .bind(key.created_at)
         .execute(&self.pool)
@@ -913,8 +1415,8 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
-                   created_at, updated_at
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+                   quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE owner_user_id = ?
             ORDER BY created_at, id
@@ -934,8 +1436,8 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT id, owner_user_id, label, key, enabled, expires_at, last_used_at,
-                   created_at, updated_at
+            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+                   quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE id = ? AND owner_user_id = ?
             "#,
@@ -952,26 +1454,57 @@ impl AuthRepository for SqliteAccountRepository {
         &self,
         owner_user_id: &UserId,
         key_id: &ApiKeyId,
-        enabled: bool,
-        expires_at: Option<i64>,
-        updated_at: i64,
+        update: StoredApiKeyUpdate,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
-        let row = sqlx::query(
-            r#"
-            UPDATE api_keys
-            SET enabled = ?, expires_at = ?, updated_at = ?
-            WHERE id = ? AND owner_user_id = ?
-            RETURNING id, owner_user_id, label, key, enabled, expires_at,
-                      last_used_at, created_at, updated_at
-            "#,
-        )
-        .bind(database_bool(enabled))
-        .bind(expires_at)
-        .bind(updated_at)
-        .bind(key_id.as_str())
-        .bind(owner_user_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
+        let StoredApiKeyUpdate {
+            group_label,
+            label,
+            enabled,
+            expires_at,
+            quota_limit_atoms,
+            updated_at,
+        } = update;
+        let row = if let Some(limit) = quota_limit_atoms {
+            sqlx::query(
+                r#"
+                UPDATE api_keys
+                SET group_label = ?, label = ?, enabled = ?, expires_at = ?,
+                    quota_limit_atoms = ?, updated_at = ?
+                WHERE id = ? AND owner_user_id = ?
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                          quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
+                "#,
+            )
+            .bind(&group_label)
+            .bind(&label)
+            .bind(database_bool(enabled))
+            .bind(expires_at)
+            .bind(limit.as_deref())
+            .bind(updated_at)
+            .bind(key_id.as_str())
+            .bind(owner_user_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE api_keys
+                SET group_label = ?, label = ?, enabled = ?, expires_at = ?, updated_at = ?
+                WHERE id = ? AND owner_user_id = ?
+                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                          quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
+                "#,
+            )
+            .bind(&group_label)
+            .bind(&label)
+            .bind(database_bool(enabled))
+            .bind(expires_at)
+            .bind(updated_at)
+            .bind(key_id.as_str())
+            .bind(owner_user_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+        }
         .map_err(|error| auth_repository_error("failed to update API key", error))?;
         row.map(stored_api_key).transpose()
     }
@@ -993,8 +1526,8 @@ impl AuthRepository for SqliteAccountRepository {
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT k.id, k.owner_user_id, k.label, k.key, k.enabled, k.expires_at,
-                   k.last_used_at, k.created_at, k.updated_at
+            SELECT k.id, k.owner_user_id, k.group_label, k.label, k.key, k.enabled, k.expires_at,
+                   k.quota_limit_atoms, k.spent_atoms, k.last_used_at, k.created_at, k.updated_at
             FROM api_keys AS k
             INNER JOIN users AS u ON u.id = k.owner_user_id
             WHERE k.enabled = 1 AND u.enabled = 1
@@ -1005,6 +1538,87 @@ impl AuthRepository for SqliteAccountRepository {
         .await
         .map_err(|error| auth_repository_error("failed to load active API keys", error))?;
         rows.into_iter().map(stored_api_key).collect()
+    }
+
+    async fn list_visible_account_ids_by_group_label(
+        &self,
+        actor_user_id: &UserId,
+        group_label: &str,
+    ) -> Result<Vec<String>, AuthRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id
+            FROM provider_accounts
+            WHERE group_label = ?
+              AND enabled = 1
+              AND owner_user_id IS NOT NULL
+              AND (owner_user_id = ? OR visibility = 'shared')
+            ORDER BY created_at, id
+            "#,
+        )
+        .bind(group_label)
+        .bind(actor_user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to list accounts by group label", error))?;
+        let mut account_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            account_ids.push(
+                row_value::<String>(&row, "id")
+                    .map_err(|error| AuthRepositoryError::new(error.to_string()))?,
+            );
+        }
+        Ok(account_ids)
+    }
+
+    async fn admit_api_key_quota(
+        &self,
+        api_key_id: &ApiKeyId,
+    ) -> Result<QuotaAdmissionOutcome, AuthRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT quota_limit_atoms, spent_atoms
+            FROM api_keys
+            WHERE id = ?
+            "#,
+        )
+        .bind(api_key_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| auth_repository_error("failed to load API key quota", error))?
+        .ok_or_else(|| AuthRepositoryError::new("API key quota is unavailable"))?;
+        let limit = auth_row_value::<Option<String>>(&row, "quota_limit_atoms")?;
+        let Some(limit) = limit else {
+            return Ok(QuotaAdmissionOutcome::Unlimited);
+        };
+        let spent = auth_row_value::<String>(&row, "spent_atoms")?;
+        // Reject only after lifetime spent reaches the configured limit.
+        if atoms_ge(&spent, &limit)
+            .map_err(|_| AuthRepositoryError::new("invalid quota admission value"))?
+        {
+            return Ok(QuotaAdmissionOutcome::Exceeded);
+        }
+        Ok(QuotaAdmissionOutcome::Admitted)
+    }
+
+    async fn quota_ledger_ready(&self) -> Result<(), AuthRepositoryError> {
+        let mut connection = self.pool.acquire().await.map_err(|error| {
+            auth_repository_error("failed to acquire quota ledger connection", error)
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| auth_repository_error("failed to begin quota ledger probe", error))?;
+        let probe = sqlx::query_scalar::<_, i64>("SELECT 1 FROM api_key_quota_ledger LIMIT 1")
+            .fetch_optional(&mut *connection)
+            .await;
+        let rollback = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+        probe
+            .map_err(|error| auth_repository_error("failed to probe quota ledger table", error))?;
+        rollback.map_err(|error| {
+            auth_repository_error("failed to roll back quota ledger probe", error)
+        })?;
+        Ok(())
     }
 }
 
@@ -1021,14 +1635,11 @@ async fn load_session(
     row.map(stored_session).transpose()
 }
 
-const SESSION_BY_ACCESS_SQL: &str = r#"
+const SESSION_BY_TOKEN_SQL: &str = r#"
     SELECT
         s.id,
-        s.access_token_hash,
-        s.refresh_token_hash,
-        s.access_expires_at,
-        s.refresh_expires_at,
-        s.absolute_expires_at,
+        s.token_hash,
+        s.expires_at,
         s.revoked_at,
         s.created_at,
         s.updated_at,
@@ -1040,32 +1651,86 @@ const SESSION_BY_ACCESS_SQL: &str = r#"
         u.updated_at AS user_updated_at
     FROM user_sessions AS s
     INNER JOIN users AS u ON u.id = s.user_id
-    WHERE s.access_token_hash = ?
+    WHERE s.token_hash = ?
     "#;
 
-const SESSION_BY_REFRESH_SQL: &str = r#"
-    SELECT
-        s.id,
-        s.access_token_hash,
-        s.refresh_token_hash,
-        s.access_expires_at,
-        s.refresh_expires_at,
-        s.absolute_expires_at,
-        s.revoked_at,
-        s.created_at,
-        s.updated_at,
-        u.id AS user_id,
-        u.username,
-        u.role,
-        u.enabled,
-        u.created_at AS user_created_at,
-        u.updated_at AS user_updated_at
-    FROM user_sessions AS s
-    INNER JOIN users AS u ON u.id = s.user_id
-    WHERE s.refresh_token_hash = ?
-    "#;
+impl CredentialCipher {
+    fn new(key: [u8; 32]) -> Self {
+        Self {
+            cipher: XChaCha20Poly1305::new((&key).into()),
+        }
+    }
 
-fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountRepositoryError> {
+    fn encrypt(
+        &self,
+        account_id: &AccountId,
+        plaintext: &SecretString,
+    ) -> Result<String, AccountRepositoryError> {
+        let mut nonce = [0_u8; CREDENTIAL_NONCE_BYTES];
+        getrandom::fill(&mut nonce).map_err(|error| {
+            repository_error("failed to generate provider credential nonce", error)
+        })?;
+        let nonce_value = XNonce::from(nonce);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                &nonce_value,
+                Payload {
+                    msg: plaintext.expose_secret().as_bytes(),
+                    aad: account_id.as_str().as_bytes(),
+                },
+            )
+            .map_err(|_| AccountRepositoryError::new("failed to encrypt provider credential"))?;
+        let mut encoded = Vec::with_capacity(nonce.len() + ciphertext.len());
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        Ok(format!(
+            "{CREDENTIAL_CIPHERTEXT_VERSION}:{}",
+            STANDARD_NO_PAD.encode(encoded)
+        ))
+    }
+
+    fn decrypt(
+        &self,
+        account_id: &AccountId,
+        encoded: &str,
+    ) -> Result<SecretString, AccountRepositoryError> {
+        let payload = encoded.strip_prefix("v1:").ok_or_else(|| {
+            AccountRepositoryError::new("unsupported provider credential ciphertext version")
+        })?;
+        let payload = STANDARD_NO_PAD.decode(payload).map_err(|_| {
+            AccountRepositoryError::new("provider credential ciphertext is not valid base64")
+        })?;
+        if payload.len() <= CREDENTIAL_NONCE_BYTES {
+            return Err(AccountRepositoryError::new(
+                "provider credential ciphertext is truncated",
+            ));
+        }
+        let (nonce, ciphertext) = payload.split_at(CREDENTIAL_NONCE_BYTES);
+        let nonce: [u8; CREDENTIAL_NONCE_BYTES] = nonce
+            .try_into()
+            .map_err(|_| AccountRepositoryError::new("provider credential nonce is invalid"))?;
+        let nonce = XNonce::from(nonce);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: account_id.as_str().as_bytes(),
+                },
+            )
+            .map_err(|_| AccountRepositoryError::new("failed to decrypt provider credential"))?;
+        String::from_utf8(plaintext)
+            .map(SecretString::from)
+            .map_err(|_| AccountRepositoryError::new("provider credential plaintext is not UTF-8"))
+    }
+}
+
+fn stored_account(
+    row: SqliteRow,
+    credential_cipher: &CredentialCipher,
+) -> Result<StoredProviderAccount, AccountRepositoryError> {
     let id = row_value::<String>(&row, "id")?;
     let id = AccountId::new(id).map_err(|error| {
         AccountRepositoryError::new(format!("invalid provider account ID: {error}"))
@@ -1085,6 +1750,7 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
     let revision = required_joined_value::<i64>(&row, "revision", &id)?;
     let format_version = required_joined_value::<i64>(&row, "format_version", &id)?;
     let credential_json = required_joined_value::<String>(&row, "credential_json", &id)?;
+    let credential_json = credential_cipher.decrypt(&id, &credential_json)?;
     let credential_updated_at = required_joined_value::<i64>(&row, "credential_updated_at", &id)?;
 
     Ok(StoredProviderAccount {
@@ -1093,6 +1759,7 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
         visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
+        group_label: row_value(&row, "group_label")?,
         config_json: row_value(&row, "config_json")?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
@@ -1103,7 +1770,7 @@ fn stored_account(row: SqliteRow) -> Result<StoredProviderAccount, AccountReposi
             kind: credential_kind,
             revision: non_negative_u64(revision, "credential revision")?,
             format_version: positive_u32(format_version, "credential format version")?,
-            credential_json: SecretString::from(credential_json),
+            credential_json,
             expires_at: row_value(&row, "expires_at")?,
             last_refreshed_at: row_value(&row, "last_refreshed_at")?,
             updated_at: credential_updated_at,
@@ -1135,6 +1802,7 @@ fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepo
         visibility: provider_visibility(&row)?,
         provider,
         label: row_value(&row, "label")?,
+        group_label: row_value(&row, "group_label")?,
         config_json: row_value(&row, "config_json")?,
         credential_kind,
         credential_revision: row_value::<i64>(&row, "revision")?
@@ -1153,6 +1821,10 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
     let account_id = AccountId::new(account_id).map_err(|error| {
         AccountRepositoryError::new(format!("invalid provider account ID: {error}"))
     })?;
+    let pricing = decode_model_pricing(
+        row_value(&row, "pricing_source")?,
+        row_value(&row, "pricing_json")?,
+    )?;
     Ok(StoredProviderModel {
         account_id,
         upstream_model: row_value(&row, "upstream_model")?,
@@ -1161,10 +1833,56 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
         available: row_value::<i64>(&row, "available")? != 0,
         routable: row_value::<i64>(&row, "routable")? != 0,
         metadata_json: row_value(&row, "metadata_json")?,
+        pricing,
         last_seen_at: row_value(&row, "last_seen_at")?,
         created_at: row_value(&row, "created_at")?,
         updated_at: row_value(&row, "updated_at")?,
     })
+}
+
+fn encode_model_pricing(
+    record: Option<&ProviderModelPricingRecord>,
+) -> Result<(Option<&'static str>, Option<String>), AccountRepositoryError> {
+    let Some(record) = record else {
+        return Ok((None, None));
+    };
+    let json = serde_json::to_string(&record.pricing)
+        .map_err(|error| repository_error("failed to encode provider model pricing", error))?;
+    Ok((Some(record.source.as_str()), Some(json)))
+}
+
+fn decode_model_pricing(
+    source: Option<String>,
+    json: Option<String>,
+) -> Result<Option<ProviderModelPricingRecord>, AccountRepositoryError> {
+    match (source.as_deref(), json) {
+        (None, None) => Ok(None),
+        (Some(source), Some(json)) => {
+            let source = match source {
+                "catalog" => ProviderModelPricingSource::Catalog,
+                "manual" => ProviderModelPricingSource::Manual,
+                _ => {
+                    return Err(AccountRepositoryError::new(
+                        "unknown provider model pricing source",
+                    ));
+                }
+            };
+            let pricing = serde_json::from_str::<ProviderModelPricing>(&json).map_err(|error| {
+                repository_error("failed to decode provider model pricing", error)
+            })?;
+            if component_prices_from_model_pricing(&pricing).is_none()
+                || context_price_tiers_from_model_pricing(&pricing).is_none()
+            {
+                return Err(AccountRepositoryError::new(
+                    "stored provider model pricing is invalid",
+                ));
+            }
+            Ok(Some(ProviderModelPricingRecord { source, pricing }))
+        }
+        _ => Err(AccountRepositoryError::new(
+            "provider model pricing source and json must be set together",
+        )),
+    }
 }
 
 fn provider_visibility(row: &SqliteRow) -> Result<ProviderVisibility, AccountRepositoryError> {
@@ -1207,11 +1925,8 @@ fn stored_session(row: SqliteRow) -> Result<StoredSession, AuthRepositoryError> 
             created_at: auth_row_value(&row, "user_created_at")?,
             updated_at: auth_row_value(&row, "user_updated_at")?,
         },
-        access_token_hash: auth_hash(&row, "access_token_hash")?,
-        refresh_token_hash: auth_hash(&row, "refresh_token_hash")?,
-        access_expires_at: auth_row_value(&row, "access_expires_at")?,
-        refresh_expires_at: auth_row_value(&row, "refresh_expires_at")?,
-        absolute_expires_at: auth_row_value(&row, "absolute_expires_at")?,
+        token_hash: auth_hash(&row, "token_hash")?,
+        expires_at: auth_row_value(&row, "expires_at")?,
         revoked_at: auth_row_value(&row, "revoked_at")?,
         created_at: auth_row_value(&row, "created_at")?,
         updated_at: auth_row_value(&row, "updated_at")?,
@@ -1219,13 +1934,28 @@ fn stored_session(row: SqliteRow) -> Result<StoredSession, AuthRepositoryError> 
 }
 
 fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
+    let group_label = auth_row_value::<String>(&row, "group_label")?;
+    let quota_limit_atoms = auth_row_value::<Option<String>>(&row, "quota_limit_atoms")?;
+    let spent_atoms = auth_row_value::<String>(&row, "spent_atoms")?;
+    if quota_limit_atoms
+        .as_deref()
+        .is_some_and(|value| provider_auth::format_usd_atoms(value).is_err())
+        || provider_auth::format_usd_atoms(&spent_atoms).is_err()
+    {
+        return Err(AuthRepositoryError::new(
+            "invalid API key quota ledger value",
+        ));
+    }
     Ok(StoredApiKey {
         id: auth_api_key_id(&row, "id")?,
         owner_user_id: auth_user_id(&row, "owner_user_id")?,
+        group_label,
         label: auth_row_value(&row, "label")?,
         key: SecretString::from(auth_row_value::<String>(&row, "key")?),
         enabled: auth_row_value::<i64>(&row, "enabled")? != 0,
         expires_at: auth_row_value(&row, "expires_at")?,
+        quota_limit_atoms,
+        spent_atoms,
         last_used_at: auth_row_value(&row, "last_used_at")?,
         created_at: auth_row_value(&row, "created_at")?,
         updated_at: auth_row_value(&row, "updated_at")?,
@@ -1377,6 +2107,210 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn snapshot_update_preserves_auth_state_until_credential_revision_advances() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let account_id = AccountId::new("snapshot-auth-state").expect("account ID");
+        let mut account = StoredProviderAccount {
+            id: account_id.clone(),
+            owner_user_id: None,
+            visibility: ProviderVisibility::Private,
+            provider: ProviderKind::OpenAiCompatible,
+            label: "Original".to_owned(),
+            group_label: "default".to_owned(),
+            config_json: r#"{"base_url":"https://example.com"}"#.to_owned(),
+            enabled: true,
+            auth_state: AccountAuthState::Active,
+            safe_error_code: None,
+            created_at: 1,
+            updated_at: 1,
+            credential: StoredCredential {
+                kind: CredentialKind::ApiKey,
+                revision: 0,
+                format_version: 1,
+                credential_json: SecretString::from("secret"),
+                expires_at: None,
+                last_refreshed_at: None,
+                updated_at: 1,
+            },
+        };
+        repository
+            .commit_provider_snapshot(
+                ProviderSnapshot {
+                    account: account.clone(),
+                    models: Vec::new(),
+                    write_models: false,
+                    reset_models: false,
+                },
+                true,
+                None,
+            )
+            .await
+            .expect("create snapshot");
+        repository
+            .update_auth_state(
+                &account_id,
+                AccountAuthState::ReauthRequired,
+                Some("credential_expired"),
+                2,
+            )
+            .await
+            .expect("mark reauth required");
+
+        account.label = "Refreshed models".to_owned();
+        account.updated_at = 3;
+        repository
+            .commit_provider_snapshot(
+                ProviderSnapshot {
+                    account: account.clone(),
+                    models: Vec::new(),
+                    write_models: true,
+                    reset_models: false,
+                },
+                false,
+                Some(0),
+            )
+            .await
+            .expect("refresh snapshot");
+        let preserved = repository
+            .load_provider_account(&account_id)
+            .await
+            .expect("load preserved account")
+            .expect("preserved account");
+        assert_eq!(preserved.auth_state, AccountAuthState::ReauthRequired);
+        assert_eq!(
+            preserved.safe_error_code.as_deref(),
+            Some("credential_expired")
+        );
+
+        account.credential.revision = 1;
+        account.auth_state = AccountAuthState::Active;
+        account.safe_error_code = None;
+        account.updated_at = 4;
+        repository
+            .commit_provider_snapshot(
+                ProviderSnapshot {
+                    account,
+                    models: Vec::new(),
+                    write_models: false,
+                    reset_models: false,
+                },
+                false,
+                Some(0),
+            )
+            .await
+            .expect("replace credential snapshot");
+        let restored = repository
+            .load_provider_account(&account_id)
+            .await
+            .expect("load restored account")
+            .expect("restored account");
+        assert_eq!(restored.auth_state, AccountAuthState::Active);
+        assert_eq!(restored.safe_error_code, None);
+        assert_eq!(restored.credential.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn quota_ledger_readiness_probe_is_non_mutating() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_key_quota_ledger")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count ledger before probe");
+
+        repository
+            .quota_ledger_ready()
+            .await
+            .expect("quota ledger readiness");
+
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_key_quota_ledger")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count ledger after probe");
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn password_reset_rolls_back_when_session_revocation_fails() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let user = NewUser {
+            id: UserId::new("atomic-reset-user").expect("user ID"),
+            username: "atomic-reset".to_owned(),
+            password_hash: "old-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 100,
+        };
+        repository
+            .create_initial_user(
+                user.clone(),
+                test_session("atomic-reset-session", user.id.clone(), 30),
+            )
+            .await
+            .expect("create initial user");
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_session_revoke
+            BEFORE UPDATE OF revoked_at ON user_sessions
+            BEGIN
+                SELECT RAISE(ABORT, 'session revoke failed');
+            END
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("install failure trigger");
+
+        assert!(
+            repository
+                .reset_user_password(&user.id, "new-hash".to_owned(), 150)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .load_user(&user.id)
+                .await
+                .expect("load user")
+                .expect("stored user")
+                .password_hash,
+            "old-hash"
+        );
+    }
+
+    #[test]
+    fn stored_model_pricing_rejects_invalid_price_semantics() {
+        let decode =
+            |json: &str| decode_model_pricing(Some("catalog".to_owned()), Some(json.to_owned()));
+
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_ok());
+        assert!(decode(
+            r#"{"input":"1e3","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":null,"output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":null,"output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}"#
+        )
+        .is_err());
+        assert!(decode(
+            r#"{"input":"1","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null},{"threshold_tokens":200000,"input":"3","output":null,"cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn migrates_and_compare_and_swaps_credentials() {
         let repository = SqliteAccountRepository::in_memory()
             .await
@@ -1384,20 +2318,29 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, provider, label, enabled, auth_state)
-            VALUES ('grok-main', 'grok', 'Main', 1, 'active')
+                (id, provider, label, group_label, enabled, auth_state)
+            VALUES ('grok-main', 'grok', 'Main', 'legacy', 1, 'active')
             "#,
         )
         .execute(&repository.pool)
         .await
         .expect("insert account");
+        let account_id = AccountId::new("grok-main").expect("account ID");
+        let encrypted = repository
+            .credential_cipher
+            .encrypt(
+                &account_id,
+                &SecretString::from(r#"{"access_token":"old"}"#.to_owned()),
+            )
+            .expect("encrypt credential");
         sqlx::query(
             r#"
             INSERT INTO provider_credentials
-                (account_id, revision, format_version, credential_json, expires_at)
-            VALUES ('grok-main', 0, 1, '{"access_token":"old"}', 100)
+                (account_id, credential_kind, revision, format_version, credential_json, expires_at)
+            VALUES ('grok-main', 'oauth', 0, 1, ?, 100)
             "#,
         )
+        .bind(encrypted)
         .execute(&repository.pool)
         .await
         .expect("insert credential");
@@ -1461,7 +2404,7 @@ mod tests {
             created_at: 1,
         };
         repository
-            .create_initial_user(owner.clone(), test_session("codex-session", owner.id, 7, 8))
+            .create_initial_user(owner.clone(), test_session("codex-session", owner.id, 7))
             .await
             .expect("create Codex owner");
         let account_id = AccountId::new("codex-main").expect("account ID");
@@ -1473,6 +2416,7 @@ mod tests {
             id: account_id.clone(),
             provider: ProviderKind::Codex,
             label: "Codex Main".to_owned(),
+            group_label: "default".to_owned(),
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {
@@ -1524,7 +2468,7 @@ mod tests {
                     enabled: true,
                     created_at: 1,
                 },
-                test_session("model-owner-session", owner_user_id, 20, 21),
+                test_session("model-owner-session", owner_user_id, 20),
             )
             .await
             .expect("create model owner");
@@ -1533,6 +2477,7 @@ mod tests {
             id: account_id.clone(),
             provider: ProviderKind::Grok,
             label: "Grok Models".to_owned(),
+            group_label: "default".to_owned(),
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {
@@ -1572,11 +2517,34 @@ mod tests {
                         upstream_model: "grok-a".to_owned(),
                         metadata_json: r#"{"version":1}"#.to_owned(),
                         routable: true,
+                        pricing: Some(ProviderModelPricingRecord {
+                            source: ProviderModelPricingSource::Catalog,
+                            pricing: ProviderModelPricing {
+                                input: Some("1".to_owned()),
+                                output: Some("2".to_owned()),
+                                cache_read: None,
+                                cache_write: None,
+                                reasoning: None,
+                                input_audio: None,
+                                output_audio: None,
+                                tiers: vec![ProviderModelPricingTier {
+                                    threshold_tokens: 200_000,
+                                    input: Some("2".to_owned()),
+                                    output: Some("4".to_owned()),
+                                    cache_read: None,
+                                    cache_write: None,
+                                    reasoning: None,
+                                    input_audio: None,
+                                    output_audio: None,
+                                }],
+                            },
+                        }),
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-b".to_owned(),
                         metadata_json: "{}".to_owned(),
                         routable: true,
+                        pricing: None,
                     },
                 ],
                 10,
@@ -1591,11 +2559,98 @@ mod tests {
                     ProviderModelOverride {
                         alias: Some("grok-latest".to_owned()),
                         enabled: false,
+                        pricing: None,
                         updated_at: 11,
                     },
                 )
                 .await
-                .expect("model override")
+                .expect("model override without pricing")
+        );
+        let catalog_model = repository
+            .list_provider_models(Some(&account_id))
+            .await
+            .expect("catalog model after override")
+            .into_iter()
+            .find(|model| model.upstream_model == "grok-a")
+            .expect("grok-a after override");
+        assert_eq!(
+            catalog_model
+                .pricing
+                .expect("catalog pricing remains")
+                .pricing
+                .tiers
+                .len(),
+            1,
+            "an alias/status-only edit must preserve catalog tiers"
+        );
+
+        let repriced = repository
+            .synchronize_provider_models(
+                &account_id,
+                vec![DiscoveredProviderModel {
+                    upstream_model: "grok-a".to_owned(),
+                    metadata_json: r#"{"version":1}"#.to_owned(),
+                    routable: true,
+                    pricing: Some(ProviderModelPricingRecord {
+                        source: ProviderModelPricingSource::Catalog,
+                        pricing: ProviderModelPricing {
+                            input: Some("5".to_owned()),
+                            output: Some("6".to_owned()),
+                            cache_read: None,
+                            cache_write: None,
+                            reasoning: None,
+                            input_audio: None,
+                            output_audio: None,
+                            tiers: vec![ProviderModelPricingTier {
+                                threshold_tokens: 200_000,
+                                input: Some("7".to_owned()),
+                                output: Some("8".to_owned()),
+                                cache_read: None,
+                                cache_write: None,
+                                reasoning: None,
+                                input_audio: None,
+                                output_audio: None,
+                            }],
+                        },
+                    }),
+                }],
+                12,
+            )
+            .await
+            .expect("catalog repricing sync");
+        let repriced = repriced
+            .into_iter()
+            .find(|model| model.upstream_model == "grok-a")
+            .expect("repriced grok-a")
+            .pricing
+            .expect("repriced catalog value");
+        assert_eq!(repriced.source, ProviderModelPricingSource::Catalog);
+        assert_eq!(repriced.pricing.input.as_deref(), Some("5"));
+        assert_eq!(repriced.pricing.tiers[0].output.as_deref(), Some("8"));
+
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-a",
+                    ProviderModelOverride {
+                        alias: Some("grok-latest".to_owned()),
+                        enabled: false,
+                        pricing: Some(Some(ProviderModelPricing {
+                            input: Some("3".to_owned()),
+                            output: Some("4".to_owned()),
+                            cache_read: None,
+                            cache_write: None,
+                            reasoning: None,
+                            input_audio: None,
+                            output_audio: None,
+                            tiers: Vec::new(),
+                        })),
+                        updated_at: 12,
+                    },
+                )
+                .await
+                .expect("model override and manual pricing")
         );
 
         let models = repository
@@ -1606,11 +2661,25 @@ mod tests {
                         upstream_model: "grok-a".to_owned(),
                         metadata_json: r#"{"version":2}"#.to_owned(),
                         routable: true,
+                        pricing: Some(ProviderModelPricingRecord {
+                            source: ProviderModelPricingSource::Catalog,
+                            pricing: ProviderModelPricing {
+                                input: Some("10".to_owned()),
+                                output: Some("20".to_owned()),
+                                cache_read: None,
+                                cache_write: None,
+                                reasoning: None,
+                                input_audio: None,
+                                output_audio: None,
+                                tiers: Vec::new(),
+                            },
+                        }),
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-c".to_owned(),
                         metadata_json: "{}".to_owned(),
                         routable: true,
+                        pricing: None,
                     },
                 ],
                 20,
@@ -1626,6 +2695,23 @@ mod tests {
         assert!(!model_a.enabled);
         assert!(model_a.available);
         assert_eq!(model_a.metadata_json, r#"{"version":2}"#);
+        assert_eq!(
+            model_a.pricing,
+            Some(ProviderModelPricingRecord {
+                source: ProviderModelPricingSource::Manual,
+                pricing: ProviderModelPricing {
+                    input: Some("3".to_owned()),
+                    output: Some("4".to_owned()),
+                    cache_read: None,
+                    cache_write: None,
+                    reasoning: None,
+                    input_audio: None,
+                    output_audio: None,
+                    tiers: Vec::new(),
+                },
+            }),
+            "model synchronization must preserve manual pricing"
+        );
         assert!(
             !models
                 .iter()
@@ -1640,6 +2726,32 @@ mod tests {
                 .expect("grok-c")
                 .available
         );
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-a",
+                    ProviderModelOverride {
+                        alias: None,
+                        enabled: true,
+                        pricing: Some(None),
+                        updated_at: 21,
+                    },
+                )
+                .await
+                .expect("clear model pricing")
+        );
+        assert_eq!(
+            repository
+                .list_provider_models(Some(&account_id))
+                .await
+                .expect("models after clearing pricing")
+                .into_iter()
+                .find(|model| model.upstream_model == "grok-a")
+                .expect("grok-a after clearing pricing")
+                .pricing,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1650,8 +2762,8 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, provider, label, enabled, auth_state)
-            VALUES ('existing-grok', 'grok', 'Existing Grok', 1, 'active')
+                (id, provider, label, group_label, enabled, auth_state)
+            VALUES ('existing-grok', 'grok', 'Existing Grok', 'legacy', 1, 'active')
             "#,
         )
         .execute(&repository.pool)
@@ -1670,7 +2782,7 @@ mod tests {
             repository
                 .create_initial_user(
                     initial_user.clone(),
-                    test_session("initial-session", initial_user.id.clone(), 10, 11),
+                    test_session("initial-session", initial_user.id.clone(), 10),
                 )
                 .await
                 .expect("create initial user"),
@@ -1685,7 +2797,7 @@ mod tests {
             repository
                 .create_initial_user(
                     second_user.clone(),
-                    test_session("second-session", second_user.id, 12, 13),
+                    test_session("second-session", second_user.id, 12),
                 )
                 .await
                 .expect("reject second initial user"),
@@ -1717,7 +2829,7 @@ mod tests {
         );
         assert!(
             repository
-                .load_session_by_access_hash(&[10; 32])
+                .load_session_by_token_hash(&[10; 32])
                 .await
                 .expect("load initial session")
                 .is_some()
@@ -1725,7 +2837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_rotation_consumes_the_previous_token_once() {
+    async fn opaque_session_can_be_loaded_and_revoked() {
         let repository = SqliteAccountRepository::in_memory()
             .await
             .expect("in-memory repository");
@@ -1741,7 +2853,7 @@ mod tests {
                         enabled: true,
                         created_at: 100,
                     },
-                    test_session("initial-session", user_id.clone(), 10, 11),
+                    test_session("initial-session", user_id.clone(), 10),
                 )
                 .await
                 .expect("create initial user"),
@@ -1751,50 +2863,332 @@ mod tests {
             .create_session(NewSession {
                 id: SessionId::new("session-one").expect("session ID"),
                 user_id,
-                access_token_hash: [1; 32],
-                refresh_token_hash: [2; 32],
-                access_expires_at: 200,
-                refresh_expires_at: 300,
-                absolute_expires_at: 400,
+                token_hash: [1; 32],
+                expires_at: 300,
                 created_at: 100,
             })
             .await
             .expect("create session");
-
-        assert_eq!(
-            repository
-                .rotate_session(&[2; 32], [3; 32], [4; 32], 250, 350, 150)
-                .await
-                .expect("rotate session"),
-            RefreshSessionOutcome::Updated
-        );
-        assert_eq!(
-            repository
-                .rotate_session(&[2; 32], [5; 32], [6; 32], 260, 360, 160)
-                .await
-                .expect("reject reused refresh token"),
-            RefreshSessionOutcome::Invalid
-        );
-
         let session = repository
-            .load_session_by_refresh_hash(&[4; 32])
+            .load_session_by_token_hash(&[1; 32])
             .await
-            .expect("load rotated session")
-            .expect("rotated session");
-        assert_eq!(session.access_token_hash, [3; 32]);
-        assert_eq!(session.refresh_expires_at, 350);
-        assert_eq!(session.absolute_expires_at, 400);
+            .expect("load session")
+            .expect("session");
+        assert_eq!(session.token_hash, [1; 32]);
+        assert_eq!(session.expires_at, 300);
+        assert!(
+            repository
+                .revoke_session(&session.id, 150)
+                .await
+                .expect("revoke")
+        );
+        assert_eq!(
+            repository
+                .load_session_by_token_hash(&[1; 32])
+                .await
+                .expect("load revoked session")
+                .expect("revoked session")
+                .revoked_at,
+            Some(150)
+        );
     }
 
-    fn test_session(id: &str, user_id: UserId, access_hash: u8, refresh_hash: u8) -> NewSession {
+    #[tokio::test]
+    async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_keys() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let user_id = UserId::new("disabled-user").expect("user ID");
+        repository
+            .create_initial_user(
+                NewUser {
+                    id: user_id.clone(),
+                    username: "admin".to_owned(),
+                    password_hash: "password-hash".to_owned(),
+                    role: UserRole::SuperAdmin,
+                    enabled: true,
+                    created_at: 100,
+                },
+                test_session("disabled-user-session", user_id.clone(), 9),
+            )
+            .await
+            .expect("create initial user");
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys
+                (id, owner_user_id, group_label, label, key,
+                 enabled, spent_atoms, created_at, updated_at)
+            VALUES ('disabled-user-key', ?, 'group', 'key', 'pode-disabled-user-key',
+                    1, '0', 100, 100)
+            "#,
+        )
+        .bind(user_id.as_str())
+        .execute(&repository.pool)
+        .await
+        .expect("create API key");
+
+        assert!(
+            repository
+                .set_user_enabled(&user_id, false, 200)
+                .await
+                .expect("disable user")
+        );
+        let state = sqlx::query(
+            r#"
+            SELECT u.enabled, s.revoked_at, k.enabled AS key_enabled
+            FROM users AS u
+            INNER JOIN user_sessions AS s ON s.user_id = u.id
+            INNER JOIN api_keys AS k ON k.owner_user_id = u.id
+            WHERE u.id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load disabled state");
+        assert_eq!(state.try_get::<i64, _>("enabled").expect("user enabled"), 0);
+        assert_eq!(
+            state.try_get::<i64, _>("revoked_at").expect("revoked at"),
+            200
+        );
+        assert_eq!(
+            state.try_get::<i64, _>("key_enabled").expect("key enabled"),
+            0
+        );
+
+        assert!(
+            repository
+                .set_user_enabled(&user_id, true, 300)
+                .await
+                .expect("re-enable user")
+        );
+        let key_enabled = sqlx::query_scalar::<_, i64>(
+            "SELECT enabled FROM api_keys WHERE id = 'disabled-user-key'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load API key state");
+        assert_eq!(key_enabled, 0);
+    }
+
+    #[tokio::test]
+    async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let user_id = UserId::new("quota-user").expect("user ID");
+        repository
+            .create_initial_user(
+                NewUser {
+                    id: user_id.clone(),
+                    username: "quota-admin".to_owned(),
+                    password_hash: "password-hash".to_owned(),
+                    role: UserRole::SuperAdmin,
+                    enabled: true,
+                    created_at: 1,
+                },
+                test_session("quota-session", user_id.clone(), 1),
+            )
+            .await
+            .expect("create quota user");
+        let key_id = ApiKeyId::new("quota-key").expect("API key ID");
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (
+                id, owner_user_id, group_label, label, key,
+                enabled, quota_limit_atoms, spent_atoms, created_at, updated_at
+            )
+            VALUES (?, ?, 'group', 'quota', 'pode-quota-key', 1, '100', '0', 1, 1)
+            "#,
+        )
+        .bind(key_id.as_str())
+        .bind(user_id.as_str())
+        .execute(&repository.pool)
+        .await
+        .expect("create quota key");
+
+        let (left, right) = tokio::join!(
+            repository.admit_api_key_quota(&key_id),
+            repository.admit_api_key_quota(&key_id),
+        );
+        assert_eq!(left.expect("left admission"), QuotaAdmissionOutcome::Admitted);
+        assert_eq!(right.expect("right admission"), QuotaAdmissionOutcome::Admitted);
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("set remaining spend");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("boundary admission"),
+            QuotaAdmissionOutcome::Admitted
+        );
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '100' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("exhaust quota");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("exhausted admission"),
+            QuotaAdmissionOutcome::Exceeded
+        );
+
+        sqlx::query("UPDATE api_keys SET spent_atoms = '150' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("overshoot spend");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("overspent admission"),
+            QuotaAdmissionOutcome::Exceeded
+        );
+
+        sqlx::query("UPDATE api_keys SET quota_limit_atoms = NULL, spent_atoms = '0' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("clear quota limit");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("unlimited admission"),
+            QuotaAdmissionOutcome::Unlimited
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_codes_are_one_time_and_survive_username_conflicts() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        let admin = NewUser {
+            id: UserId::new("registration-admin").expect("admin ID"),
+            username: "admin".to_owned(),
+            password_hash: "admin-password-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 100,
+        };
+        assert_eq!(
+            repository
+                .create_initial_user(
+                    admin.clone(),
+                    test_session("registration-admin-session", admin.id.clone(), 10),
+                )
+                .await
+                .expect("create admin"),
+            InitialUserCreateOutcome::Created
+        );
+        repository
+            .create_registration_code(NewRegistrationCode {
+                code_hash: [20; 32],
+                expires_at: 200,
+            })
+            .await
+            .expect("create registration code");
+        assert!(
+            repository
+                .registration_code_valid(&[20; 32], 199)
+                .await
+                .expect("validate unexpired registration code")
+        );
+        assert!(
+            !repository
+                .registration_code_valid(&[20; 32], 200)
+                .await
+                .expect("reject registration code at expiry")
+        );
+
+        let conflict = NewUser {
+            id: UserId::new("conflicting-registration").expect("user ID"),
+            username: "ADMIN".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 120,
+        };
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    conflict.clone(),
+                    test_session("conflicting-registration-session", conflict.id, 20),
+                    120,
+                )
+                .await
+                .expect("reject username conflict"),
+            RegisterUserOutcome::Conflict
+        );
+
+        let member = NewUser {
+            id: UserId::new("registered-member").expect("user ID"),
+            username: "member".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 121,
+        };
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    member.clone(),
+                    test_session("registered-member-session", member.id.clone(), 22),
+                    121,
+                )
+                .await
+                .expect("register member"),
+            RegisterUserOutcome::Created
+        );
+        assert!(
+            repository
+                .load_user(&member.id)
+                .await
+                .expect("load registered member")
+                .is_some()
+        );
+        assert_eq!(
+            repository
+                .register_user(
+                    &[20; 32],
+                    NewUser {
+                        id: UserId::new("reused-registration").expect("user ID"),
+                        username: "other".to_owned(),
+                        password_hash: "password-hash".to_owned(),
+                        role: UserRole::User,
+                        enabled: true,
+                        created_at: 122,
+                    },
+                    test_session(
+                        "reused-registration-session",
+                        UserId::new("reused-registration").expect("user ID"),
+                        24,
+                    ),
+                    122,
+                )
+                .await
+                .expect("reject reused code"),
+            RegisterUserOutcome::InvalidCode
+        );
+    }
+
+    fn test_session(id: &str, user_id: UserId, token_hash: u8) -> NewSession {
         NewSession {
             id: SessionId::new(id).expect("session ID"),
             user_id,
-            access_token_hash: [access_hash; 32],
-            refresh_token_hash: [refresh_hash; 32],
-            access_expires_at: 200,
-            refresh_expires_at: 300,
-            absolute_expires_at: 400,
+            token_hash: [token_hash; 32],
+            expires_at: 300,
             created_at: 100,
         }
     }
