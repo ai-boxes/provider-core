@@ -2045,7 +2045,6 @@ mod tests {
                 .expect("check admission after overrun"),
             QuotaAdmissionOutcome::Exceeded
         );
-
     }
 
     #[tokio::test]

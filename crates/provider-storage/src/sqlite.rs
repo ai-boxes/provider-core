@@ -3011,8 +3011,14 @@ mod tests {
             repository.admit_api_key_quota(&key_id),
             repository.admit_api_key_quota(&key_id),
         );
-        assert_eq!(left.expect("left admission"), QuotaAdmissionOutcome::Admitted);
-        assert_eq!(right.expect("right admission"), QuotaAdmissionOutcome::Admitted);
+        assert_eq!(
+            left.expect("left admission"),
+            QuotaAdmissionOutcome::Admitted
+        );
+        assert_eq!(
+            right.expect("right admission"),
+            QuotaAdmissionOutcome::Admitted
+        );
 
         sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = ?")
             .bind(key_id.as_str())

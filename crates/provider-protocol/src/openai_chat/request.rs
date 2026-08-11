@@ -265,7 +265,6 @@ fn copy_fields(source: &Map<String, Value>, target: &mut Map<String, Value>, fie
     }
 }
 
-
 /// Chat Completions requires every `tool_calls` assistant message to be followed by
 /// matching `role=tool` messages. Responses emits each call as its own input item, so
 /// consecutive function calls must collapse into one assistant message.

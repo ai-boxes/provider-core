@@ -346,7 +346,8 @@ struct RawModel {
 /// fields over time and that must not invalidate a price.
 ///
 /// Both supported context-tier encodings are parsed strictly for saved model
-/// pricing. Conflicting encodings invalidate the entry.
+/// pricing. The explicit `tiers` encoding wins over the legacy
+/// `context_over_200k` block when they differ.
 #[derive(Deserialize)]
 struct RawCost {
     input: Option<Box<RawValue>>,
@@ -418,6 +419,10 @@ fn parse_model_pricing_tiers(cost: &RawCost) -> Option<Vec<ProviderModelPricingT
         }
     };
 
+    if let Some(tiers) = tiers {
+        return Some(tiers);
+    }
+
     let legacy = match cost.context_over_200k.as_deref() {
         None => None,
         Some(raw) if raw.get().trim() == "null" => None,
@@ -431,12 +436,12 @@ fn parse_model_pricing_tiers(cost: &RawCost) -> Option<Vec<ProviderModelPricingT
         }
     };
 
-    match (tiers, legacy) {
-        (None, None) => Some(Vec::new()),
-        (Some(tiers), None) | (None, Some(tiers)) => Some(tiers),
-        (Some(tiers), Some(legacy)) if tiers == legacy => Some(tiers),
-        (Some(_), Some(_)) => None,
-    }
+    // The explicit `tiers` encoding is authoritative whenever it is present;
+    // `context_over_200k` is the legacy form models.dev keeps alongside it. A
+    // difference between the two (for example a 272k tier next to the old 200k
+    // block) must not drop a real price, so the explicit encoding wins instead
+    // of invalidating the entry.
+    Some(legacy.unwrap_or_default())
 }
 
 fn model_pricing_tier(threshold_tokens: u64, prices: ComponentPrices) -> ProviderModelPricingTier {
@@ -685,9 +690,68 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_tier_encodings_are_rejected() {
+    fn explicit_tiers_win_over_the_legacy_context_tier() {
         let snapshot = snapshot();
-        assert_eq!(snapshot.exact_model_pricing("tiered"), None);
+        let model_pricing = snapshot
+            .exact_model_pricing("tiered")
+            .expect("explicit tiers are used even when the legacy context tier differs");
+        assert_eq!(model_pricing.tiers.len(), 1);
+        assert_eq!(model_pricing.tiers[0].threshold_tokens, 272_000);
+    }
+
+    #[test]
+    fn explicit_tiers_ignore_an_unreadable_legacy_context_tier() {
+        let snapshot = CatalogSnapshot::parse(
+            r#"{
+              "openai": {
+                "models": {
+                  "explicit-tier": {
+                    "cost": {
+                      "input": 2,
+                      "output": 6,
+                      "tiers": [
+                        { "input": 4, "output": 12, "tier": { "type": "context", "size": 272000 } }
+                      ],
+                      "context_over_200k": { "input": "unreadable" }
+                    }
+                  }
+                }
+              }
+            }"#,
+            "explicit",
+        )
+        .expect("catalog parses");
+        let model_pricing = snapshot
+            .exact_model_pricing("explicit-tier")
+            .expect("valid explicit tiers do not depend on the legacy encoding");
+        assert_eq!(model_pricing.tiers.len(), 1);
+        assert_eq!(model_pricing.tiers[0].threshold_tokens, 272_000);
+    }
+
+    #[test]
+    fn legacy_context_tier_is_kept_when_there_are_no_explicit_tiers() {
+        let snapshot = CatalogSnapshot::parse(
+            r#"{
+              "openai": {
+                "models": {
+                  "legacy-tier": {
+                    "cost": {
+                      "input": 2,
+                      "output": 6,
+                      "context_over_200k": { "input": 4, "output": 12, "cache_read": 0.6 }
+                    }
+                  }
+                }
+              }
+            }"#,
+            "legacy",
+        )
+        .expect("legacy-only catalog parses");
+        let model_pricing = snapshot
+            .exact_model_pricing("legacy-tier")
+            .expect("legacy context tier is used without explicit tiers");
+        assert_eq!(model_pricing.tiers.len(), 1);
+        assert_eq!(model_pricing.tiers[0].threshold_tokens, 200_000);
     }
 
     #[test]
@@ -725,9 +789,9 @@ mod tests {
         let snapshot = snapshot();
         assert!(snapshot.exact_model_pricing("claude-4").is_some());
         assert_eq!(snapshot.exact_model_pricing("Claude-4"), None);
-        // Six models are listed; missing, unreadable, and conflicting tier costs
-        // carry no price the parser accepted.
-        assert_eq!(snapshot.priced_model_count(), 3);
+        // Six models are listed; missing and unreadable costs carry no price the
+        // parser accepted. The tiered model is priced from its explicit tiers.
+        assert_eq!(snapshot.priced_model_count(), 4);
     }
 
     #[test]

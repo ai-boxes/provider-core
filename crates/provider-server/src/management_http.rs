@@ -1449,12 +1449,7 @@ mod tests {
         let server = tokio::spawn(
             axum::serve(
                 listener,
-                router_with_management(
-                    service,
-                    manager,
-                    auth,
-                    api_keys,
-                ),
+                router_with_management(service, manager, auth, api_keys),
             )
             .into_future(),
         );
@@ -2073,12 +2068,7 @@ mod tests {
         let management_server = tokio::spawn(
             axum::serve(
                 management_listener,
-                router_with_management(
-                    service,
-                    manager.clone(),
-                    auth,
-                    api_keys,
-                ),
+                router_with_management(service, manager.clone(), auth, api_keys),
             )
             .into_future(),
         );

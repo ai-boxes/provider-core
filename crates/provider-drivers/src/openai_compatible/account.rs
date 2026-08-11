@@ -334,9 +334,7 @@ async fn status_error(operation: &str, response: reqwest::Response) -> ProviderE
     ProviderError::new(kind, message).with_upstream_status(status.as_u16())
 }
 
-async fn read_error_detail(
-    response: reqwest::Response,
-) -> Result<Option<String>, ErrorBodyIssue> {
+async fn read_error_detail(response: reqwest::Response) -> Result<Option<String>, ErrorBodyIssue> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_RESPONSE_SIZE as u64)
@@ -412,7 +410,10 @@ fn truncate_error_detail(text: &str) -> String {
     if cleaned.chars().count() <= MAX_ERROR_DETAIL_CHARS {
         cleaned
     } else {
-        let mut truncated = cleaned.chars().take(MAX_ERROR_DETAIL_CHARS).collect::<String>();
+        let mut truncated = cleaned
+            .chars()
+            .take(MAX_ERROR_DETAIL_CHARS)
+            .collect::<String>();
         truncated.push_str("...");
         truncated
     }
