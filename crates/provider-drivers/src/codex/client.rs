@@ -314,21 +314,21 @@ mod tests {
         let captured = capture.0.lock().expect("capture lock").clone();
         let (headers, captured_body) = &captured[0];
         assert_eq!(
-            header(&headers, reqwest::header::AUTHORIZATION.as_str()),
+            header(headers, reqwest::header::AUTHORIZATION.as_str()),
             "Bearer access-token"
         );
-        assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
-        assert_eq!(header(&headers, "x-openai-fedramp"), "true");
-        assert_eq!(header(&headers, "originator"), "codex_cli_rs");
+        assert_eq!(header(headers, "chatgpt-account-id"), "workspace-1");
+        assert_eq!(header(headers, "x-openai-fedramp"), "true");
+        assert_eq!(header(headers, "originator"), "codex_cli_rs");
         assert!(headers.get("version").is_none());
         assert!(
-            header(&headers, reqwest::header::USER_AGENT.as_str())
+            header(headers, reqwest::header::USER_AGENT.as_str())
                 .starts_with("codex_cli_rs/0.144.5 (")
         );
-        let session_id = header(&headers, "session-id");
+        let session_id = header(headers, "session-id");
         assert_eq!(session_id, "session-1");
-        assert_eq!(header(&headers, "thread-id"), "thread-1");
-        assert_eq!(header(&headers, "x-client-request-id"), "thread-1");
+        assert_eq!(header(headers, "thread-id"), "thread-1");
+        assert_eq!(header(headers, "x-client-request-id"), "thread-1");
         let captured_body: Value =
             serde_json::from_slice(captured_body).expect("captured request JSON");
         assert_eq!(captured_body["model"], "gpt-5.5");
