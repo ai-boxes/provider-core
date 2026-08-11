@@ -114,6 +114,7 @@ pub trait ProviderRoute: Send + Sync {
 pub struct ProviderRouteCandidate {
     pub upstream_model: String,
     pub input_modalities: Option<Vec<crate::ProviderModelInputModality>>,
+    pub responses_lite: bool,
     pub pricing: Option<crate::ProviderModelPricingRecord>,
     pub route: Arc<dyn ProviderRoute>,
 }

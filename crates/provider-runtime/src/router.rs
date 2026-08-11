@@ -261,6 +261,7 @@ impl ProviderRouter for ProviderModelRouter {
                     ProviderRouteCandidate {
                         upstream_model: provider_model.upstream_model.clone(),
                         input_modalities: provider_model.input_modalities.clone(),
+                        responses_lite: model_uses_responses_lite(provider_model),
                         pricing: provider_model.pricing.clone(),
                         route: account.route.clone(),
                     },
@@ -349,6 +350,17 @@ impl ProviderRoute for RuntimeAccountRoute {
             .count_tokens_for(&self.account_id, request)
             .await
     }
+}
+
+fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
+    serde_json::from_str::<serde_json::Value>(&model.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("use_responses_lite")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn conservative_input_modalities(
@@ -487,6 +499,11 @@ mod tests {
             ProviderModelInputModality::Text,
             ProviderModelInputModality::Image,
         ]);
+        let mut first_metadata: serde_json::Value =
+            serde_json::from_str(&first_shared.metadata_json).expect("model metadata");
+        first_metadata["use_responses_lite"] = serde_json::Value::Bool(true);
+        first_shared.metadata_json =
+            serde_json::to_string(&first_metadata).expect("serialize model metadata");
         router
             .replace_account_models(
                 runtime.clone(),
@@ -537,6 +554,16 @@ mod tests {
             None,
         );
         assert_eq!(routes.len(), 2);
+        assert!(
+            routes
+                .iter()
+                .any(|route| { route.upstream_model == "upstream-a" && route.responses_lite })
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|route| { route.upstream_model == "upstream-b" && !route.responses_lite })
+        );
         let mut outputs = Vec::new();
         for route in routes {
             let stream = route

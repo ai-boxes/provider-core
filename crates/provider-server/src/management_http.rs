@@ -359,7 +359,7 @@ async fn list_models(
         .manager
         .list_models(session.user.id.as_str(), &account_id)
         .await?;
-    Ok(data(Value::Array(models.iter().map(model_json).collect())))
+    Ok(data(models_json(&models)))
 }
 
 async fn refresh_models(
@@ -447,7 +447,7 @@ async fn update_model(
             },
         )
         .await?;
-    Ok(data(Value::Array(models.iter().map(model_json).collect())))
+    Ok(data(models_json(&models)))
 }
 
 async fn start_oauth_session(
@@ -777,8 +777,26 @@ fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiErro
 
 fn model_snapshot_json(snapshot: &ModelCatalogSnapshot) -> Value {
     json!({
-        "models": snapshot.models.iter().map(model_json).collect::<Vec<_>>()
+        "models": models_json(&snapshot.models)
     })
+}
+
+fn models_json(models: &[StoredProviderModel]) -> Value {
+    Value::Array(
+        models
+            .iter()
+            .filter(|model| model_is_visible(model))
+            .map(model_json)
+            .collect(),
+    )
+}
+
+fn model_is_visible(model: &StoredProviderModel) -> bool {
+    serde_json::from_str::<Value>(&model.metadata_json)
+        .expect("stored provider model metadata must be valid JSON")
+        .get("visibility")
+        .and_then(Value::as_str)
+        .is_none_or(|visibility| visibility == "list")
 }
 
 fn model_json(model: &StoredProviderModel) -> Value {
@@ -988,6 +1006,7 @@ mod tests {
     use provider_core::{
         AccountId, CredentialKind, ProviderKind, ProviderManagementRepository,
         ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
+        StoredProviderModel,
     };
     use provider_drivers::{
         codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
@@ -1015,8 +1034,41 @@ mod tests {
 
     use super::{
         ModelPricingPatch, ProviderHealthParams, SetEnabledRequest, UpdateModelRequest,
-        require_super_admin, unix_timestamp, updated_pricing,
+        model_is_visible, require_super_admin, unix_timestamp, updated_pricing,
     };
+
+    fn stored_model_with_metadata(metadata_json: &str) -> StoredProviderModel {
+        StoredProviderModel {
+            account_id: AccountId::new("account-1").expect("account ID"),
+            upstream_model: "model-1".to_owned(),
+            alias: None,
+            enabled: true,
+            available: true,
+            routable: true,
+            input_modalities: None,
+            metadata_json: metadata_json.to_owned(),
+            pricing: None,
+            last_seen_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn hides_models_that_are_not_listed_by_upstream() {
+        assert!(model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"public","visibility":"list"}"#,
+        )));
+        assert!(!model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"hidden","visibility":"hide"}"#,
+        )));
+        assert!(!model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"internal","visibility":"none"}"#,
+        )));
+        assert!(model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"compatible"}"#,
+        )));
+    }
 
     fn management_headers(session_token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

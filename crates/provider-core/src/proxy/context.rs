@@ -10,6 +10,7 @@ pub struct RequestMetadata {
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub client_request_id: Option<String>,
+    pub responses_lite: bool,
 }
 
 /// Provider-neutral request envelope that preserves the source JSON payload.

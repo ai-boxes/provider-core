@@ -209,6 +209,7 @@ impl ProviderRouter for ChatLengthRouter {
         vec![ProviderRouteCandidate {
             upstream_model: model.to_owned(),
             input_modalities: None,
+            responses_lite: false,
             pricing: None,
             route: Arc::new(Self),
         }]

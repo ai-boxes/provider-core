@@ -31,11 +31,14 @@ struct CodexUpstreamState {
 #[derive(Clone)]
 struct CapturedRequest {
     authorization: String,
+    originator: String,
+    user_agent: String,
+    has_responses_lite_header: bool,
     body: Value,
 }
 
 async fn models() -> &'static str {
-    r#"{"data":[{"id":"gpt-5.5","owned_by":"openai"}]}"#
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
 }
 
 async fn responses(State(state): State<CodexUpstreamState>, request: Request) -> Response<Body> {
@@ -46,6 +49,22 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    let originator = request
+        .headers()
+        .get("originator")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let user_agent = request
+        .headers()
+        .get(reqwest::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let has_responses_lite_header = request
+        .headers()
+        .get("x-openai-internal-codex-responses-lite")
+        .is_some();
     let body = to_bytes(request.into_body(), 1024 * 1024)
         .await
         .expect("Codex request body");
@@ -56,6 +75,9 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .expect("Codex request capture lock")
         .push(CapturedRequest {
             authorization,
+            originator,
+            user_agent,
+            has_responses_lite_header,
             body: body.clone(),
         });
 
@@ -216,6 +238,39 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert!(claude_body.contains(r#""type":"text_delta""#));
     assert!(claude_body.contains("event: message_stop"));
 
+    let lite_body = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "parallel_tool_calls": true
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("Responses Lite request")
+        .text()
+        .await
+        .expect("Responses Lite SSE");
+    assert!(lite_body.contains("response.output_text.delta"));
+
+    let luna_body = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({ "model": "gpt-5.6-luna", "input": "hello" }).to_string())
+        .send()
+        .await
+        .expect("Luna request")
+        .text()
+        .await
+        .expect("Luna SSE");
+    assert!(luna_body.contains("response.output_text.delta"));
+
     let unauthorized = client
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
@@ -231,7 +286,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .await
         .expect("unauthorized request");
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 6);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let rate_limited = client
@@ -251,7 +306,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     )
     .expect("rate limited response JSON");
     assert_eq!(rate_limited["error"]["type"], "rate_limit_error");
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 7);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let requests = upstream_state
@@ -262,9 +317,15 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[0].body["stream"], true);
     assert_eq!(requests[0].body["store"], false);
     assert_eq!(requests[1].body["input"][0]["role"], "user");
-    assert_eq!(requests[2].authorization, "Bearer old-access");
-    assert_eq!(requests[3].authorization, "Bearer new-access");
-    assert_eq!(requests[4].authorization, "Bearer new-access");
+    assert!(!requests[2].has_responses_lite_header);
+    assert_eq!(requests[2].body["model"], "gpt-5.6-sol");
+    assert_eq!(requests[2].body["parallel_tool_calls"], false);
+    assert_eq!(requests[3].originator, "codex-tui");
+    assert!(requests[3].user_agent.starts_with("codex-tui/0.144.0 "));
+    assert!(!requests[3].has_responses_lite_header);
+    assert_eq!(requests[4].authorization, "Bearer old-access");
+    assert_eq!(requests[5].authorization, "Bearer new-access");
+    assert_eq!(requests[6].authorization, "Bearer new-access");
     drop(requests);
 
     runtime.shutdown();

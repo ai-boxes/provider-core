@@ -99,6 +99,7 @@ impl ProxyService {
         let route = self.resolve_route(user_id, &request, account_ids)?;
         let mut request = request;
         request.model = route.upstream_model.clone();
+        request.metadata.responses_lite = route.responses_lite;
         let prepared = self.protocol.prepare(
             request,
             route.route.native_format(),
@@ -244,6 +245,7 @@ impl ProviderRouter for SingleProviderRouter {
                 .iter()
                 .find(|candidate| candidate.id == model)
                 .and_then(|candidate| candidate.input_modalities.clone()),
+            responses_lite: false,
             pricing: None,
             route: self.route.clone(),
         }]

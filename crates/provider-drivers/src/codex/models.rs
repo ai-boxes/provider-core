@@ -105,7 +105,6 @@ fn normalize_models(
                 });
                 let routable = model.visibility.as_deref() == Some("list")
                     && model.supported_in_api
-                    && !model.use_responses_lite
                     && compatible;
                 let input_modalities = codex_input_modalities(id);
                 let mut metadata = serde_json::json!({
@@ -292,7 +291,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filters_codex_models_by_visibility_api_lite_and_compatibility() {
+    fn filters_codex_models_by_visibility_api_and_compatibility() {
         let response: ModelsResponse = serde_json::from_value(serde_json::json!({
             "models": [
                 {
@@ -355,7 +354,7 @@ mod tests {
                 .get("supports_image_detail_original")
                 .is_none()
         );
-        assert!(!model(&models, "lite-only").routable);
+        assert!(model(&models, "lite-only").routable);
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
