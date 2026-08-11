@@ -15,8 +15,9 @@ use axum::{
 };
 use provider_auth::{AuthenticatedSession, UserRole};
 use provider_core::{
-    AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind, ProviderModelOverride,
-    ProviderModelPricing, ProviderVisibility, StoredProviderModel,
+    AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
+    ProviderModelInputModality, ProviderModelOverride, ProviderModelPricing, ProviderVisibility,
+    StoredProviderModel,
 };
 use provider_drivers::compatible_api_key_credential;
 use provider_management::{
@@ -430,6 +431,7 @@ async fn update_model(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let pricing = updated_pricing(request.pricing_changed, request.pricing)?;
+    let input_modalities = request.input_modalities.into_modalities()?;
     let models = state
         .manager
         .update_model(
@@ -439,6 +441,7 @@ async fn update_model(
             ProviderModelOverride {
                 alias,
                 enabled: request.enabled,
+                input_modalities,
                 pricing,
                 updated_at: unix_timestamp(),
             },
@@ -563,9 +566,28 @@ struct UpdateModelRequest {
     upstream_model: String,
     alias: Option<String>,
     enabled: bool,
+    input_modalities: InputModalitiesPatch,
     pricing_changed: bool,
     #[serde(default)]
     pricing: ModelPricingPatch,
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct InputModalitiesPatch(Value);
+
+impl InputModalitiesPatch {
+    fn into_modalities(self) -> Result<Option<Vec<ProviderModelInputModality>>, ApiError> {
+        let input_modalities: Option<Vec<ProviderModelInputModality>> =
+            serde_json::from_value(self.0).map_err(|_| {
+                ApiError::invalid_request(
+                    "input_modalities must be null, [\"text\"], or [\"text\",\"image\"]",
+                )
+            })?;
+        provider_core::validate_input_modalities(input_modalities.as_deref())
+            .map_err(ApiError::invalid_request)?;
+        Ok(input_modalities)
+    }
 }
 
 #[derive(Default)]
@@ -768,6 +790,10 @@ fn model_json(model: &StoredProviderModel) -> Value {
         "enabled": model.enabled,
         "available": model.available,
         "routable": model.routable,
+        "input_modalities": model.input_modalities,
+        "supports_image_detail_original": model.input_modalities.as_deref().is_some_and(|modalities| {
+            modalities.contains(&ProviderModelInputModality::Image)
+        }),
         "metadata": serde_json::from_str::<Value>(&model.metadata_json)
             .expect("stored provider model metadata must be valid JSON"),
         "pricing": model.pricing.as_ref().map(|record| &record.pricing),
@@ -1058,22 +1084,39 @@ mod tests {
 
     #[test]
     fn model_update_pricing_request_is_strict_and_preserves_field_presence() {
+        assert!(
+            serde_json::from_str::<UpdateModelRequest>(
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":false}"#,
+            )
+            .is_err(),
+            "input_modalities is a required management contract field"
+        );
         let missing: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":false}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":false}"#,
         )
         .expect("missing pricing field");
         assert!(matches!(missing.pricing, ModelPricingPatch::Missing));
 
         let null: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":null}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":null}"#,
         )
         .expect("explicit null pricing");
         assert!(matches!(null.pricing, ModelPricingPatch::Null));
 
         let value: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","image"],"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
         )
         .expect("complete pricing object");
+        let Ok(input_modalities) = value.input_modalities.into_modalities() else {
+            panic!("valid input modalities");
+        };
+        assert_eq!(
+            input_modalities,
+            Some(vec![
+                provider_core::ProviderModelInputModality::Text,
+                provider_core::ProviderModelInputModality::Image,
+            ])
+        );
         let ModelPricingPatch::Value(value) = value.pricing else {
             panic!("pricing value");
         };
@@ -1083,13 +1126,13 @@ mod tests {
 
         assert!(
             serde_json::from_str::<UpdateModelRequest>(
-                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"extra":true}]}}"#,
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"extra":true}]}}"#,
             )
             .is_err()
         );
         assert!(
             serde_json::from_str::<UpdateModelRequest>(
-                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2"}}"#,
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":{"input":"1","output":"2"}}"#,
             )
             .is_err()
         );
@@ -1924,7 +1967,7 @@ mod tests {
             .headers(management_headers(&member_session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
-                r#"{"upstream_model":"model-a","alias":"no","enabled":true,"pricing_changed":false}"#,
+                r#"{"upstream_model":"model-a","alias":"no","enabled":true,"input_modalities":null,"pricing_changed":false}"#,
             )
             .send()
             .await

@@ -86,6 +86,12 @@ CREATE TABLE provider_models (
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     available INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
     routable INTEGER NOT NULL DEFAULT 1 CHECK (routable IN (0, 1)),
+    input_modalities_json TEXT CHECK (
+        input_modalities_json IS NULL
+        OR input_modalities_json IN ('["text"]', '["text","image"]')
+    ),
+    input_modalities_source TEXT NOT NULL DEFAULT 'discovery'
+        CHECK (input_modalities_source IN ('discovery', 'manual')),
     metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
     pricing_source TEXT CHECK (pricing_source IS NULL OR pricing_source IN ('catalog', 'manual')),
     pricing_json TEXT CHECK (pricing_json IS NULL OR json_valid(pricing_json)),

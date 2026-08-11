@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::LazyLock, time::Duration};
 
 use provider_core::{
     BoundedBodyError, DiscoveredProviderModel, ProviderError, ProviderErrorKind, ProviderModel,
-    collect_bounded_body,
+    ProviderModelInputModality, collect_bounded_body,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,7 +21,9 @@ static COMPATIBILITY_VERSION: LazyLock<ClientVersion> = LazyLock::new(|| {
 static MODELS: LazyLock<Vec<ProviderModel>> = LazyLock::new(|| {
     ["gpt-5.5", "gpt-5.2"]
         .into_iter()
-        .map(|id| ProviderModel::new(id, "openai"))
+        .map(|id| {
+            ProviderModel::new(id, "openai").with_input_modalities(Some(codex_input_modalities(id)))
+        })
         .collect()
 });
 
@@ -105,7 +107,8 @@ fn normalize_models(
                     && model.supported_in_api
                     && !model.use_responses_lite
                     && compatible;
-                let metadata = serde_json::json!({
+                let input_modalities = codex_input_modalities(id);
+                let mut metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
                     "owned_by": "openai",
@@ -117,7 +120,11 @@ fn normalize_models(
                     "minimal_client_version": model.minimal_client_version,
                     "use_responses_lite": model.use_responses_lite,
                     "prefer_websockets": model.prefer_websockets,
+                    "input_modalities": input_modalities.clone(),
                 });
+                if input_modalities.contains(&ProviderModelInputModality::Image) {
+                    metadata["supports_image_detail_original"] = Value::Bool(true);
+                }
                 let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                     ProviderError::new(
                         ProviderErrorKind::Internal,
@@ -128,6 +135,7 @@ fn normalize_models(
                     id.to_owned(),
                     DiscoveredProviderModel {
                         upstream_model: id.to_owned(),
+                        input_modalities: Some(input_modalities),
                         metadata_json,
                         routable,
                         pricing: None,
@@ -141,12 +149,17 @@ fn normalize_models(
                 if id.is_empty() {
                     continue;
                 }
-                let metadata_json = serde_json::to_string(&serde_json::json!({
+                let input_modalities = codex_input_modalities(id);
+                let mut metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
                     "owned_by": "openai",
-                }))
-                .map_err(|_| {
+                    "input_modalities": input_modalities.clone(),
+                });
+                if input_modalities.contains(&ProviderModelInputModality::Image) {
+                    metadata["supports_image_detail_original"] = Value::Bool(true);
+                }
+                let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                     ProviderError::new(
                         ProviderErrorKind::Internal,
                         "failed to normalize Codex model metadata",
@@ -156,6 +169,7 @@ fn normalize_models(
                     id.to_owned(),
                     DiscoveredProviderModel {
                         upstream_model: id.to_owned(),
+                        input_modalities: Some(input_modalities),
                         metadata_json,
                         routable: true,
                         pricing: None,
@@ -165,6 +179,17 @@ fn normalize_models(
         }
     }
     Ok(normalized.into_values().collect())
+}
+
+fn codex_input_modalities(model: &str) -> Vec<ProviderModelInputModality> {
+    if model == "gpt-5.3-codex-spark" {
+        vec![ProviderModelInputModality::Text]
+    } else {
+        vec![
+            ProviderModelInputModality::Text,
+            ProviderModelInputModality::Image,
+        ]
+    }
 }
 
 async fn read_limited(
@@ -279,6 +304,12 @@ mod tests {
                     "use_responses_lite": false
                 },
                 {
+                    "slug": "gpt-5.3-codex-spark",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "use_responses_lite": false
+                },
+                {
                     "slug": "lite-only",
                     "visibility": "list",
                     "supported_in_api": true,
@@ -308,6 +339,22 @@ mod tests {
 
         let models = normalize_models(response).expect("normalized models");
         assert!(model(&models, "gpt-5.5").routable);
+        let spark = model(&models, "gpt-5.3-codex-spark");
+        assert_eq!(
+            spark.input_modalities,
+            Some(vec![ProviderModelInputModality::Text])
+        );
+        let spark_metadata: Value =
+            serde_json::from_str(&spark.metadata_json).expect("spark metadata");
+        assert_eq!(
+            spark_metadata["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert!(
+            spark_metadata
+                .get("supports_image_detail_original")
+                .is_none()
+        );
         assert!(!model(&models, "lite-only").routable);
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
@@ -323,6 +370,20 @@ mod tests {
         let models = normalize_models(response).expect("normalized models");
 
         assert!(model(&models, "gpt-openai").routable);
+        assert_eq!(
+            model(&models, "gpt-openai").input_modalities,
+            Some(vec![
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Image,
+            ])
+        );
+        let metadata: Value = serde_json::from_str(&model(&models, "gpt-openai").metadata_json)
+            .expect("model metadata");
+        assert_eq!(
+            metadata["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(metadata["supports_image_detail_original"], true);
         assert_eq!(
             codex_models()
                 .iter()

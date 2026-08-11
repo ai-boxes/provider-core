@@ -99,9 +99,11 @@ impl ProxyService {
         let route = self.resolve_route(user_id, &request, account_ids)?;
         let mut request = request;
         request.model = route.upstream_model.clone();
-        let prepared = self
-            .protocol
-            .prepare(request, route.route.native_format())?;
+        let prepared = self.protocol.prepare(
+            request,
+            route.route.native_format(),
+            route.input_modalities.as_deref(),
+        )?;
         let (request, response) = prepared.into_parts();
         Ok(PreparedProxyExecution {
             route,
@@ -236,6 +238,12 @@ impl ProviderRouter for SingleProviderRouter {
         }
         vec![ProviderRouteCandidate {
             upstream_model: model.to_owned(),
+            input_modalities: self
+                .provider
+                .models()
+                .iter()
+                .find(|candidate| candidate.id == model)
+                .and_then(|candidate| candidate.input_modalities.clone()),
             pricing: None,
             route: self.route.clone(),
         }]

@@ -30,9 +30,10 @@ pub use management::{
     StartedProviderOAuth,
 };
 pub use model::{
-    DiscoveredProviderModel, ProviderModel, ProviderModelOverride, ProviderModelPricing,
-    ProviderModelPricingCatalog, ProviderModelPricingRecord, ProviderModelPricingSource,
-    ProviderModelPricingTier, StoredProviderModel,
+    DiscoveredProviderModel, ProviderModel, ProviderModelInputModality, ProviderModelOverride,
+    ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingRecord,
+    ProviderModelPricingSource, ProviderModelPricingTier, StoredProviderModel,
+    validate_input_modalities,
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{

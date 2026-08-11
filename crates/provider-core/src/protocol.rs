@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ProviderError, ProviderRequest, ProviderStream, ProxyRequest};
+use crate::{
+    ProviderError, ProviderModelInputModality, ProviderRequest, ProviderStream, ProxyRequest,
+};
 
 /// Request and response schema used on one side of the proxy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -37,6 +39,7 @@ pub trait ProtocolBridge: Send + Sync {
         &self,
         request: ProxyRequest,
         target: WireFormat,
+        input_modalities: Option<&[ProviderModelInputModality]>,
     ) -> Result<PreparedProviderRequest, ProviderError>;
 }
 

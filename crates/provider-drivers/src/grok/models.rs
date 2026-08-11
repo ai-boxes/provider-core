@@ -160,6 +160,7 @@ impl GrokModelClient {
                 id.to_owned(),
                 DiscoveredProviderModel {
                     upstream_model: id.to_owned(),
+                    input_modalities: None,
                     metadata_json,
                     routable: !id.starts_with("grok-imagine-"),
                     pricing: None,

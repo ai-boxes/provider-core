@@ -6,6 +6,7 @@ use super::response::ChatResponseTranslator;
 
 pub(crate) fn prepare_request(
     request: ProviderRequest,
+    omit_tool_images: bool,
 ) -> Result<(ProviderRequest, ChatResponseTranslator), ProviderError> {
     if request.format != WireFormat::OpenAiResponses {
         return Err(invalid_request(
@@ -30,7 +31,7 @@ pub(crate) fn prepare_request(
             "content": instructions
         }));
     }
-    append_input(source.get("input"), &mut messages)?;
+    append_input(source.get("input"), &mut messages, omit_tool_images)?;
 
     let mut body = Map::new();
     body.insert("model".to_owned(), Value::String(request.model.clone()));
@@ -92,7 +93,11 @@ pub(crate) fn prepare_request(
     ))
 }
 
-fn append_input(input: Option<&Value>, messages: &mut Vec<Value>) -> Result<(), ProviderError> {
+fn append_input(
+    input: Option<&Value>,
+    messages: &mut Vec<Value>,
+    omit_tool_images: bool,
+) -> Result<(), ProviderError> {
     let input = input.ok_or_else(|| invalid_request("Responses request requires input"))?;
     match input {
         Value::String(text) => {
@@ -100,7 +105,7 @@ fn append_input(input: Option<&Value>, messages: &mut Vec<Value>) -> Result<(), 
         }
         Value::Array(items) => {
             for item in items {
-                append_input_item(item, messages)?;
+                append_input_item(item, messages, omit_tool_images)?;
             }
         }
         _ => return Err(invalid_request("Responses input must be text or an array")),
@@ -108,7 +113,11 @@ fn append_input(input: Option<&Value>, messages: &mut Vec<Value>) -> Result<(), 
     Ok(())
 }
 
-fn append_input_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), ProviderError> {
+fn append_input_item(
+    item: &Value,
+    messages: &mut Vec<Value>,
+    omit_tool_images: bool,
+) -> Result<(), ProviderError> {
     let item = item
         .as_object()
         .ok_or_else(|| invalid_request("Responses input items must be JSON objects"))?;
@@ -125,7 +134,11 @@ fn append_input_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Prov
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = required_string(item, "call_id", "tool output requires call_id")?;
-            let content = item.get("output").map(json_string).unwrap_or_default();
+            let content = item
+                .get("output")
+                .map(|output| tool_output_string(output, omit_tool_images))
+                .transpose()?
+                .unwrap_or_default();
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -136,6 +149,65 @@ fn append_input_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Prov
         "reasoning" => Ok(()),
         _ => Err(invalid_request("unsupported Responses input item")),
     }
+}
+
+pub(crate) fn omit_tool_images(request: &mut ProviderRequest) -> Result<(), ProviderError> {
+    let mut body: Value = serde_json::from_slice(&request.payload)
+        .map_err(|_| invalid_request("Chat Completions request body must be valid JSON"))?;
+    let messages = body
+        .as_object_mut()
+        .and_then(|body| body.get_mut("messages"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| invalid_request("Chat Completions request requires messages"))?;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let Some(content) = message
+            .as_object_mut()
+            .and_then(|message| message.get_mut("content"))
+        else {
+            continue;
+        };
+        if content.is_array() {
+            *content = Value::String(tool_output_string(content, true)?);
+        }
+    }
+    request.payload = serde_json::to_vec(&body).map(Bytes::from).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            "failed to serialize Chat Completions request",
+        )
+    })?;
+    Ok(())
+}
+
+fn tool_output_string(output: &Value, omit_images: bool) -> Result<String, ProviderError> {
+    let Value::Array(parts) = output else {
+        return Ok(json_string(output));
+    };
+    if !omit_images {
+        return Ok(output.to_string());
+    }
+    let mut flattened = Vec::with_capacity(parts.len());
+    for part in parts {
+        let part = part
+            .as_object()
+            .ok_or_else(|| invalid_request("tool content parts must be objects"))?;
+        match part.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "input_text" | "output_text" | "text" => flattened.push(
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            "input_image" | "image_url" | "image" => {
+                flattened.push("[image omitted: unsupported by upstream]".to_owned())
+            }
+            _ => flattened.push(Value::Object(part.clone()).to_string()),
+        }
+    }
+    Ok(flattened.join("\n\n"))
 }
 
 fn append_message(
@@ -362,7 +434,7 @@ mod tests {
             metadata: RequestMetadata::default(),
         };
 
-        let (request, _) = prepare_request(request).expect("converted request");
+        let (request, _) = prepare_request(request, false).expect("converted request");
         let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
 
         assert_eq!(request.format, WireFormat::OpenAiChatCompletions);
@@ -396,7 +468,7 @@ mod tests {
             metadata: RequestMetadata::default(),
         };
 
-        let (request, _) = prepare_request(request).expect("converted request");
+        let (request, _) = prepare_request(request, false).expect("converted request");
         let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
         let messages = body["messages"].as_array().expect("messages");
 
@@ -430,7 +502,7 @@ mod tests {
             metadata: RequestMetadata::default(),
         };
 
-        let (request, _) = prepare_request(request).expect("converted request");
+        let (request, _) = prepare_request(request, false).expect("converted request");
         let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
         let messages = body["messages"].as_array().expect("messages");
 
@@ -462,7 +534,7 @@ mod tests {
             metadata: RequestMetadata::default(),
         };
 
-        let (request, _) = prepare_request(request).expect("converted request");
+        let (request, _) = prepare_request(request, false).expect("converted request");
         let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
         let messages = body["messages"].as_array().expect("messages");
 
@@ -471,5 +543,67 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_1");
         assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
         assert_eq!(messages[4]["tool_call_id"], "call_2");
+    }
+
+    #[test]
+    fn text_only_models_omit_tool_images_but_keep_user_images() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "upstream-model".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "model":"client-model",
+                    "input":[
+                        {"type":"message","role":"user","content":[
+                            {"type":"input_text","text":"inspect"},
+                            {"type":"input_image","image_url":"data:image/png;base64,user"}
+                        ]},
+                        {"type":"function_call_output","call_id":"call_1","output":[
+                            {"type":"input_text","text":"tool text"},
+                            {"type":"input_image","image_url":"data:image/png;base64,tool"}
+                        ]}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let (request, _) = prepare_request(request, true).expect("converted request");
+        let body: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,user"
+        );
+        assert_eq!(
+            body["messages"][1]["content"],
+            "tool text\n\n[image omitted: unsupported by upstream]"
+        );
+    }
+
+    #[test]
+    fn native_chat_tool_arrays_are_unchanged_unless_omission_is_requested() {
+        let request = || {
+            ProviderRequest {
+            format: WireFormat::OpenAiChatCompletions,
+            model: "upstream-model".to_owned(),
+            payload: Bytes::from_static(
+                br#"{"messages":[{"role":"tool","content":[{"type":"text","text":"ok"},{"type":"image_url","image_url":{"url":"data:image/png;base64,tool"}}]}]}"#,
+            ),
+            metadata: RequestMetadata::default(),
+        }
+        };
+        let original = request();
+        let mut omitted = request();
+
+        omit_tool_images(&mut omitted).expect("omit tool image");
+
+        assert!(serde_json::from_slice::<Value>(&original.payload).expect("JSON")["messages"][0]
+            ["content"]
+            .is_array());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&omitted.payload).expect("JSON")["messages"][0]["content"],
+            "ok\n\n[image omitted: unsupported by upstream]"
+        );
     }
 }

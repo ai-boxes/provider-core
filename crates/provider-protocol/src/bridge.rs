@@ -1,6 +1,7 @@
 use provider_core::{
-    PreparedProviderRequest, ProtocolBridge, ProviderError, ProviderErrorKind, ProviderRequest,
-    ProviderStream, ProxyRequest, ResponseTranslator, WireFormat,
+    PreparedProviderRequest, ProtocolBridge, ProviderError, ProviderErrorKind,
+    ProviderModelInputModality, ProviderRequest, ProviderStream, ProxyRequest, ResponseTranslator,
+    WireFormat,
 };
 
 use crate::{anthropic, claude, openai_chat};
@@ -26,10 +27,16 @@ impl ProtocolBridge for DefaultProtocolBridge {
         &self,
         request: ProxyRequest,
         target: WireFormat,
+        input_modalities: Option<&[ProviderModelInputModality]>,
     ) -> Result<PreparedProviderRequest, ProviderError> {
+        let explicitly_text_only = input_modalities == Some(&[ProviderModelInputModality::Text]);
         if request.format == target {
+            let mut request = ProviderRequest::from_proxy(request, target);
+            if target == WireFormat::OpenAiChatCompletions && explicitly_text_only {
+                openai_chat::omit_tool_images(&mut request)?;
+            }
             return Ok(PreparedProviderRequest::new(
-                ProviderRequest::from_proxy(request, target),
+                request,
                 Box::new(IdentityResponseTranslator),
             ));
         }
@@ -60,7 +67,8 @@ impl ProtocolBridge for DefaultProtocolBridge {
                 ));
             }
             WireFormat::OpenAiChatCompletions => {
-                let (request, response) = openai_chat::prepare_request(responses_request)?;
+                let (request, response) =
+                    openai_chat::prepare_request(responses_request, explicitly_text_only)?;
                 (request, Box::new(response))
             }
             WireFormat::ClaudeMessages => {

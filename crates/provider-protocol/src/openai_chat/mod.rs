@@ -7,6 +7,9 @@ pub(crate) use response::ChatResponseTranslator;
 
 pub(crate) fn prepare_request(
     request: ProviderRequest,
+    omit_tool_images: bool,
 ) -> Result<(ProviderRequest, ChatResponseTranslator), ProviderError> {
-    request::prepare_request(request)
+    request::prepare_request(request, omit_tool_images)
 }
+
+pub(crate) use request::omit_tool_images;
