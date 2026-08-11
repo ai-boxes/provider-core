@@ -49,7 +49,6 @@ pub struct ProxyReadiness(Arc<AtomicBool>);
 pub(crate) struct ManagementRouterConfig {
     pub(crate) usage: Option<crate::usage_http::UsageServices>,
     pub(crate) trusted_proxy_ip: Option<std::net::IpAddr>,
-    pub(crate) management_origin: crate::auth_http::ManagementOrigin,
     pub(crate) proxy_readiness: ProxyReadiness,
 }
 
@@ -108,17 +107,8 @@ pub fn router_with_management(
     manager: ProviderManager,
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
-    management_origin: crate::auth_http::ManagementOrigin,
 ) -> Router {
-    router_with_management_and_usage(
-        service,
-        manager,
-        auth,
-        api_keys,
-        None,
-        None,
-        management_origin,
-    )
+    router_with_management_and_usage(service, manager, auth, api_keys, None, None)
 }
 
 pub fn router_with_management_and_usage(
@@ -128,7 +118,6 @@ pub fn router_with_management_and_usage(
     api_keys: ApiKeyAuthenticator,
     usage: Option<crate::usage_http::UsageServices>,
     trusted_proxy_ip: Option<std::net::IpAddr>,
-    management_origin: crate::auth_http::ManagementOrigin,
 ) -> Router {
     router_with_management_usage_and_readiness(
         service,
@@ -138,7 +127,6 @@ pub fn router_with_management_and_usage(
         ManagementRouterConfig {
             usage,
             trusted_proxy_ip,
-            management_origin,
             proxy_readiness: ProxyReadiness::new(true),
         },
     )
@@ -154,7 +142,6 @@ pub(crate) fn router_with_management_usage_and_readiness(
     let ManagementRouterConfig {
         usage,
         trusted_proxy_ip,
-        management_origin,
         proxy_readiness,
     } = config;
     let auth_state = crate::auth_http::AuthHttpState::new(
@@ -162,7 +149,6 @@ pub(crate) fn router_with_management_usage_and_readiness(
         api_keys.clone(),
         manager.clone(),
         trusted_proxy_ip,
-        management_origin.clone(),
     );
     let mut management = crate::management_http::router(manager, usage.clone());
     if let Some(usage) = &usage {
@@ -170,7 +156,7 @@ pub(crate) fn router_with_management_usage_and_readiness(
         // by a logged-in person, never with a proxy API key.
         management = management.merge(crate::usage_http::router(usage.clone()));
     }
-    let management = crate::auth_http::protect(management, auth, management_origin)
+    let management = crate::auth_http::protect(management, auth)
         .layer(DefaultBodyLimit::max(MAX_MANAGEMENT_BODY_BYTES))
         .layer(middleware::from_fn(reject_compressed_request));
     router_with_usage_and_readiness(

@@ -984,8 +984,7 @@ mod tests {
     };
 
     use crate::{
-        ManagementOrigin, auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES,
-        router_with_management,
+        auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES, router_with_management,
     };
 
     use super::{
@@ -993,18 +992,12 @@ mod tests {
         require_super_admin, unix_timestamp, updated_pricing,
     };
 
-    const TEST_MANAGEMENT_ORIGIN: &str = "https://admin.example.com";
-
     fn management_headers(session_token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
             HeaderValue::from_str(&format!("pode_session={session_token}"))
                 .expect("session cookie"),
-        );
-        headers.insert(
-            header::ORIGIN,
-            HeaderValue::from_static(TEST_MANAGEMENT_ORIGIN),
         );
         headers
     }
@@ -1461,8 +1454,6 @@ mod tests {
                     manager,
                     auth,
                     api_keys,
-                    ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN)
-                        .expect("test management origin"),
                 ),
             )
             .into_future(),
@@ -1479,7 +1470,6 @@ mod tests {
         );
         let exact_auth = client
             .post(format!("http://{address}/api/v1/auth/login"))
-            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
             .header(header::CONTENT_TYPE, "application/json")
             .body(exact_auth_body)
             .send()
@@ -1493,7 +1483,6 @@ mod tests {
         );
         let oversized_auth = client
             .post(format!("http://{address}/api/v1/auth/login"))
-            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
             .header(header::CONTENT_TYPE, "application/json")
             .body(oversized_auth_body)
             .send()
@@ -1502,7 +1491,6 @@ mod tests {
         assert_eq!(oversized_auth.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let compressed_auth = client
             .post(format!("http://{address}/api/v1/auth/login"))
-            .header(header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::CONTENT_ENCODING, "gzip")
             .body(r#"{"username":"admin","password":"secret"}"#)
@@ -2090,8 +2078,6 @@ mod tests {
                     manager.clone(),
                     auth,
                     api_keys,
-                    ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN)
-                        .expect("test management origin"),
                 ),
             )
             .into_future(),

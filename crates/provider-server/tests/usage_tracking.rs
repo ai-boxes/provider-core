@@ -38,7 +38,6 @@ use provider_drivers::codex::CodexDriver;
 use provider_management::{CredentialProviderAccountInput, ProviderManager};
 use provider_protocol::{DefaultProtocolBridge, observe_chat_completions_usage};
 use provider_runtime::ProviderRuntimeCatalog;
-use provider_server::ManagementOrigin;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
 use provider_usage::{
     CatalogPrices, CatalogRefresher, CostReason, CostStatus, DEFAULT_WRITE_QUEUE, DeliveryOutcome,
@@ -49,7 +48,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-const TEST_MANAGEMENT_ORIGIN: &str = "https://admin.example.com";
 
 /// A Codex `response.completed` reporting input and output but no cache details
 /// and no total, which is exactly the shape that must not become zeroes. It names
@@ -913,7 +911,6 @@ async fn a_priced_response_records_an_exact_cost() {
 async fn login(server_url: &str, username: &str, password: &str) -> String {
     let response = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/auth/login"))
-        .header(reqwest::header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": username, "password": password }).to_string())
         .send()
@@ -979,7 +976,6 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         deployment.api_keys.clone(),
         Some(services),
         None,
-        ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN).expect("test management origin"),
     ))
     .await;
 
@@ -1007,7 +1003,6 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let created_text = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/users"))
         .header(reqwest::header::COOKIE, &admin_cookie)
-        .header(reqwest::header::ORIGIN, TEST_MANAGEMENT_ORIGIN)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "username": "other", "password": "other-secret" }).to_string())
         .send()
@@ -1089,7 +1084,6 @@ async fn the_usage_endpoints_require_a_session_and_validate_their_input() {
         deployment.api_keys.clone(),
         Some(services),
         None,
-        ManagementOrigin::try_new(TEST_MANAGEMENT_ORIGIN).expect("test management origin"),
     ))
     .await;
 

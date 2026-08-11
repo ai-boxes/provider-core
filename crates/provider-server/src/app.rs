@@ -23,7 +23,7 @@ use crate::{
     UsageServices,
     catalog_source::HttpCatalogSource,
     config::{
-        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address, management_origin,
+        CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address,
         provider_credential_key, trusted_proxy_ip,
     },
     http::{ManagementRouterConfig, ProxyReadiness, router_with_management_usage_and_readiness},
@@ -175,7 +175,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             ManagementRouterConfig {
                 usage: Some(usage),
                 trusted_proxy_ip: trusted_proxy_ip()?,
-                management_origin: management_origin()?,
                 proxy_readiness,
             },
         )

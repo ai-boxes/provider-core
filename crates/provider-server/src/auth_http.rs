@@ -10,7 +10,7 @@ use axum::{
     extract::{
         ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State, rejection::JsonRejection,
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -30,22 +30,12 @@ const SESSION_COOKIE: &str = "pode_session";
 pub(crate) const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
-pub struct ManagementOrigin(HeaderValue);
-
-impl ManagementOrigin {
-    pub fn try_new(origin: &str) -> Result<Self, &'static str> {
-        parse_management_origin(origin).map(Self)
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct AuthHttpState {
     auth: AuthService,
     api_keys: ApiKeyAuthenticator,
     manager: ProviderManager,
     rate_limits: Arc<AuthRateLimits>,
-    management_origin: HeaderValue,
-    secure_cookie: bool,
+    trusted_proxy_ip: Option<IpAddr>,
 }
 
 impl AuthHttpState {
@@ -55,7 +45,6 @@ impl AuthHttpState {
         api_keys: ApiKeyAuthenticator,
         manager: ProviderManager,
         trusted_proxy_ip: Option<IpAddr>,
-        management_origin: ManagementOrigin,
     ) -> Self {
         Self {
             auth,
@@ -65,8 +54,7 @@ impl AuthHttpState {
                 trusted_proxy_ip,
                 ..AuthRateLimits::default()
             }),
-            management_origin: management_origin.0,
-            secure_cookie: true,
+            trusted_proxy_ip,
         }
     }
 
@@ -79,7 +67,6 @@ impl AuthHttpState {
 pub(crate) fn router(state: AuthHttpState) -> Router {
     let session_guard = SessionGuardState {
         auth: state.auth_service(),
-        management_origin: state.management_origin.clone(),
     };
     let protected = Router::new()
         .route("/api/v1/auth/logout", post(logout))
@@ -132,25 +119,18 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .merge(login_route)
         .merge(register_route)
         .merge(protected)
-        .route_layer(middleware::from_fn_with_state(
-            state.management_origin.clone(),
-            require_origin,
-        ))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .layer(middleware::from_fn(crate::http::reject_compressed_request))
+        .layer(middleware::from_fn_with_state(
+            state.trusted_proxy_ip,
+            inject_cookie_security,
+        ))
         .with_state(state)
 }
 
-pub(crate) fn protect(
-    router: Router,
-    auth: AuthService,
-    management_origin: ManagementOrigin,
-) -> Router {
+pub(crate) fn protect(router: Router, auth: AuthService) -> Router {
     router.route_layer(middleware::from_fn_with_state(
-        SessionGuardState {
-            auth,
-            management_origin: management_origin.0,
-        },
+        SessionGuardState { auth },
         require_session,
     ))
 }
@@ -163,6 +143,7 @@ async fn setup_required(State(state): State<AuthHttpState>) -> Result<Json<Value
 
 async fn setup(
     State(state): State<AuthHttpState>,
+    Extension(cookie_security): Extension<CookieSecurity>,
     request: Result<Json<UserCredentialsRequest>, JsonRejection>,
 ) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
@@ -180,12 +161,13 @@ async fn setup(
     Ok(session_response(
         StatusCode::CREATED,
         &grant,
-        state.secure_cookie,
+        cookie_security.secure,
     ))
 }
 
 async fn login(
     State(state): State<AuthHttpState>,
+    Extension(cookie_security): Extension<CookieSecurity>,
     request: Result<Json<UserCredentialsRequest>, JsonRejection>,
 ) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
@@ -200,12 +182,13 @@ async fn login(
     Ok(session_response(
         StatusCode::OK,
         &grant,
-        state.secure_cookie,
+        cookie_security.secure,
     ))
 }
 
 async fn register_user(
     State(state): State<AuthHttpState>,
+    Extension(cookie_security): Extension<CookieSecurity>,
     request: Result<Json<RegisterUserRequest>, JsonRejection>,
 ) -> Result<Response, AuthApiError> {
     let request = json_request(request)?;
@@ -221,19 +204,20 @@ async fn register_user(
     Ok(session_response(
         StatusCode::CREATED,
         &grant,
-        state.secure_cookie,
+        cookie_security.secure,
     ))
 }
 
 async fn logout(
     State(state): State<AuthHttpState>,
+    Extension(cookie_security): Extension<CookieSecurity>,
     Extension(session): Extension<AuthenticatedSession>,
 ) -> Result<Response, AuthApiError> {
     state
         .auth
         .logout_session(&session.session_id, unix_timestamp())
         .await?;
-    Ok(clear_session_response(state.secure_cookie))
+    Ok(clear_session_response(cookie_security.secure))
 }
 
 async fn me(Extension(session): Extension<AuthenticatedSession>) -> Json<Value> {
@@ -409,10 +393,28 @@ async fn delete_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Clone, Copy)]
+struct CookieSecurity {
+    secure: bool,
+}
+
 #[derive(Clone)]
 struct SessionGuardState {
     auth: AuthService,
-    management_origin: HeaderValue,
+}
+
+async fn inject_cookie_security(
+    State(trusted_proxy_ip): State<Option<IpAddr>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0);
+    let secure = secure_cookie_for_request(peer, request.headers(), trusted_proxy_ip);
+    request.extensions_mut().insert(CookieSecurity { secure });
+    next.run(request).await
 }
 
 async fn require_session(
@@ -420,26 +422,12 @@ async fn require_session(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthApiError> {
-    require_exact_origin(
-        request.method(),
-        request.headers(),
-        &state.management_origin,
-    )?;
     let token = session_cookie(request.headers())?;
     let session = state
         .auth
         .authenticate_session(token, unix_timestamp())
         .await?;
     request.extensions_mut().insert(session);
-    Ok(next.run(request).await)
-}
-
-async fn require_origin(
-    State(origin): State<HeaderValue>,
-    request: Request,
-    next: Next,
-) -> Result<Response, AuthApiError> {
-    require_exact_origin(request.method(), request.headers(), &origin)?;
     Ok(next.run(request).await)
 }
 
@@ -552,41 +540,21 @@ fn client_ip(
     peer_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
-fn parse_management_origin(origin: &str) -> Result<HeaderValue, &'static str> {
-    if origin.is_empty() || origin.ends_with('/') || !origin.starts_with("https://") {
-        return Err("must be an exact HTTPS origin without a trailing slash");
-    }
-    let authority = origin
-        .split_once("://")
-        .map(|(_, authority)| authority)
-        .ok_or("must be an exact HTTPS origin without a trailing slash")?;
-    if authority.is_empty()
-        || authority.contains('@')
-        || authority.contains(',')
-        || authority.contains('\\')
-        || authority.chars().any(char::is_whitespace)
-        || authority
-            .chars()
-            .any(|character| matches!(character, '/' | '?' | '#'))
-    {
-        return Err("must be an exact HTTPS origin without a trailing slash");
-    }
-    HeaderValue::from_str(origin).map_err(|_| "must be a valid HTTP Origin header value")
-}
-
-fn require_exact_origin(
-    method: &Method,
+fn secure_cookie_for_request(
+    peer: Option<SocketAddr>,
     headers: &HeaderMap,
-    expected: &HeaderValue,
-) -> Result<(), AuthApiError> {
-    if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS {
-        return Ok(());
+    trusted_proxy_ip: Option<IpAddr>,
+) -> bool {
+    let peer_ip = peer.map(|peer| peer.ip());
+    if peer_ip != trusted_proxy_ip {
+        return false;
     }
-    let mut origins = headers.get_all(header::ORIGIN).iter();
-    if origins.next() != Some(expected) || origins.next().is_some() {
-        return Err(AuthApiError::forbidden());
-    }
-    Ok(())
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
 }
 
 #[derive(Deserialize)]
@@ -912,28 +880,32 @@ mod focused_tests {
     use super::*;
 
     #[test]
-    fn unsafe_requests_require_the_exact_configured_origin() {
-        let expected = HeaderValue::from_static("https://admin.example.com");
+    fn secure_cookie_requires_trusted_proxy_and_https_proto() {
+        let trusted: IpAddr = "172.29.250.3".parse().expect("ip");
+        let peer = SocketAddr::from(([172, 29, 250, 3], 443));
         let mut headers = HeaderMap::new();
-        assert!(require_exact_origin(&Method::GET, &headers, &expected).is_ok());
-        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_err());
-        headers.insert(header::ORIGIN, expected.clone());
-        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_ok());
-        headers.insert(
-            header::ORIGIN,
-            HeaderValue::from_static("https://admin.example.com/"),
-        );
-        assert!(require_exact_origin(&Method::POST, &headers, &expected).is_err());
+        assert!(!secure_cookie_for_request(Some(peer), &headers, Some(trusted)));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(secure_cookie_for_request(Some(peer), &headers, Some(trusted)));
+        let other = SocketAddr::from(([127, 0, 0, 1], 443));
+        assert!(!secure_cookie_for_request(Some(other), &headers, Some(trusted)));
+        assert!(!secure_cookie_for_request(None, &headers, Some(trusted)));
     }
 
     #[test]
-    fn production_session_cookie_is_http_only_secure_and_strict() {
-        let cookie = session_cookie_header("opaque", unix_timestamp() + 60, true);
-        let cookie = cookie.to_str().expect("cookie header");
-        assert!(cookie.starts_with("pode_session=opaque;"));
-        assert!(cookie.contains("; HttpOnly"));
-        assert!(cookie.contains("; SameSite=Strict"));
-        assert!(cookie.contains("; Secure"));
+    fn session_cookie_marks_secure_only_when_requested() {
+        let secure = session_cookie_header("opaque", unix_timestamp() + 60, true);
+        let secure = secure.to_str().expect("cookie header");
+        assert!(secure.starts_with("pode_session=opaque;"));
+        assert!(secure.contains("; HttpOnly"));
+        assert!(secure.contains("; SameSite=Strict"));
+        assert!(secure.contains("; Secure"));
+
+        let plain = session_cookie_header("opaque", unix_timestamp() + 60, false);
+        let plain = plain.to_str().expect("cookie header");
+        assert!(plain.contains("; HttpOnly"));
+        assert!(plain.contains("; SameSite=Strict"));
+        assert!(!plain.contains("; Secure"));
     }
 
     #[test]
