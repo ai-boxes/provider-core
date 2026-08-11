@@ -12,6 +12,7 @@ use provider_core::{
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     compatibility::{CompatibleConfig, CompatibleCredentials, normalize_label},
@@ -20,6 +21,8 @@ use crate::{
 
 const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_SIZE: usize = 16 * 1024;
+const MAX_ERROR_DETAIL_CHARS: usize = 512;
 
 pub struct OpenAiCompatibleDriver {
     token_counter: Cl100kTokenCounter,
@@ -217,7 +220,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("OpenAI-compatible upstream", status));
+            return Err(status_error("OpenAI-compatible upstream", response).await);
         }
         let stream = response.bytes_stream().map_err(|_| {
             ProviderError::new(
@@ -259,7 +262,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("OpenAI-compatible model discovery", status));
+            return Err(status_error("OpenAI-compatible model discovery", response).await);
         }
         let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
             .await
@@ -304,15 +307,115 @@ impl OpenAiCompatibleAccount {
     }
 }
 
-fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ErrorBodyIssue {
+    ReadFailed,
+    TooLarge,
+}
+
+async fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
+    let status = response.status();
     let kind = match status.as_u16() {
         400 | 422 => ProviderErrorKind::InvalidRequest,
         401 | 403 => ProviderErrorKind::Authentication,
         429 => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
-    ProviderError::new(kind, format!("{operation} returned HTTP {status}"))
-        .with_upstream_status(status.as_u16())
+    let message = match read_error_detail(response).await {
+        Ok(Some(detail)) => format!("{operation} returned HTTP {status}: {detail}"),
+        Ok(None) => format!("{operation} returned HTTP {status}"),
+        Err(ErrorBodyIssue::ReadFailed) => {
+            format!("{operation} returned HTTP {status} with an unreadable error response")
+        }
+        Err(ErrorBodyIssue::TooLarge) => {
+            format!("{operation} returned HTTP {status} with an oversized error response")
+        }
+    };
+    ProviderError::new(kind, message).with_upstream_status(status.as_u16())
+}
+
+async fn read_error_detail(
+    response: reqwest::Response,
+) -> Result<Option<String>, ErrorBodyIssue> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ERROR_RESPONSE_SIZE as u64)
+    {
+        return Err(ErrorBodyIssue::TooLarge);
+    }
+    let body = collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
+            BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
+        })?;
+    Ok(sanitize_error_detail(&body))
+}
+
+fn sanitize_error_detail(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body)
+        && let Some(message) = extract_json_error_message(&value)
+    {
+        return Some(truncate_error_detail(&message));
+    }
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_error_detail(text))
+}
+
+fn extract_json_error_message(value: &Value) -> Option<String> {
+    let candidates = [
+        value.pointer("/error/message"),
+        value.pointer("/error/msg"),
+        value.get("message"),
+        value.get("error"),
+    ];
+    for candidate in candidates {
+        match candidate {
+            Some(Value::String(message)) => {
+                let message = message.trim();
+                if !message.is_empty() {
+                    return Some(message.to_owned());
+                }
+            }
+            Some(Value::Object(object)) => {
+                if let Some(Value::String(message)) = object.get("message") {
+                    let message = message.trim();
+                    if !message.is_empty() {
+                        return Some(message.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn truncate_error_detail(text: &str) -> String {
+    let cleaned = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= MAX_ERROR_DETAIL_CHARS {
+        cleaned
+    } else {
+        let mut truncated = cleaned.chars().take(MAX_ERROR_DETAIL_CHARS).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
 }
 
 fn normalize_models(
@@ -367,4 +470,46 @@ struct ModelResponse {
     id: String,
     created: Option<u64>,
     owned_by: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_json_error_message, sanitize_error_detail, truncate_error_detail};
+    use serde_json::json;
+
+    #[test]
+    fn openai_error_objects_surface_their_message() {
+        let body = serde_json::to_vec(&json!({
+            "error": { "message": "model not found", "type": "invalid_request_error" }
+        }))
+        .expect("json");
+        assert_eq!(
+            sanitize_error_detail(&body).as_deref(),
+            Some("model not found")
+        );
+    }
+
+    #[test]
+    fn nested_and_flat_error_shapes_are_accepted() {
+        assert_eq!(
+            extract_json_error_message(&json!({ "message": "flat failure" })).as_deref(),
+            Some("flat failure")
+        );
+        assert_eq!(
+            extract_json_error_message(&json!({ "error": "string failure" })).as_deref(),
+            Some("string failure")
+        );
+    }
+
+    #[test]
+    fn error_detail_is_trimmed_and_length_limited() {
+        let long = "x".repeat(600);
+        let truncated = truncate_error_detail(&long);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.chars().count(), 515);
+        assert_eq!(
+            sanitize_error_detail(b"  hello\nworld  ").as_deref(),
+            Some("hello world")
+        );
+    }
 }
