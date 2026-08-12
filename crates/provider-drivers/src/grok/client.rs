@@ -258,8 +258,8 @@ mod tests {
             .expect("captured request");
         assert_eq!(captured.authorization, "Bearer upstream-token");
         assert_eq!(captured.token_auth, "xai-grok-cli");
-        assert_eq!(captured.client_version, "0.2.105");
-        assert!(captured.user_agent.starts_with("grok-shell/0.2.105 ("));
+        assert_eq!(captured.client_version, "1.0.0");
+        assert!(captured.user_agent.starts_with("grok-shell/1.0.0 ("));
         assert_eq!(captured.conversation_id, "session-1");
         assert_eq!(captured.authenticate_response, "authenticate-response");
         assert_eq!(captured.client_mode, "headless");

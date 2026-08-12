@@ -16,7 +16,6 @@ const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration"
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const DEFAULT_API_BASE_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 
@@ -273,7 +272,6 @@ impl PendingProviderOAuth for GrokPendingOAuth {
                 "expires_in": expires_in,
                 "expired": timestamp_rfc3339(expired_at)?,
                 "last_refresh": timestamp_rfc3339(refreshed_at)?,
-                "base_url": DEFAULT_API_BASE_URL,
                 "token_endpoint": self.token_endpoint,
                 "disabled": false
             });
@@ -413,7 +411,9 @@ mod tests {
             )
             .route(
                 "/user",
-                get(|| async { r#"{"userId":"oauth-user"}"# }),
+                get(|| async {
+                    axum::Json(serde_json::json!({"userId": "oauth-user"}))
+                }),
             );
         let server = tokio::spawn(axum::serve(listener, app).into_future());
 
@@ -433,7 +433,6 @@ mod tests {
         assert_eq!(document["access_token"], "access-secret");
         assert_eq!(document["refresh_token"], "refresh-secret");
         assert_eq!(document["upstream_user_id"], "oauth-user");
-        assert_eq!(document["base_url"], DEFAULT_API_BASE_URL);
         assert_eq!(document["token_endpoint"], format!("{base_url}/token"));
     }
 

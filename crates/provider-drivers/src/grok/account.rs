@@ -98,7 +98,7 @@ impl GrokDriver {
         Arc::new(Self {
             client: GrokClient::with_base_url(base_url.clone()),
             refresh_client: GrokRefreshClient::new(),
-            model_client: GrokModelClient::for_test(),
+            model_client: GrokModelClient::for_test(base_url.clone()),
             oauth_client: GrokOAuthClient::for_test("http://127.0.0.1/unused", base_url.clone()),
             quota_client: GrokQuotaClient::with_base_url(base_url),
             token_counter: Cl100kTokenCounter,
@@ -116,7 +116,7 @@ impl GrokDriver {
         Arc::new(Self {
             client: GrokClient::with_base_url(base_url.clone()),
             refresh_client: GrokRefreshClient::new(),
-            model_client: GrokModelClient::for_test(),
+            model_client: GrokModelClient::for_test(base_url.clone()),
             oauth_client: GrokOAuthClient::for_test(discovery_url, base_url.clone()),
             quota_client: GrokQuotaClient::with_base_url(base_url),
             token_counter: Cl100kTokenCounter,
@@ -361,10 +361,6 @@ impl GrokAccount {
         self.state.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn snapshot(&self) -> GrokCredentials {
-        self.state().credentials.clone()
-    }
-
     async fn persist_pending(
         &self,
         repository: &Arc<dyn AccountRepository>,
@@ -544,8 +540,20 @@ impl ProviderAccount for GrokAccount {
     async fn discover_models(
         &self,
     ) -> Result<Vec<provider_core::DiscoveredProviderModel>, ProviderError> {
-        let credentials = self.snapshot();
-        self.driver.model_client.discover(&credentials).await
+        let (credentials, _) = self
+            .credentials_with_upstream_user_id()
+            .await
+            .map_err(quota_provider_error)?;
+        let user_id = credentials.upstream_user_id().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                "Grok credential is missing upstream user ID",
+            )
+        })?;
+        self.driver
+            .model_client
+            .discover(&credentials, user_id)
+            .await
     }
 
     fn fallback_models(&self) -> &[ProviderModel] {
@@ -661,21 +669,20 @@ impl ProviderAccount for GrokAccount {
 #[async_trait]
 impl ProviderQuotaSource for GrokAccount {
     async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
-        let (credentials, revision) = self.credentials_with_upstream_user_id().await?;
-        let user_id = credentials.upstream_user_id().ok_or_else(|| {
-            ProviderQuotaError::new(
-                ProviderQuotaErrorKind::Internal,
-                "Grok credential is missing upstream user ID",
-            )
-        })?;
+        let current = self.state().clone();
+        let user_id = self
+            .driver
+            .quota_client
+            .fetch_user_id(&current.credentials)
+            .await?;
         let snapshot = self
             .driver
             .quota_client
-            .fetch_quota(self.account_id.as_str(), &credentials, user_id)
+            .fetch_quota(self.account_id.as_str(), &current.credentials, &user_id)
             .await?;
         Ok(ProviderQuotaFetch {
             snapshot,
-            credential_revision: revision,
+            credential_revision: current.revision,
         })
     }
 }

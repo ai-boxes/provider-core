@@ -7,9 +7,11 @@ use provider_core::{
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 
-use super::credentials::GrokCredentials;
+use super::{
+    credentials::GrokCredentials,
+    identity::{DEFAULT_PROXY_BASE_URL, session_headers},
+};
 
-const DEFAULT_MODEL_BASE_URL: &str = "https://api.x.ai/v1";
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 
 struct ModelDefinition {
@@ -71,36 +73,37 @@ pub fn grok_models() -> &'static [ProviderModel] {
 #[derive(Clone)]
 pub(crate) struct GrokModelClient {
     http: reqwest::Client,
-    allow_insecure_endpoint: bool,
+    base_url: String,
 }
 
 impl GrokModelClient {
     pub(crate) fn new() -> Self {
         Self {
             http: model_http_client(),
-            allow_insecure_endpoint: false,
+            base_url: DEFAULT_PROXY_BASE_URL.to_owned(),
         }
     }
 
     pub(crate) async fn discover(
         &self,
         credentials: &GrokCredentials,
+        user_id: &str,
     ) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
-        let base_url = credentials.base_url().unwrap_or(DEFAULT_MODEL_BASE_URL);
-        validate_model_base_url(base_url, self.allow_insecure_endpoint)?;
-        let response = self
-            .http
-            .get(format!("{}/models", base_url.trim_end_matches('/')))
-            .bearer_auth(credentials.access_token().expose_secret())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|_| {
-                ProviderError::new(
-                    ProviderErrorKind::Upstream,
-                    "Grok model discovery request failed",
-                )
-            })?;
+        let response = session_headers(
+            self.http
+                .get(format!("{}/models", self.base_url))
+                .bearer_auth(credentials.access_token().expose_secret())
+                .header(reqwest::header::ACCEPT, "application/json"),
+        )
+        .header("x-userid", user_id)
+        .send()
+        .await
+        .map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Upstream,
+                "Grok model discovery request failed",
+            )
+        })?;
         let status = response.status();
         if !status.is_success() {
             let kind = match status.as_u16() {
@@ -171,10 +174,10 @@ impl GrokModelClient {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn for_test() -> Self {
+    pub(crate) fn for_test(base_url: impl Into<String>) -> Self {
         Self {
             http: model_http_client(),
-            allow_insecure_endpoint: true,
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
 }
@@ -184,27 +187,6 @@ fn model_http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
-}
-
-fn validate_model_base_url(base_url: &str, allow_insecure: bool) -> Result<(), ProviderError> {
-    let endpoint = reqwest::Url::parse(base_url).map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "Grok model base_url is invalid",
-        )
-    })?;
-    let host = endpoint.host_str().unwrap_or_default().to_ascii_lowercase();
-    let secure_xai = endpoint.scheme() == "https" && (host == "x.ai" || host.ends_with(".x.ai"));
-    let local_test = allow_insecure
-        && endpoint.scheme() == "http"
-        && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
-    if !secure_xai && !local_test {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "Grok model base_url must use HTTPS on an x.ai host",
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -230,7 +212,6 @@ mod tests {
         http::{HeaderMap, StatusCode},
         routing::get,
     };
-    use secrecy::SecretString;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -246,12 +227,12 @@ mod tests {
             .expect("bind model endpoint");
         let address = listener.local_addr().expect("model endpoint address");
         let server = tokio::spawn(axum::serve(listener, app).into_future());
-        let credentials = GrokCredentials::from_json(&SecretString::from(format!(
-            r#"{{"type":"xai","auth_kind":"oauth","access_token":"model-token","base_url":"http://{address}/v1"}}"#
-        )))
-        .expect("credentials");
+        let credentials = GrokCredentials::from_access_token("model-token");
 
-        let error = match GrokModelClient::for_test().discover(&credentials).await {
+        let error = match GrokModelClient::for_test(format!("http://{address}/v1"))
+            .discover(&credentials, "model-user")
+            .await
+        {
             Ok(_) => panic!("429 model discovery must fail"),
             Err(error) => error,
         };
@@ -263,43 +244,48 @@ mod tests {
 
     #[tokio::test]
     async fn discovers_and_normalizes_remote_models() {
-        let authorization = Arc::new(Mutex::new(String::new()));
+        let headers = Arc::new(Mutex::new(HeaderMap::new()));
         let app = Router::new()
             .route(
                 "/v1/models",
                 get(
-                    |State(authorization): State<Arc<Mutex<String>>>, headers: HeaderMap| async move {
-                        *authorization.lock().expect("authorization lock") = headers
-                            .get(reqwest::header::AUTHORIZATION)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_owned();
+                    |State(captured): State<Arc<Mutex<HeaderMap>>>, headers: HeaderMap| async move {
+                        *captured.lock().expect("headers lock") = headers;
                         r#"{"data":[{"id":"grok-new","created":42,"owned_by":"xai"},{"id":"grok-new"},{"id":"  "}]}"#
                     },
                 ),
             )
-            .with_state(authorization.clone());
+            .with_state(headers.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind model endpoint");
         let address = listener.local_addr().expect("model endpoint address");
         let server = tokio::spawn(axum::serve(listener, app).into_future());
-        let credentials = GrokCredentials::from_json(&SecretString::from(format!(
-            r#"{{"type":"xai","auth_kind":"oauth","access_token":"model-token","base_url":"http://{address}/v1"}}"#
-        )))
-        .expect("credentials");
+        let credentials = GrokCredentials::from_access_token("model-token");
 
-        let models = GrokModelClient::for_test()
-            .discover(&credentials)
+        let models = GrokModelClient::for_test(format!("http://{address}/v1"))
+            .discover(&credentials, "model-user")
             .await
             .expect("models");
         server.abort();
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].upstream_model, "grok-new");
+        let headers = headers.lock().expect("headers lock");
         assert_eq!(
-            authorization.lock().expect("authorization lock").as_str(),
+            header(&headers, reqwest::header::AUTHORIZATION.as_str()),
             "Bearer model-token"
         );
+        assert_eq!(header(&headers, "x-userid"), "model-user");
+        assert_eq!(header(&headers, "x-xai-token-auth"), "xai-grok-cli");
+        assert_eq!(header(&headers, "x-grok-client-version"), "1.0.0");
+    }
+
+    fn header(headers: &HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
     }
 }

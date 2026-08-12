@@ -18,7 +18,6 @@ pub struct GrokCredentials {
     refresh_token: Option<SecretString>,
     upstream_user_id: Option<String>,
     token_endpoint: Option<String>,
-    base_url: Option<String>,
 }
 
 impl GrokCredentials {
@@ -62,11 +61,6 @@ impl GrokCredentials {
     #[must_use]
     pub(crate) fn token_endpoint(&self) -> Option<&str> {
         self.token_endpoint.as_deref()
-    }
-
-    #[must_use]
-    pub(crate) fn base_url(&self) -> Option<&str> {
-        self.base_url.as_deref()
     }
 
     pub(crate) fn expires_at(&self) -> Result<Option<i64>, GrokAuthError> {
@@ -180,18 +174,12 @@ impl GrokCredentials {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
-        let base_url = string_field(&document, "base_url")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-
         Ok(Self {
             document,
             access_token,
             refresh_token,
             upstream_user_id,
             token_endpoint,
-            base_url,
         })
     }
 }
@@ -207,7 +195,6 @@ impl fmt::Debug for GrokCredentials {
             )
             .field("upstream_user_id", &self.upstream_user_id)
             .field("token_endpoint", &self.token_endpoint)
-            .field("base_url", &self.base_url)
             .finish_non_exhaustive()
     }
 }

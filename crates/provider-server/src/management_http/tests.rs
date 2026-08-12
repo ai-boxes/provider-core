@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     routing::{get, post},
@@ -27,7 +27,7 @@ use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::SqliteAccountRepository;
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -325,30 +325,34 @@ struct QuotaUpstreamState {
     fail_billing: Arc<AtomicBool>,
 }
 
-async fn quota_models() -> &'static str {
-    r#"{"data":[{"id":"grok-4.5","owned_by":"xai"}]}"#
+async fn quota_models() -> Json<Value> {
+    Json(json!({"data": [{"id": "grok-4.5", "owned_by": "xai"}]}))
 }
 
-async fn quota_user(State(state): State<QuotaUpstreamState>) -> &'static str {
+async fn quota_user(State(state): State<QuotaUpstreamState>) -> Json<Value> {
     state.user_calls.fetch_add(1, Ordering::SeqCst);
-    r#"{"userId":"upstream-user"}"#
+    Json(json!({"userId": "upstream-user"}))
 }
 
-async fn quota_billing(State(state): State<QuotaUpstreamState>) -> (StatusCode, &'static str) {
+async fn quota_billing(State(state): State<QuotaUpstreamState>) -> (StatusCode, Json<Value>) {
     state.billing_calls.fetch_add(1, Ordering::SeqCst);
     if state.fail_billing.load(Ordering::SeqCst) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed"})),
+        );
     }
     (
         StatusCode::OK,
-        r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-16T02:27:51+00:00","end":"2026-07-23T02:27:51+00:00"},"creditUsagePercent":75.0,"onDemandCap":{"val":5000},"onDemandUsed":{"val":1250},"productUsage":[{"product":"GrokBuild","usagePercent":70.0}],"prepaidBalance":{"val":3000}}}"#,
+        Json(
+            json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-16T02:27:51+00:00","end":"2026-07-23T02:27:51+00:00"},"creditUsagePercent":75.0,"onDemandCap":{"val":5000},"onDemandUsed":{"val":1250},"productUsage":[{"product":"GrokBuild","usagePercent":70.0}],"prepaidBalance":{"val":3000}}}),
+        ),
     )
 }
 
 struct QuotaTestContext {
     upstream_state: QuotaUpstreamState,
     upstream_server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
-    base_url: String,
     repository: Arc<SqliteAccountRepository>,
     runtime: Arc<ProviderRuntimeCatalog>,
     manager: ProviderManager,
@@ -418,7 +422,6 @@ async fn quota_test_context() -> QuotaTestContext {
             "access_token": "quota-token",
             "refresh_token": "quota-refresh",
             "token_endpoint": "https://auth.x.ai/oauth/token",
-            "base_url": base_url.clone(),
             "disabled": false
         })
         .to_string(),
@@ -442,7 +445,6 @@ async fn quota_test_context() -> QuotaTestContext {
     QuotaTestContext {
         upstream_state,
         upstream_server,
-        base_url,
         repository,
         runtime,
         manager,
@@ -1168,7 +1170,7 @@ async fn quota_http_filters_shared_billing_and_forces_refresh() {
             .map(|snapshot| snapshot.groups.len()),
         Some(2)
     );
-    assert_eq!(upstream_state.user_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(upstream_state.user_calls.load(Ordering::SeqCst), 2);
     assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
 
     let api_keys = ApiKeyAuthenticator::load(repository.clone())
@@ -1251,7 +1253,6 @@ async fn quota_cache_handles_singleflight_backoff_and_credential_replacement() {
     let repository = context.repository.clone();
     let runtime = context.runtime.clone();
     let manager = context.manager.clone();
-    let base_url = context.base_url.clone();
     let owner = context.owner.clone();
     let member = context.member.clone();
     let account_id = context.account_id.clone();
@@ -1313,13 +1314,6 @@ async fn quota_cache_handles_singleflight_backoff_and_credential_replacement() {
         .await
         .expect("load account")
         .expect("stored account");
-    assert!(
-        stored
-            .credential
-            .credential_json
-            .expose_secret()
-            .contains("upstream_user_id")
-    );
     manager
         .update_credential(
             owner.id.as_str(),
@@ -1335,7 +1329,6 @@ async fn quota_cache_handles_singleflight_backoff_and_credential_replacement() {
                         "refresh_token": "replacement-refresh",
                         "upstream_user_id": "replacement-user",
                         "token_endpoint": "https://auth.x.ai/oauth/token",
-                        "base_url": base_url,
                         "disabled": false
                     })
                     .to_string(),

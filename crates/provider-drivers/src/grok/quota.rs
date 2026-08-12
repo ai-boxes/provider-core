@@ -335,6 +335,22 @@ async fn response_json<T: for<'de> Deserialize<'de>>(
     if !status.is_success() {
         return Err(status_error(operation, status));
     }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing")
+        .to_owned();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(ProviderQuotaError::new(
+            ProviderQuotaErrorKind::InvalidResponse,
+            format!("{operation} returned non-JSON content type {content_type}"),
+        ));
+    }
     let body = collect_bounded_body(response.bytes_stream(), MAX_RESPONSE_SIZE)
         .await
         .map_err(|error| match error {
@@ -399,18 +415,24 @@ mod tests {
     async fn user_handler(
         State(captured): State<CapturedRequests>,
         headers: HeaderMap,
-    ) -> &'static str {
+    ) -> axum::Json<serde_json::Value> {
         *captured.user_headers.lock().expect("user headers lock") = Some(headers);
-        r#"{"userId":"upstream-user"}"#
+        axum::Json(serde_json::json!({"userId": "upstream-user"}))
     }
 
     async fn billing_handler(
         State(captured): State<CapturedRequests>,
         OriginalUri(uri): OriginalUri,
         headers: HeaderMap,
-    ) -> &'static str {
+    ) -> (
+        [(axum::http::header::HeaderName, &'static str); 1],
+        &'static str,
+    ) {
         *captured.billing.lock().expect("billing request lock") = Some((headers, uri.to_string()));
-        include_str!("fixtures/billing_current.json")
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            include_str!("fixtures/billing_current.json"),
+        )
     }
 
     #[test]
@@ -475,7 +497,7 @@ mod tests {
             user_headers
                 .get("x-grok-client-version")
                 .and_then(|value| value.to_str().ok()),
-            Some("0.2.105")
+            Some("1.0.0")
         );
         assert!(user_headers.get("x-userid").is_none());
 

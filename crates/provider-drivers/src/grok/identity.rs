@@ -1,7 +1,7 @@
 use reqwest::RequestBuilder;
 
 pub(crate) const DEFAULT_PROXY_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
-pub(crate) const CLIENT_VERSION: &str = "0.2.105";
+pub(crate) const CLIENT_VERSION: &str = "1.0.0";
 pub(crate) const CLIENT_MODE: &str = "headless";
 pub(crate) const CLIENT_IDENTIFIER: &str = "grok-shell";
 const TOKEN_AUTH_HEADER: &str = "X-XAI-Token-Auth";
