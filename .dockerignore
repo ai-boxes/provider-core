@@ -5,4 +5,6 @@ docs
 **/*.md
 .idea
 .vscode
+.claude
+.DS_Store
 .cargo-docker
