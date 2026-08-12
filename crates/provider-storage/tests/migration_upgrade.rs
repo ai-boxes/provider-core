@@ -100,6 +100,15 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         "discovery"
     );
 
+    let quota_columns = sqlx::query("PRAGMA table_info(api_key_quota_ledger)")
+        .fetch_all(&mut connection)
+        .await
+        .expect("load upgraded quota ledger columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(quota_columns.iter().any(|name| name == "dispatched_at_ms"));
+
     let versions = sqlx::query("SELECT version FROM _sqlx_migrations ORDER BY version")
         .fetch_all(&mut connection)
         .await
@@ -107,5 +116,5 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
 }

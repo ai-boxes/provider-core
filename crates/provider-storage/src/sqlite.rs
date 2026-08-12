@@ -1623,7 +1623,14 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<QuotaAdmissionOutcome, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT quota_limit_atoms, spent_atoms
+            SELECT quota_limit_atoms, spent_atoms,
+                   EXISTS (
+                       SELECT 1
+                       FROM api_key_quota_ledger
+                       WHERE api_key_id = api_keys.id
+                         AND state = 'reserved'
+                         AND dispatched_at_ms IS NOT NULL
+                   ) AS has_unresolved_dispatch
             FROM api_keys
             WHERE id = ?
             "#,
@@ -1637,6 +1644,9 @@ impl AuthRepository for SqliteAccountRepository {
         let Some(limit) = limit else {
             return Ok(QuotaAdmissionOutcome::Unlimited);
         };
+        if auth_row_value::<i64>(&row, "has_unresolved_dispatch")? != 0 {
+            return Ok(QuotaAdmissionOutcome::Exceeded);
+        }
         let spent = auth_row_value::<String>(&row, "spent_atoms")?;
         // Reject only after lifetime spent reaches the configured limit.
         if atoms_ge(&spent, &limit)
@@ -3281,6 +3291,30 @@ mod tests {
                 .await
                 .expect("unlimited admission"),
             QuotaAdmissionOutcome::Unlimited
+        );
+
+        sqlx::query("UPDATE api_keys SET quota_limit_atoms = '100' WHERE id = ?")
+            .bind(key_id.as_str())
+            .execute(&repository.pool)
+            .await
+            .expect("restore quota limit");
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_ledger (
+                entry_id, api_key_id, reserved_atoms, state, reserved_at_ms, dispatched_at_ms
+            ) VALUES ('ambiguous', ?, '0', 'reserved', 1, 2)
+            "#,
+        )
+        .bind(key_id.as_str())
+        .execute(&repository.pool)
+        .await
+        .expect("insert unresolved dispatched claim");
+        assert_eq!(
+            repository
+                .admit_api_key_quota(&key_id)
+                .await
+                .expect("ambiguous claim admission"),
+            QuotaAdmissionOutcome::Exceeded
         );
     }
 

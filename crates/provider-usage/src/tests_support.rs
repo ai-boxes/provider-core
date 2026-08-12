@@ -107,6 +107,27 @@ impl UsageRepository for TestRepository {
         Ok(LogicalWriteOutcome::Written)
     }
 
+    async fn begin_quota_request(
+        &self,
+        _start: &LogicalRequestStart,
+    ) -> Result<LogicalWriteOutcome, UsageRepositoryError> {
+        if self.fail_start {
+            return Err(unavailable());
+        }
+        Ok(LogicalWriteOutcome::Written)
+    }
+
+    async fn mark_quota_request_dispatched(
+        &self,
+        _request_id: &str,
+        _dispatched_at_ms: i64,
+    ) -> Result<(), UsageRepositoryError> {
+        if self.fail_start {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
     async fn complete_logical_request(
         &self,
         terminal: &LogicalRequestTerminal,

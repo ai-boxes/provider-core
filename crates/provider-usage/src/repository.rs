@@ -136,10 +136,9 @@ pub struct AttemptFacts {
     pub cost: ObservedCatalogCost,
 }
 
-/// Terminal result for a legacy pre-dispatch quota reservation.
-/// Only an observed exact cost is settled; an absent cost releases the
-/// reservation without inventing spend. New finite-quota traffic charges via
-/// attempt completion instead of creating reservations.
+/// Terminal result for a finite-quota accounting claim.
+/// Only an observed exact cost is settled; an absent cost releases the claim
+/// without inventing spend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuotaLedgerEntry {
     pub entry_id: String,
@@ -147,6 +146,7 @@ pub struct QuotaLedgerEntry {
     pub dispatched: bool,
     pub cost_atoms: Option<String>,
     pub resolved_at_ms: i64,
+    pub attempts: Vec<AttemptFacts>,
 }
 
 /// The stored models.dev catalog. Exactly one is kept; an absent row means the
@@ -175,6 +175,24 @@ pub trait UsageRepository: Send + Sync {
         start: &LogicalRequestStart,
     ) -> Result<LogicalWriteOutcome, UsageRepositoryError>;
 
+    /// Persist a finite-quota request and create its zero-value accounting
+    /// claim atomically. The claim does not reserve spend, so quota remains a
+    /// soft limit; it only makes the request's later settlement durable and
+    /// idempotent.
+    async fn begin_quota_request(
+        &self,
+        start: &LogicalRequestStart,
+    ) -> Result<LogicalWriteOutcome, UsageRepositoryError>;
+
+    /// Mark a finite-quota claim as dispatched before invoking the upstream.
+    /// Recovery uses this durable boundary to distinguish claims that are safe
+    /// to release from requests whose observed attempt costs must be settled.
+    async fn mark_quota_request_dispatched(
+        &self,
+        request_id: &str,
+        dispatched_at_ms: i64,
+    ) -> Result<(), UsageRepositoryError>;
+
     /// Persist a logical request's terminal state.
     ///
     /// Operational outcomes are retained even when they are not user-visible
@@ -188,18 +206,19 @@ pub trait UsageRepository: Send + Sync {
     /// Persist one attempt. Re-submitting the same `attempt_id` is a no-op; a
     /// *different* attempt claiming an already-used sequence is an error,
     /// because that would silently duplicate upstream usage. Observed complete
-    /// costs advance lifetime key spend unless a legacy reservation still owns
-    /// that request's settlement.
+    /// costs advance lifetime key spend unless a quota claim owns that request's
+    /// settlement.
     async fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), UsageRepositoryError>;
 
-    /// Persist a legacy quota-reservation terminal and update lifetime spend.
+    /// Persist a quota-claim terminal and update lifetime spend.
     async fn record_quota_ledger_entry(
         &self,
         entry: &QuotaLedgerEntry,
     ) -> Result<(), UsageRepositoryError>;
 
-    /// Release every reservation left by a prior process. Without terminal
-    /// usage facts, restart recovery cannot invent a billable amount.
+    /// Release undispatched claims and settle dispatched claims from complete
+    /// attempt costs. Recovery fails if a dispatched claim has no complete cost
+    /// to prove, rather than silently discarding possible spend.
     async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError>;
 
     /// Add `count` lost facts to a bucket, creating it if needed. Counting rather
