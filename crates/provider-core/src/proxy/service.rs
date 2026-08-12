@@ -11,8 +11,6 @@ use crate::{
     RoutableProviderModel, WireFormat, usage::ProviderUsageProfile,
 };
 
-const MAX_ROUTE_CANDIDATES: usize = 3;
-
 /// Application service that delegates proxy operations to the active provider.
 #[derive(Clone)]
 pub struct ProxyService {
@@ -128,20 +126,15 @@ impl ProxyService {
         .filter(|target| self.protocol.supports(request.format, *target))
         .collect::<Vec<_>>();
         let routing_scope = request.metadata.routing_scope.as_deref().unwrap_or(user_id);
-        let routes = self
-            .router
-            .routes(
-                user_id,
-                routing_scope,
-                &request.model,
-                &native_formats,
-                request.metadata.session_id.as_deref(),
-                request.metadata.previous_response_id.as_deref(),
-                account_ids,
-            )
-            .into_iter()
-            .take(MAX_ROUTE_CANDIDATES)
-            .collect::<Vec<_>>();
+        let routes = self.router.routes(
+            user_id,
+            routing_scope,
+            &request.model,
+            &native_formats,
+            request.metadata.session_id.as_deref(),
+            request.metadata.previous_response_id.as_deref(),
+            account_ids,
+        );
         if routes.is_empty() {
             Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
@@ -699,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_plan_is_capped_at_three_candidates() {
+    async fn route_plan_tries_every_candidate_in_the_group() {
         let failure =
             RouteResult::HeaderError(Some(crate::ProviderFailoverReason::PreconnectFailure));
         let (service, calls, _, _) = service(&[
@@ -708,15 +701,14 @@ mod tests {
             ("account-c", failure),
             ("account-d", RouteResult::Success),
         ]);
-        assert!(
-            service
-                .execute_stream("owner", request(), None)
-                .await
-                .is_err()
-        );
+        let mut stream = service
+            .execute_stream("owner", request(), None)
+            .await
+            .expect("fourth candidate succeeds");
+        assert_eq!(stream.next().await.expect("item").expect("chunk"), "ok");
         assert_eq!(
             *calls.lock().expect("calls"),
-            ["account-a", "account-b", "account-c"]
+            ["account-a", "account-b", "account-c", "account-d"]
         );
     }
 

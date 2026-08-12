@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant},
 };
@@ -27,13 +27,20 @@ const QUOTA_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const AUTH_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const PRECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
 const RESPONSE_BINDING_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_RESPONSE_BINDINGS: usize = 100_000;
 
 struct RouterInner {
     accounts: RwLock<BTreeMap<AccountId, RoutedAccount>>,
     affinities: Mutex<SessionAffinities>,
     selections: Mutex<HashMap<SelectionKey, u64>>,
     cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
-    response_bindings: Mutex<HashMap<ResponseBindingKey, ResponseBinding>>,
+    response_bindings: Mutex<ResponseBindings>,
+}
+
+#[derive(Default)]
+struct ResponseBindings {
+    entries: HashMap<ResponseBindingKey, ResponseBinding>,
+    oldest_first: VecDeque<(Instant, ResponseBindingKey)>,
 }
 
 #[derive(Default)]
@@ -113,7 +120,7 @@ impl ProviderModelRouter {
                 affinities: Mutex::new(SessionAffinities::default()),
                 selections: Mutex::new(HashMap::new()),
                 cooldowns: Mutex::new(HashMap::new()),
-                response_bindings: Mutex::new(HashMap::new()),
+                response_bindings: Mutex::new(ResponseBindings::default()),
             }),
         }
     }
@@ -156,8 +163,13 @@ impl ProviderModelRouter {
                 .retain(|_, affinity| affinity.account_id != *account_id);
             self.cooldowns()
                 .retain(|key, _| key.account_id != *account_id);
-            self.response_bindings()
-                .retain(|_, binding| binding.account_id != *account_id);
+            let mut bindings = self.response_bindings();
+            let ResponseBindings {
+                entries,
+                oldest_first,
+            } = &mut *bindings;
+            entries.retain(|_, binding| binding.account_id != *account_id);
+            oldest_first.retain(|(_, key)| entries.contains_key(key));
         }
         removed
     }
@@ -234,9 +246,7 @@ impl ProviderModelRouter {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn response_bindings(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ResponseBindingKey, ResponseBinding>> {
+    fn response_bindings(&self) -> std::sync::MutexGuard<'_, ResponseBindings> {
         self.inner
             .response_bindings
             .lock()
@@ -349,9 +359,9 @@ impl ProviderRouter for ProviderModelRouter {
 
         if let Some(previous_response_id) = previous_response_id {
             let mut bindings = self.response_bindings();
-            bindings
-                .retain(|_, binding| now.duration_since(binding.bound_at) < RESPONSE_BINDING_TTL);
+            bindings.remove_expired(now);
             let bound = bindings
+                .entries
                 .get(&ResponseBindingKey {
                     routing_scope: routing_scope.to_owned(),
                     response_id: previous_response_id.to_owned(),
@@ -455,16 +465,60 @@ impl ProviderRouter for ProviderModelRouter {
     }
 
     fn bind_response_id(&self, routing_scope: &str, response_id: &str, account_id: &AccountId) {
-        self.response_bindings().insert(
+        let now = Instant::now();
+        let mut bindings = self.response_bindings();
+        bindings.insert(
+            now,
             ResponseBindingKey {
                 routing_scope: routing_scope.to_owned(),
                 response_id: response_id.to_owned(),
             },
+            account_id.clone(),
+        );
+    }
+}
+
+impl ResponseBindings {
+    fn insert(&mut self, now: Instant, key: ResponseBindingKey, account_id: AccountId) {
+        self.remove_expired(now);
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        while self.entries.len() >= MAX_RESPONSE_BINDINGS {
+            self.remove_oldest();
+        }
+        self.entries.insert(
+            key.clone(),
             ResponseBinding {
-                account_id: account_id.clone(),
-                bound_at: Instant::now(),
+                account_id,
+                bound_at: now,
             },
         );
+        self.oldest_first.push_back((now, key));
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        while self.oldest_first.front().is_some_and(|(bound_at, key)| {
+            self.entries
+                .get(key)
+                .is_none_or(|binding| binding.bound_at != *bound_at)
+                || now.duration_since(*bound_at) >= RESPONSE_BINDING_TTL
+        }) {
+            self.remove_oldest();
+        }
+    }
+
+    fn remove_oldest(&mut self) {
+        let Some((bound_at, key)) = self.oldest_first.pop_front() else {
+            return;
+        };
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|binding| binding.bound_at == bound_at)
+        {
+            self.entries.remove(&key);
+        }
     }
 }
 
@@ -540,25 +594,29 @@ fn rotate_round_robin(
     model: &str,
     routes: &mut [(AccountId, ProviderRouteCandidate)],
 ) {
-    if routes.len() <= 1 {
-        return;
-    }
-    let priority = routes[0].1.priority;
-    let tier_len = routes
-        .iter()
-        .take_while(|(_, candidate)| candidate.priority == priority)
-        .count();
-    let key = SelectionKey {
-        routing_scope: routing_scope.to_owned(),
-        model: model.to_owned(),
-        priority,
-    };
     let mut selections = router.selections();
-    let cursor = selections.entry(key).or_default();
-    let index = usize::try_from(*cursor % u64::try_from(tier_len).expect("tier length fits u64"))
-        .expect("round-robin index fits usize");
-    *cursor = cursor.wrapping_add(1);
-    routes[..tier_len].rotate_left(index);
+    let mut start = 0;
+    while start < routes.len() {
+        let priority = routes[start].1.priority;
+        let tier_len = routes[start..]
+            .iter()
+            .take_while(|(_, candidate)| candidate.priority == priority)
+            .count();
+        if tier_len > 1 {
+            let key = SelectionKey {
+                routing_scope: routing_scope.to_owned(),
+                model: model.to_owned(),
+                priority,
+            };
+            let cursor = selections.entry(key).or_default();
+            let index =
+                usize::try_from(*cursor % u64::try_from(tier_len).expect("tier length fits u64"))
+                    .expect("round-robin index fits usize");
+            *cursor = cursor.wrapping_add(1);
+            routes[start..start + tier_len].rotate_left(index);
+        }
+        start += tier_len;
+    }
 }
 
 #[cfg(test)]
@@ -1223,6 +1281,50 @@ mod tests {
         assert_eq!(second[2].priority, 10);
         assert_ne!(first[0].account_id, second[0].account_id);
 
+        let low_b = Arc::new(TestAccount {
+            id: AccountId::new("account-low-b").expect("account ID"),
+        });
+        runtime
+            .register(low_b.clone())
+            .await
+            .expect("low b account");
+        router
+            .replace_account_models(
+                runtime.clone(),
+                low_b.clone(),
+                vec![stored_model(&low_b.id, "upstream-low-b", "shared")],
+                access("owner", ProviderVisibility::Shared),
+                10,
+            )
+            .expect("low b route");
+        let tier_first = router.routes(
+            "caller",
+            "key-tier",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        let tier_second = router.routes(
+            "caller",
+            "key-tier",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        let first_low = tier_first
+            .iter()
+            .find(|candidate| candidate.priority == 10)
+            .and_then(|candidate| candidate.account_id.clone());
+        let second_low = tier_second
+            .iter()
+            .find(|candidate| candidate.priority == 10)
+            .and_then(|candidate| candidate.account_id.clone());
+        assert_ne!(first_low, second_low);
+
         let cooled = first[0].account_id.clone().expect("account");
         router.record_route_failure(
             &cooled,
@@ -1297,16 +1399,22 @@ mod tests {
                 )
                 .is_empty()
         );
-        router.response_bindings().insert(
-            ResponseBindingKey {
-                routing_scope: "key-a".to_owned(),
-                response_id: "expired".to_owned(),
-            },
-            ResponseBinding {
-                account_id: high_b.id.clone(),
-                bound_at: Instant::now() - RESPONSE_BINDING_TTL - Duration::from_secs(1),
-            },
-        );
+        let expired_at = Instant::now() - RESPONSE_BINDING_TTL - Duration::from_secs(1);
+        let expired_key = ResponseBindingKey {
+            routing_scope: "key-a".to_owned(),
+            response_id: "expired".to_owned(),
+        };
+        {
+            let mut bindings = router.response_bindings();
+            bindings.entries.insert(
+                expired_key.clone(),
+                ResponseBinding {
+                    account_id: high_b.id.clone(),
+                    bound_at: expired_at,
+                },
+            );
+            bindings.oldest_first.push_front((expired_at, expired_key));
+        }
         assert!(
             router
                 .routes(
@@ -1320,6 +1428,49 @@ mod tests {
                 )
                 .is_empty()
         );
+        let expired_on_bind_key = ResponseBindingKey {
+            routing_scope: "key-a".to_owned(),
+            response_id: "expired-on-bind".to_owned(),
+        };
+        {
+            let mut bindings = router.response_bindings();
+            bindings.entries.insert(
+                expired_on_bind_key.clone(),
+                ResponseBinding {
+                    account_id: high_b.id.clone(),
+                    bound_at: expired_at,
+                },
+            );
+            bindings
+                .oldest_first
+                .push_front((expired_at, expired_on_bind_key));
+        }
+        router.bind_response_id("key-a", "resp-2", &high_b.id);
+        router.bind_response_id("key-a", "resp-2", &high_a.id);
+        assert!(
+            !router
+                .response_bindings()
+                .entries
+                .contains_key(&ResponseBindingKey {
+                    routing_scope: "key-a".to_owned(),
+                    response_id: "expired-on-bind".to_owned(),
+                })
+        );
+        {
+            let bindings = router.response_bindings();
+            assert_eq!(bindings.entries.len(), 2);
+            assert_eq!(bindings.oldest_first.len(), bindings.entries.len());
+            assert_eq!(
+                bindings
+                    .entries
+                    .get(&ResponseBindingKey {
+                        routing_scope: "key-a".to_owned(),
+                        response_id: "resp-2".to_owned(),
+                    })
+                    .map(|binding| &binding.account_id),
+                Some(&high_b.id)
+            );
+        }
         assert!(router.remove_account(&high_a.id));
         assert!(
             router
