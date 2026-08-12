@@ -185,6 +185,28 @@ pub struct LogicalTracker {
     state: Mutex<LogicalState>,
 }
 
+impl Drop for LogicalTracker {
+    fn drop(&mut self) {
+        // If the handler is cancelled before a response body exists, there is no
+        // delivery wrapper left to close the logical request. Treat that path as
+        // a client drop and let finish's idempotence protect normal terminals.
+        let should_finish = {
+            let mut state = self.lock();
+            if state.finished {
+                false
+            } else {
+                if state.delivery.is_none() {
+                    state.delivery = Some(DeliveryOutcome::ClientDrop);
+                }
+                true
+            }
+        };
+        if should_finish {
+            let _ = self.finish();
+        }
+    }
+}
+
 impl LogicalTracker {
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -1144,6 +1166,28 @@ mod tests {
             TrackingState::Gap {
                 reason: TrackingGapReason::AmbiguousCancel
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_logical_tracker_closes_cancelled_request() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-cancelled-logical"))
+            .await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.failed(true);
+        drop(attempt);
+        drop(logical);
+
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+        let terminal = &harness.repository.terminals()[0];
+        assert_eq!(terminal.status, LogicalStatus::Canceled);
+        assert_eq!(terminal.delivery, Some(DeliveryOutcome::ClientDrop));
+        assert_eq!(
+            terminal.execution,
+            Some(ExecutionOutcome::EofWithoutSuccessTerminal)
         );
     }
 

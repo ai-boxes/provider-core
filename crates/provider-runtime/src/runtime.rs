@@ -64,6 +64,34 @@ struct RuntimeInner {
     cancellation: CancellationToken,
 }
 
+struct AnsweredAttemptGuard {
+    attempt: Option<Arc<dyn AttemptTracking>>,
+}
+
+impl AnsweredAttemptGuard {
+    fn new(attempt: Option<Arc<dyn AttemptTracking>>) -> Self {
+        Self { attempt }
+    }
+
+    fn failed(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.failed(true);
+        }
+    }
+
+    fn failed_with_reason(&mut self, reason: provider_core::ProviderFailoverReason) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.failed_with_reason(true, reason);
+        }
+    }
+}
+
+impl Drop for AnsweredAttemptGuard {
+    fn drop(&mut self) {
+        self.failed();
+    }
+}
+
 struct AccountEntry {
     account: Arc<dyn ProviderAccount>,
     refresh_gate: Mutex<()>,
@@ -297,12 +325,22 @@ impl ProviderRuntime {
     ) -> Result<ProviderStream, ProviderError> {
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
+        let format = request.format;
 
-        match self
-            .execute_attempt(&entry, first_request, pricing, tracking, None)
-            .await
-        {
+        let first_attempt =
+            tracking
+                .zip(entry.account.usage_profile())
+                .and_then(|(tracking, profile)| {
+                    tracking.begin_attempt(
+                        profile,
+                        entry.account.account_id().as_str(),
+                        Some(first_request.model.as_str()),
+                        pricing,
+                    )
+                });
+        match entry.account.execute_stream(first_request).await {
             Err(error) if error.upstream_status() == Some(401) => {
+                let mut first_attempt = AnsweredAttemptGuard::new(first_attempt);
                 let account_id = entry.account.account_id().clone();
                 let refresh = self
                     .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
@@ -310,7 +348,15 @@ impl ProviderRuntime {
                 self.report_refresh_result(account_id, &refresh);
                 // A failed refresh is not a model call, so it must not invent a
                 // second attempt.
-                refresh.map_err(refresh_provider_error)?;
+                if let Err(error) = refresh {
+                    if let Some(reason) = refresh_failover_reason(&error) {
+                        first_attempt.failed_with_reason(reason);
+                    } else {
+                        first_attempt.failed();
+                    }
+                    return Err(refresh_failover_error(error));
+                }
+                first_attempt.failed();
                 match self
                     .execute_attempt(
                         &entry,
@@ -328,7 +374,7 @@ impl ProviderRuntime {
                     result => result,
                 }
             }
-            result => result,
+            result => finish_attempt(first_attempt, result, None, format),
         }
     }
 
@@ -362,25 +408,7 @@ impl ProviderRuntime {
         // call, which records an unprovable cancellation rather than guessing
         // whether the request reached the upstream.
         let result = entry.account.execute_stream(request).await;
-        let Some(attempt) = attempt else {
-            return result;
-        };
-
-        match result {
-            Ok(stream) => {
-                attempt.stream_opened();
-                Ok(observe_usage(stream, attempt, format))
-            }
-            Err(error) => {
-                let failover_reason = attempt_failover_reason(&error, unauthorized_failover_reason);
-                if let Some(reason) = failover_reason {
-                    attempt.failed_with_reason(error.upstream_status().is_some(), reason);
-                } else {
-                    attempt.failed(error.upstream_status().is_some());
-                }
-                Err(error)
-            }
-        }
+        finish_attempt(attempt, result, unauthorized_failover_reason, format)
     }
 
     async fn fetch_quota_entry(
@@ -437,6 +465,32 @@ impl ProviderRuntime {
 
     async fn account_entry(&self, account_id: &AccountId) -> Option<Arc<AccountEntry>> {
         self.inner.accounts.read().await.get(account_id).cloned()
+    }
+}
+
+fn finish_attempt(
+    attempt: Option<Arc<dyn AttemptTracking>>,
+    result: Result<ProviderStream, ProviderError>,
+    unauthorized_failover_reason: Option<provider_core::ProviderFailoverReason>,
+    format: WireFormat,
+) -> Result<ProviderStream, ProviderError> {
+    let Some(attempt) = attempt else {
+        return result;
+    };
+    match result {
+        Ok(stream) => {
+            attempt.stream_opened();
+            Ok(observe_usage(stream, attempt, format))
+        }
+        Err(error) => {
+            let failover_reason = attempt_failover_reason(&error, unauthorized_failover_reason);
+            if let Some(reason) = failover_reason {
+                attempt.failed_with_reason(error.upstream_status().is_some(), reason);
+            } else {
+                attempt.failed(error.upstream_status().is_some());
+            }
+            Err(error)
+        }
     }
 }
 
@@ -502,6 +556,20 @@ fn refresh_provider_error(error: RefreshError) -> ProviderError {
         RefreshErrorKind::Internal => ProviderErrorKind::Internal,
     };
     ProviderError::new(kind, error.message())
+}
+
+fn refresh_failover_error(error: RefreshError) -> ProviderError {
+    let failover_reason = refresh_failover_reason(&error);
+    let error = refresh_provider_error(error);
+    match failover_reason {
+        Some(reason) => error.with_failover_reason(reason),
+        None => error,
+    }
+}
+
+fn refresh_failover_reason(error: &RefreshError) -> Option<provider_core::ProviderFailoverReason> {
+    (error.kind() == RefreshErrorKind::ReauthRequired)
+        .then_some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
 }
 
 fn refresh_quota_error(error: RefreshError) -> ProviderQuotaError {
@@ -675,7 +743,10 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use futures_util::stream;
     use provider_core::{
@@ -704,6 +775,34 @@ mod tests {
         revision: AtomicU64,
         quota_started: Notify,
         release_quota: Notify,
+    }
+
+    #[derive(Default)]
+    struct RecordingAttempt {
+        terminal: StdMutex<Option<(bool, Option<provider_core::ProviderFailoverReason>)>>,
+        terminal_calls: AtomicU64,
+    }
+
+    impl AttemptTracking for RecordingAttempt {
+        fn stream_opened(&self) {}
+        fn first_token_observed(&self) {}
+        fn success_terminal_observed(&self) {}
+        fn provider_model_observed(&self, _model: &str) {}
+        fn observation_lost(&self) {}
+        fn finished(&self, _fields: Option<provider_core::usage::RawUsageFields>) {}
+        fn cancelled(&self, _fields: Option<provider_core::usage::RawUsageFields>) {}
+        fn failed(&self, answered: bool) {
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            *self.terminal.lock().expect("terminal") = Some((answered, None));
+        }
+        fn failed_with_reason(
+            &self,
+            answered: bool,
+            reason: provider_core::ProviderFailoverReason,
+        ) {
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            *self.terminal.lock().expect("terminal") = Some((answered, Some(reason)));
+        }
     }
 
     struct TestDriver;
@@ -911,6 +1010,84 @@ mod tests {
             ),
             Some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
         );
+    }
+
+    #[test]
+    fn only_reauth_refresh_failure_allows_cross_provider_failover() {
+        let reauth = refresh_failover_error(RefreshError::new(
+            RefreshErrorKind::ReauthRequired,
+            "refresh failed",
+        ));
+        assert_eq!(reauth.kind(), ProviderErrorKind::Authentication);
+        assert_eq!(
+            reauth.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
+        );
+
+        let transient = refresh_failover_error(RefreshError::new(
+            RefreshErrorKind::Transient,
+            "refresh failed",
+        ));
+        assert_eq!(transient.kind(), ProviderErrorKind::Upstream);
+        assert_eq!(transient.failover_reason(), None);
+
+        let internal = refresh_failover_error(RefreshError::new(
+            RefreshErrorKind::Internal,
+            "refresh failed",
+        ));
+        assert_eq!(internal.kind(), ProviderErrorKind::Internal);
+        assert_eq!(internal.failover_reason(), None);
+
+        assert_eq!(
+            refresh_failover_reason(&RefreshError::new(
+                RefreshErrorKind::ReauthRequired,
+                "refresh failed",
+            )),
+            Some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
+        );
+        assert_eq!(
+            refresh_failover_reason(&RefreshError::new(
+                RefreshErrorKind::Transient,
+                "refresh failed",
+            )),
+            None
+        );
+        assert_eq!(
+            refresh_failover_reason(&RefreshError::new(
+                RefreshErrorKind::Internal,
+                "refresh failed",
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn answered_attempt_guard_records_cancellation_as_an_answered_failure() {
+        let attempt = Arc::new(RecordingAttempt::default());
+        {
+            let _guard = AnsweredAttemptGuard::new(Some(attempt.clone()));
+        }
+        assert_eq!(
+            *attempt.terminal.lock().expect("terminal"),
+            Some((true, None))
+        );
+        assert_eq!(attempt.terminal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn answered_attempt_guard_records_refresh_failure_reason_once() {
+        let attempt = Arc::new(RecordingAttempt::default());
+        let mut guard = AnsweredAttemptGuard::new(Some(attempt.clone()));
+        guard.failed_with_reason(provider_core::ProviderFailoverReason::AuthenticationExhausted);
+        drop(guard);
+        assert_eq!(
+            *attempt.terminal.lock().expect("terminal"),
+            Some((
+                true,
+                Some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
+            ))
+        );
+        assert_eq!(attempt.terminal_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
