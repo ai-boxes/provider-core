@@ -325,14 +325,19 @@ async fn responses(
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::OpenAiResponses, &body).await?;
-    let request =
-        match proxy_request_from_payload(WireFormat::OpenAiResponses, &headers, body, payload) {
-            Ok(request) => request,
-            Err(error) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
-                return Err(error);
-            }
-        };
+    let request = match proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
+            return Err(error);
+        }
+    };
     proxy_prepared_stream(&state, &key, request, logical).await
 }
 
@@ -354,7 +359,7 @@ async fn messages(
     ) {
         Ok(request) => request,
         Err(error) => {
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             return Err(error);
         }
     };
@@ -412,14 +417,14 @@ async fn proxy_prepared_stream(
         match state.api_keys.admit_quota(key).await {
             Ok(()) => {}
             Err(AuthError::QuotaExceeded) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
                 return Err(HttpError::rate_limited(
                     protocol,
                     "API key USD quota has been exhausted",
                 ));
             }
             Err(_) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
                 return Err(HttpError::service_unavailable(
                     protocol,
                     "quota accounting is unavailable",
@@ -430,7 +435,7 @@ async fn proxy_prepared_stream(
     let account_ids = match load_key_account_filter(&state.api_keys, key, protocol).await {
         Ok(account_ids) => account_ids,
         Err(error) => {
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             return Err(error);
         }
     };
@@ -441,17 +446,30 @@ async fn proxy_prepared_stream(
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
                 return Err(HttpError::from_provider(protocol, error));
             }
         };
 
     let tracking = logical.as_ref().map(LogicalTracker::request_tracking);
 
+    if key.quota_limit_atoms.is_some() {
+        let tracker = logical
+            .as_ref()
+            .expect("finite quota requests require a logical tracker");
+        if tracker.mark_quota_dispatched().await.is_err() {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
+            return Err(HttpError::service_unavailable(
+                protocol,
+                "quota accounting is unavailable",
+            ));
+        }
+    }
+
     let stream = match prepared.execute_stream(tracking.as_ref()).await {
         Ok(stream) => stream,
         Err(error) => {
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             return Err(HttpError::from_provider(protocol, error));
         }
     };
@@ -492,57 +510,75 @@ async fn parse_tracked_payload(
             let logical = begin_tracking(
                 state,
                 key,
+                protocol,
                 client_model_raw,
                 routing_model,
                 reasoning_effort,
             )
-            .await;
+            .await?;
             Ok((payload, logical))
         }
         Err(error) => {
-            let logical = begin_tracking(state, key, None, None, None).await;
-            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            let logical = begin_tracking(state, key, protocol, None, None, None).await?;
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             Err(error)
         }
     }
 }
 
-fn finish_before_bytes(logical: Option<&Arc<LogicalTracker>>, execution: ExecutionOutcome) {
+async fn finish_before_bytes(logical: Option<&Arc<LogicalTracker>>, execution: ExecutionOutcome) {
     if let Some(logical) = logical {
         logical.record_execution(execution);
         logical.record_delivery(DeliveryOutcome::ErrorBeforeBytes);
-        logical.finish();
+        if let Some(receipt) = logical.finish() {
+            let _ = receipt.persisted().await;
+        }
     }
 }
 
 /// Record the start of a logical request, if usage is being tracked.
 ///
-/// The write inside is the only tracking write on the request path, and it is
-/// fail-open: it cannot fail this function, so a broken database costs a gap in
-/// the statistics and nothing else.
+/// Ordinary usage statistics remain fail-open. Finite-quota requests instead
+/// create their durable accounting claim here and fail closed before dispatch
+/// when accounting is unavailable.
 async fn begin_tracking(
     state: &AppState,
     key: &AuthenticatedApiKey,
+    protocol: WireFormat,
     client_model_raw: Option<String>,
     routing_model: Option<String>,
     reasoning_effort: Option<String>,
-) -> Option<Arc<LogicalTracker>> {
-    let usage = state.usage.as_ref()?;
-    Some(
-        usage
-            .begin_request(LogicalRequestStart {
-                request_id: uuid::Uuid::new_v4().to_string(),
-                owner_user_id: key.owner_user_id.to_string(),
-                api_key_id: Some(key.key_id.to_string()),
-                api_key_label: Some(key.label.clone()),
-                api_key_group_label: Some(key.group_label.clone()),
-                client_model_raw,
-                routing_model,
-                reasoning_effort,
-                started_at_ms: provider_usage::system_clock_ms(),
-            })
-            .await,
-    )
+) -> Result<Option<Arc<LogicalTracker>>, HttpError> {
+    let Some(usage) = state.usage.as_ref() else {
+        if key.quota_limit_atoms.is_some() {
+            return Err(HttpError::service_unavailable(
+                protocol,
+                "quota accounting is unavailable",
+            ));
+        }
+        return Ok(None);
+    };
+    let start = LogicalRequestStart {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        owner_user_id: key.owner_user_id.to_string(),
+        api_key_id: Some(key.key_id.to_string()),
+        api_key_label: Some(key.label.clone()),
+        api_key_group_label: Some(key.group_label.clone()),
+        client_model_raw,
+        routing_model,
+        reasoning_effort,
+        started_at_ms: provider_usage::system_clock_ms(),
+    };
+    if key.quota_limit_atoms.is_some() {
+        return usage
+            .begin_quota_request(start)
+            .await
+            .map(Some)
+            .map_err(|_| {
+                HttpError::service_unavailable(protocol, "quota accounting is unavailable")
+            });
+    }
+    Ok(Some(usage.begin_request(start).await))
 }
 
 /// Capture the client-declared reasoning level without interpreting provider
@@ -711,6 +747,15 @@ fn proxy_request_for_key_from_payload(
     key: &AuthenticatedApiKey,
 ) -> Result<ProxyRequest, HttpError> {
     let mut request = proxy_request_from_payload(protocol, headers, body, payload)?;
+    request.metadata.routing_scope = Some(key.key_id.to_string());
+    request.metadata.previous_response_id = serde_json::from_slice::<Value>(&request.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     if protocol == WireFormat::ClaudeMessages {
         let mut payload: Value = serde_json::from_slice(&request.payload)
             .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
@@ -1023,6 +1068,7 @@ mod tests {
                     provider: ProviderKind::OpenAiCompatible,
                     label: "seed".to_owned(),
                     group_label: group_label.to_owned(),
+                    priority: 0,
                     config_json: "{}".to_owned(),
                     enabled: true,
                     credential: NewCredential {
@@ -1232,12 +1278,15 @@ mod tests {
         expected_metadata.session_id = Some("session-1".to_owned());
         expected_metadata.thread_id = Some("thread:1".to_owned());
         expected_metadata.client_request_id = Some("request_1".to_owned());
+        expected_metadata.routing_scope = Some(created_key.summary.id.to_string());
+        let mut anthropic_metadata = RequestMetadata::default();
+        anthropic_metadata.routing_scope = Some(created_key.summary.id.to_string());
         assert_eq!(
             captured_metadata
                 .lock()
                 .expect("metadata capture lock")
                 .as_slice(),
-            [expected_metadata, RequestMetadata::default()]
+            [expected_metadata, anthropic_metadata]
         );
 
         let invalid_metadata = client

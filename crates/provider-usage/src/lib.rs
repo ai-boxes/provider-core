@@ -51,8 +51,9 @@ pub use refresh::{
     MODELS_DEV_URL, RefreshOutcome, content_revision, reason,
 };
 pub use repository::{
-    AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
-    QuotaLedgerEntry, StoredCatalog, StoredLogicalRequest, UsageRepository, UsageRepositoryError,
+    AttemptFacts, AttemptFailoverReason, AttemptOutcome, LogicalRequestStart,
+    LogicalRequestTerminal, LogicalWriteOutcome, QuotaLedgerEntry, StoredCatalog,
+    StoredLogicalRequest, UsageRepository, UsageRepositoryError,
 };
 pub use retention::{
     DEFAULT_RETENTION, DEFAULT_RETENTION_BATCH, DEFAULT_RETENTION_PERIOD, RetentionReport,

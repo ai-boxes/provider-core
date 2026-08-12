@@ -34,6 +34,7 @@ async fn metadata_only_update_does_not_discover_or_overwrite_concurrent_auth_sta
             ProviderAccountUpdate {
                 label: "Renamed".to_owned(),
                 group_label: "new-group".to_owned(),
+                priority: 5,
                 config_json: r#"{"base_url":"https://old.example"}"#.to_owned(),
                 visibility: ProviderVisibility::Shared,
                 updated_at: 20,
@@ -79,6 +80,7 @@ async fn configuration_update_rebuilds_discovers_and_commits_models() {
             ProviderAccountUpdate {
                 label: "Renamed".to_owned(),
                 group_label: "new-group".to_owned(),
+                priority: 2,
                 config_json: r#"{"base_url":"https://new.example"}"#.to_owned(),
                 visibility: ProviderVisibility::Shared,
                 updated_at: 20,
@@ -251,6 +253,7 @@ impl ProviderManagementRepository for TestRepository {
         account.safe_error_code = Some("credential_expired".to_owned());
         account.label = update.label;
         account.group_label = update.group_label;
+        account.priority = update.priority;
         account.config_json = update.config_json;
         account.visibility = update.visibility;
         account.updated_at = update.updated_at;
@@ -377,6 +380,7 @@ impl ProviderControl for TestControl {
         _account: Arc<dyn ProviderAccount>,
         _models: Vec<StoredProviderModel>,
         _access: ProviderAccountAccess,
+        _priority: u32,
     ) {
         self.installs.fetch_add(1, Ordering::SeqCst);
     }
@@ -480,6 +484,7 @@ fn stored_account() -> StoredProviderAccount {
         provider: ProviderKind::OpenAiCompatible,
         label: "Original".to_owned(),
         group_label: "default".to_owned(),
+        priority: 5,
         config_json: r#"{"base_url":"https://old.example"}"#.to_owned(),
         enabled: true,
         auth_state: AccountAuthState::Active,

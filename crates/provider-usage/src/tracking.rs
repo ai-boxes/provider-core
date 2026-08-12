@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use provider_core::{
-    ProviderKind, ProviderModelPricingRecord,
+    ProviderFailoverReason, ProviderKind, ProviderModelPricingRecord,
     usage::{
         AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
         RequestTracking, UsageContractSnapshot, normalize_usage,
@@ -32,8 +32,8 @@ use crate::{
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
     price::{InlinePriceRecord, ModelInlinePriceRecordV2, PriceResolution},
     repository::{
-        AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
-        UsageRepository,
+        AttemptFacts, AttemptFailoverReason, AttemptOutcome, LogicalRequestStart,
+        LogicalRequestTerminal, LogicalWriteOutcome, UsageRepository, UsageRepositoryError,
     },
     writer::{
         QuotaLedgerPermit, QuotaLedgerReceipt, QuotaLedgerWriter, UsageFact, UsageWrite,
@@ -117,10 +117,40 @@ impl UsageTracking {
                 Some(TrackingGapReason::WriteFailed)
             }
         };
+        self.tracker(start, start_gap, None)
+    }
+
+    /// Begin a finite-quota request on the fail-closed accounting path.
+    ///
+    /// Queue capacity is acquired before the durable claim is created, so every
+    /// admitted claim has an unsheddable route to settlement. The database
+    /// stores the logical start and claim in one transaction.
+    pub async fn begin_quota_request(
+        &self,
+        start: LogicalRequestStart,
+    ) -> Result<Arc<LogicalTracker>, UsageRepositoryError> {
+        let quota_writer = self
+            .quota_writer
+            .as_ref()
+            .ok_or_else(|| UsageRepositoryError::new("quota ledger writer is unavailable"))?;
+        let permit = quota_writer
+            .reserve()
+            .await
+            .ok_or_else(|| UsageRepositoryError::new("quota ledger writer is unavailable"))?;
+        self.repository.begin_quota_request(&start).await?;
+        Ok(self.tracker(start, None, Some(permit)))
+    }
+
+    fn tracker(
+        &self,
+        start: LogicalRequestStart,
+        start_gap: Option<TrackingGapReason>,
+        quota_permit: Option<QuotaLedgerPermit>,
+    ) -> Arc<LogicalTracker> {
         Arc::new(LogicalTracker {
             start,
+            repository: Arc::clone(&self.repository),
             writer: Arc::clone(&self.writer),
-            quota_writer: self.quota_writer.clone(),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
                 start_gap,
@@ -130,10 +160,11 @@ impl UsageTracking {
                 final_attempt_execution: None,
                 execution: None,
                 delivery: None,
-                quota_permit: None,
+                quota_permit,
                 quota_atoms: 0,
                 quota_dispatched: false,
-                quota_cost_unknown: false,
+                quota_has_complete_cost: false,
+                quota_attempts: Vec::new(),
                 finished: false,
             }),
         })
@@ -173,16 +204,39 @@ struct LogicalState {
     quota_permit: Option<QuotaLedgerPermit>,
     quota_atoms: i128,
     quota_dispatched: bool,
-    quota_cost_unknown: bool,
+    quota_has_complete_cost: bool,
+    quota_attempts: Vec<AttemptFacts>,
     finished: bool,
 }
 
 pub struct LogicalTracker {
     start: LogicalRequestStart,
+    repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
-    quota_writer: Option<Arc<QuotaLedgerWriter>>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
+}
+
+impl Drop for LogicalTracker {
+    fn drop(&mut self) {
+        // If the handler is cancelled before a response body exists, there is no
+        // delivery wrapper left to close the logical request. Treat that path as
+        // a client drop and let finish's idempotence protect normal terminals.
+        let should_finish = {
+            let mut state = self.lock();
+            if state.finished {
+                false
+            } else {
+                if state.delivery.is_none() {
+                    state.delivery = Some(DeliveryOutcome::ClientDrop);
+                }
+                true
+            }
+        };
+        if should_finish {
+            let _ = self.finish();
+        }
+    }
 }
 
 impl LogicalTracker {
@@ -203,21 +257,13 @@ impl LogicalTracker {
         Arc::new(RequestTrackingHandle(Arc::clone(self)))
     }
 
-    /// Reserve bounded quota-ledger capacity before dispatch. Holding the permit
-    /// makes the eventual terminal enqueue infallible, including on client drop.
-    pub async fn reserve_quota_settlement(&self) -> Result<(), ()> {
-        let Some(writer) = self.quota_writer.as_ref() else {
-            return Ok(());
-        };
-        let permit = writer.reserve().await.ok_or(())?;
-        self.lock().quota_permit = Some(permit);
+    /// Persist the dispatch boundary before the upstream can be invoked.
+    pub async fn mark_quota_dispatched(&self) -> Result<(), UsageRepositoryError> {
+        self.repository
+            .mark_quota_request_dispatched(&self.start.request_id, (self.now_ms)())
+            .await?;
+        self.lock().quota_dispatched = true;
         Ok(())
-    }
-
-    /// Drop unused writer capacity when the durable admission transaction finds
-    /// that the key became unlimited before the reservation was committed.
-    pub fn cancel_quota_settlement(&self) {
-        self.lock().quota_permit = None;
     }
 
     /// Allocate the next attempt. Nothing is persisted yet; an attempt is written
@@ -245,6 +291,8 @@ impl LogicalTracker {
                 first_token_at_ms: None,
                 tracking: TrackingState::Complete,
                 success_terminal: false,
+                outcome: None,
+                failover_reason: None,
                 closed: false,
             }),
         })
@@ -311,9 +359,10 @@ impl LogicalTracker {
                         .clone()
                         .expect("a reserved quota entry must belong to an API key"),
                     dispatched: state.quota_dispatched,
-                    cost_atoms: (state.quota_dispatched && !state.quota_cost_unknown)
+                    cost_atoms: (state.quota_dispatched && state.quota_has_complete_cost)
                         .then(|| state.quota_atoms.to_string()),
                     resolved_at_ms: terminal.completed_at_ms,
+                    attempts: std::mem::take(&mut state.quota_attempts),
                 };
                 (permit, entry)
             });
@@ -356,19 +405,18 @@ impl LogicalTracker {
             return;
         }
         state.quota_dispatched = true;
+        if state.quota_permit.is_some() {
+            state.quota_attempts.push(facts.clone());
+        }
         if matches!(
             facts.cost.status,
             CostStatus::CompleteForObservedCatalogComponents
         ) {
-            match state
+            state.quota_has_complete_cost = true;
+            state.quota_atoms = state
                 .quota_atoms
                 .checked_add(facts.cost.total_known.as_atoms())
-            {
-                Some(total) => state.quota_atoms = total,
-                None => state.quota_cost_unknown = true,
-            }
-        } else {
-            state.quota_cost_unknown = true;
+                .expect("finite quota cost total must fit i128");
         }
     }
 
@@ -390,6 +438,8 @@ struct AttemptState {
     tracking: TrackingState,
     /// Whether the upstream stream reached its documented successful terminal.
     success_terminal: bool,
+    outcome: Option<AttemptOutcome>,
+    failover_reason: Option<AttemptFailoverReason>,
     closed: bool,
 }
 
@@ -459,6 +509,7 @@ impl AttemptTracker {
                     reason: TrackingGapReason::AmbiguousCancel,
                 };
             }
+            state.outcome = Some(AttemptOutcome::Cancelled);
         }
         self.close();
     }
@@ -528,6 +579,14 @@ impl AttemptTracker {
                 started_at_ms: self.started_at_ms,
                 first_token_at_ms: state.first_token_at_ms,
                 completed_at_ms: (self.logical.now_ms)(),
+                outcome: Some(state.outcome.unwrap_or_else(|| {
+                    if state.success_terminal {
+                        AttemptOutcome::Succeeded
+                    } else {
+                        AttemptOutcome::Failed
+                    }
+                })),
+                failover_reason: state.failover_reason,
                 dispatch_evidence: state.evidence,
                 tracking: state.tracking,
                 contract: self.spec.contract,
@@ -576,6 +635,7 @@ impl Drop for AttemptTracker {
                 state.tracking = TrackingState::Gap {
                     reason: TrackingGapReason::AmbiguousCancel,
                 };
+                state.outcome = Some(AttemptOutcome::Cancelled);
                 true
             }
         };
@@ -661,13 +721,39 @@ impl AttemptTracking for AttemptTracker {
     }
 
     fn failed(&self, answered: bool) {
+        self.fail(answered, None);
+    }
+
+    fn failed_with_reason(&self, answered: bool, failover_reason: ProviderFailoverReason) {
+        self.fail(answered, Some(failover_reason));
+    }
+}
+
+impl AttemptTracker {
+    fn fail(&self, answered: bool, failover_reason: Option<ProviderFailoverReason>) {
         self.advance(if answered {
             DispatchEvidence::ResponseObserved
         } else {
             // The send was attempted, but nothing proves the provider received it.
             DispatchEvidence::DispatchInvoked
         });
+        {
+            let mut state = self.lock();
+            state.outcome = Some(AttemptOutcome::Failed);
+            state.failover_reason = failover_reason.map(map_failover_reason);
+        }
         self.close();
+    }
+}
+
+const fn map_failover_reason(reason: ProviderFailoverReason) -> AttemptFailoverReason {
+    match reason {
+        ProviderFailoverReason::AuthenticationExhausted => {
+            AttemptFailoverReason::AuthenticationExhausted
+        }
+        ProviderFailoverReason::QuotaExhausted => AttemptFailoverReason::QuotaExhausted,
+        ProviderFailoverReason::RateLimited => AttemptFailoverReason::RateLimited,
+        ProviderFailoverReason::PreconnectFailure => AttemptFailoverReason::PreconnectFailure,
     }
 }
 
@@ -904,7 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_drop_with_partial_cost_releases_the_reservation() {
+    async fn client_drop_with_partial_cost_releases_the_quota_claim() {
         let repository = Arc::new(crate::tests_support::TestRepository::default());
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
         let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
@@ -914,11 +1000,10 @@ mod tests {
             Some(quota_writer),
             ticking_clock,
         );
-        let logical = tracking.begin_request(start("req-client-drop")).await;
-        logical
-            .reserve_quota_settlement()
+        let logical = tracking
+            .begin_quota_request(start("req-client-drop"))
             .await
-            .expect("quota permit");
+            .expect("quota request");
 
         let attempt = logical.open_attempt(spec(priced()));
         attempt.stream_opened();
@@ -934,6 +1019,115 @@ mod tests {
         assert_eq!(entries[0].api_key_id, "key-1");
         assert!(entries[0].dispatched);
         assert_eq!(entries[0].cost_atoms, None);
+    }
+
+    #[tokio::test]
+    async fn partial_attempt_does_not_erase_complete_quota_cost() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
+        let tracking = UsageTracking::with_clock_and_quota_writer(
+            repository.clone(),
+            writer,
+            Some(quota_writer),
+            ticking_clock,
+        );
+        let logical = tracking
+            .begin_quota_request(start("req-mixed-cost"))
+            .await
+            .expect("quota request");
+        logical
+            .mark_quota_dispatched()
+            .await
+            .expect("dispatch marker");
+
+        let complete = logical.open_attempt(spec(priced()));
+        complete.stream_opened();
+        complete.finished(Some(codex_usage()));
+
+        let partial = logical.open_attempt(spec(priced()));
+        partial.stream_opened();
+        partial.record_provider_model("gpt-4o-mini");
+        partial.finished(Some(codex_usage()));
+
+        logical.record_delivery(DeliveryOutcome::CleanEof);
+        let receipt = logical.finish().expect("quota receipt");
+        assert!(receipt.persisted().await);
+
+        let entries = repository.quota_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].cost_atoms.is_some());
+    }
+
+    #[tokio::test]
+    async fn quota_settlement_survives_saturation_of_the_usage_writer() {
+        let stall = Arc::new(tokio::sync::Mutex::new(()));
+        let held = stall.clone().lock_owned().await;
+        let repository = Arc::new(crate::tests_support::TestRepository {
+            stall: Some(stall),
+            ..crate::tests_support::TestRepository::default()
+        });
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), 1));
+        let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
+        let tracking = UsageTracking::with_clock_and_quota_writer(
+            repository.clone(),
+            writer.clone(),
+            Some(quota_writer),
+            ticking_clock,
+        );
+
+        for index in 0..8 {
+            writer.submit(UsageWrite {
+                owner_user_id: "user-1".to_owned(),
+                at_ms: 1_700_000_000_000,
+                fact: UsageFact::Gap(TrackingGapReason::WriterSaturated),
+            });
+            if writer.unrecorded_facts() > 0 {
+                panic!("gap tally unexpectedly overflowed at {index}");
+            }
+        }
+
+        let logical = tracking
+            .begin_quota_request(start("req-saturated"))
+            .await
+            .expect("quota request");
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.finished(Some(codex_usage()));
+        logical.record_delivery(DeliveryOutcome::CleanEof);
+        let receipt = logical.finish().expect("quota receipt");
+
+        drop(held);
+        assert!(receipt.persisted().await);
+        let entries = repository.quota_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_id, "req-saturated");
+        assert!(entries[0].cost_atoms.is_some());
+        assert_eq!(entries[0].attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_quota_claim_rejects_the_request() {
+        let repository = Arc::new(crate::tests_support::TestRepository {
+            fail_start: true,
+            ..crate::tests_support::TestRepository::default()
+        });
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let quota_writer = Arc::new(QuotaLedgerWriter::spawn(repository.clone(), 1));
+        let tracking = UsageTracking::with_clock_and_quota_writer(
+            repository,
+            writer,
+            Some(quota_writer),
+            ticking_clock,
+        );
+
+        assert!(
+            tracking
+                .begin_quota_request(start("req-failed-claim"))
+                .await
+                .is_err(),
+            "finite-quota accounting must fail closed before dispatch"
+        );
     }
 
     #[tokio::test]
@@ -1019,6 +1213,10 @@ mod tests {
         assert_eq!(attempts.len(), 2, "a refresh retry is a second attempt");
         assert_eq!(attempts[0].sequence, AttemptSequence(1));
         assert_eq!(attempts[1].sequence, AttemptSequence(2));
+        assert_eq!(attempts[0].outcome, Some(AttemptOutcome::Failed));
+        assert_eq!(attempts[0].failover_reason, None);
+        assert_eq!(attempts[1].outcome, Some(AttemptOutcome::Succeeded));
+        assert_eq!(attempts[1].failover_reason, None);
         let terminal = &harness.repository.terminals()[0];
         assert_eq!(
             terminal.final_attempt_id.as_deref(),
@@ -1035,6 +1233,93 @@ mod tests {
             attempts[0].dispatch_evidence,
             DispatchEvidence::ResponseObserved,
             "a failure status still proves the provider answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_failover_reasons_are_persisted_on_failed_attempts() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-failover-reasons"))
+            .await;
+        let cases = [
+            (
+                ProviderFailoverReason::AuthenticationExhausted,
+                AttemptFailoverReason::AuthenticationExhausted,
+            ),
+            (
+                ProviderFailoverReason::QuotaExhausted,
+                AttemptFailoverReason::QuotaExhausted,
+            ),
+            (
+                ProviderFailoverReason::RateLimited,
+                AttemptFailoverReason::RateLimited,
+            ),
+            (
+                ProviderFailoverReason::PreconnectFailure,
+                AttemptFailoverReason::PreconnectFailure,
+            ),
+        ];
+
+        for (provider_reason, _) in cases {
+            logical
+                .open_attempt(spec(priced()))
+                .failed_with_reason(false, provider_reason);
+        }
+        logical.finish();
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+
+        let attempts = harness.repository.attempts();
+        for (attempt, (_, expected_reason)) in attempts.iter().zip(cases) {
+            assert_eq!(attempt.outcome, Some(AttemptOutcome::Failed));
+            assert_eq!(attempt.failover_reason, Some(expected_reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_persists_cancelled_without_failover_reason() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-cancelled-attempt"))
+            .await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.cancelled(Some(codex_usage()));
+        logical.finish();
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+
+        let facts = &harness.repository.attempts()[0];
+        assert_eq!(facts.outcome, Some(AttemptOutcome::Cancelled));
+        assert_eq!(facts.failover_reason, None);
+        assert_eq!(
+            facts.tracking,
+            TrackingState::Gap {
+                reason: TrackingGapReason::AmbiguousCancel
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_logical_tracker_closes_cancelled_request() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-cancelled-logical"))
+            .await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.failed(true);
+        drop(attempt);
+        drop(logical);
+
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+        let terminal = &harness.repository.terminals()[0];
+        assert_eq!(terminal.status, LogicalStatus::Canceled);
+        assert_eq!(terminal.delivery, Some(DeliveryOutcome::ClientDrop));
+        assert_eq!(
+            terminal.execution,
+            Some(ExecutionOutcome::EofWithoutSuccessTerminal)
         );
     }
 

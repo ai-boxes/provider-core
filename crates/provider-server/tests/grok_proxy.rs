@@ -113,6 +113,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
                 provider: ProviderKind::Grok,
                 label: "seed".to_owned(),
                 group_label: "default".to_owned(),
+                priority: 0,
                 config_json: "{}".to_owned(),
                 enabled: true,
                 credential: NewCredential {

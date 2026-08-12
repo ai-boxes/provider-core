@@ -94,6 +94,7 @@ impl ManagedProviderDriver for AnthropicCompatibleDriver {
             provider: ProviderKind::AnthropicCompatible,
             label,
             group_label,
+            priority: 0,
             config_json: config.to_json()?,
             enabled: true,
             credential: NewCredential {
@@ -191,11 +192,17 @@ impl ProviderAccount for AnthropicCompatibleAccount {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("x-api-key", self.credentials.api_key.expose_secret())
             .body(request.payload);
-        let response = upstream.send().await.map_err(|_| {
-            ProviderError::new(
+        let response = upstream.send().await.map_err(|error| {
+            let provider_error = ProviderError::new(
                 ProviderErrorKind::Upstream,
                 "Anthropic-compatible upstream request failed",
-            )
+            );
+            if error.is_connect() {
+                provider_error
+                    .with_failover_reason(provider_core::ProviderFailoverReason::PreconnectFailure)
+            } else {
+                provider_error
+            }
         })?;
         let status = response.status();
         if !status.is_success() {
@@ -290,8 +297,13 @@ fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {
         429 => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
-    ProviderError::new(kind, format!("{operation} returned HTTP {status}"))
-        .with_upstream_status(status.as_u16())
+    let error = ProviderError::new(kind, format!("{operation} returned HTTP {status}"))
+        .with_upstream_status(status.as_u16());
+    match status.as_u16() {
+        402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
+        429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),
+        _ => error,
+    }
 }
 
 fn normalize_models(

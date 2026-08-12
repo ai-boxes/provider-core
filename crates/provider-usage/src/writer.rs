@@ -194,7 +194,17 @@ async fn run_quota_ledger(
     while let Some(job) = receiver.recv().await {
         match job {
             QuotaJob::Entry(entry, ack) => loop {
-                match repository.record_quota_ledger_entry(&entry).await {
+                let mut result = Ok(());
+                for attempt in &entry.attempts {
+                    if let Err(error) = repository.record_attempt(attempt).await {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                if result.is_ok() {
+                    result = repository.record_quota_ledger_entry(&entry).await;
+                }
+                match result {
                     Ok(()) => {
                         healthy.store(true, Ordering::Release);
                         pending.fetch_sub(1, Ordering::Release);
@@ -416,6 +426,7 @@ mod tests {
             dispatched: true,
             cost_atoms: Some("1".to_owned()),
             resolved_at_ms: AT_MS,
+            attempts: Vec::new(),
         }
     }
 
@@ -498,6 +509,8 @@ mod tests {
                 started_at_ms: 1_700_000_090_000,
                 first_token_at_ms: None,
                 completed_at_ms: AT_MS,
+                outcome: None,
+                failover_reason: None,
                 dispatch_evidence: DispatchEvidence::ResponseObserved,
                 tracking: TrackingState::Complete,
                 contract: UsageContractSnapshot {

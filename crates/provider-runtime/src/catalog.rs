@@ -296,6 +296,7 @@ impl ProviderControl for ProviderRuntimeCatalog {
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
         access: ProviderAccountAccess,
+        priority: u32,
     ) {
         let driver = self
             .inner
@@ -320,7 +321,7 @@ impl ProviderControl for ProviderRuntimeCatalog {
         runtime.replace(account.clone()).await;
         self.inner
             .router
-            .replace_account_models(runtime, account, models, access)
+            .replace_account_models(runtime, account, models, access, priority)
             .expect("candidate account must match its provider runtime");
         self.clear_recovery_failure(&account_id);
     }
@@ -357,17 +358,46 @@ impl ProviderRouter for ProviderRuntimeCatalog {
         self.inner.router.models(user_id, account_ids)
     }
 
-    fn routes(
+    fn routes(&self, query: &provider_core::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
+        ProviderRouter::routes(&self.inner.router, query)
+    }
+
+    fn commit_session_affinity(
         &self,
-        user_id: &str,
+        routing_scope: &str,
         model: &str,
-        native_formats: &[provider_core::WireFormat],
         session_id: Option<&str>,
-        account_ids: Option<&std::collections::HashSet<provider_core::AccountId>>,
-    ) -> Vec<ProviderRouteCandidate> {
+        account_id: &provider_core::AccountId,
+    ) {
         self.inner
             .router
-            .routes(user_id, model, native_formats, session_id, account_ids)
+            .commit_session_affinity(routing_scope, model, session_id, account_id);
+    }
+
+    fn record_route_failure(
+        &self,
+        account_id: &provider_core::AccountId,
+        model: &str,
+        reason: provider_core::ProviderFailoverReason,
+    ) {
+        self.inner
+            .router
+            .record_route_failure(account_id, model, reason);
+    }
+
+    fn record_route_success(&self, account_id: &provider_core::AccountId, model: &str) {
+        self.inner.router.record_route_success(account_id, model);
+    }
+
+    fn bind_response_id(
+        &self,
+        routing_scope: &str,
+        response_id: &str,
+        account_id: &provider_core::AccountId,
+    ) {
+        self.inner
+            .router
+            .bind_response_id(routing_scope, response_id, account_id);
     }
 }
 

@@ -37,8 +37,9 @@ pub use model::{
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{
-    Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderRoute,
-    ProviderRouteCandidate, ProviderRouter, ProviderStream, RoutableProviderModel,
+    Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderFailoverReason,
+    ProviderRoute, ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
+    RoutableProviderModel,
 };
 pub use proxy::{
     PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,

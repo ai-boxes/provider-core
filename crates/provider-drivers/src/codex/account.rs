@@ -145,6 +145,7 @@ impl ManagedProviderDriver for CodexDriver {
             provider: ProviderKind::Codex,
             label,
             group_label,
+            priority: 0,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: NewCredential {
