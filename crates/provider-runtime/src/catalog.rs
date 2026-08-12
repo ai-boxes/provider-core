@@ -358,25 +358,8 @@ impl ProviderRouter for ProviderRuntimeCatalog {
         self.inner.router.models(user_id, account_ids)
     }
 
-    fn routes(
-        &self,
-        user_id: &str,
-        routing_scope: &str,
-        model: &str,
-        native_formats: &[provider_core::WireFormat],
-        session_id: Option<&str>,
-        previous_response_id: Option<&str>,
-        account_ids: Option<&std::collections::HashSet<provider_core::AccountId>>,
-    ) -> Vec<ProviderRouteCandidate> {
-        self.inner.router.routes(
-            user_id,
-            routing_scope,
-            model,
-            native_formats,
-            session_id,
-            previous_response_id,
-            account_ids,
-        )
+    fn routes(&self, query: &provider_core::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
+        ProviderRouter::routes(&self.inner.router, query)
     }
 
     fn commit_session_affinity(

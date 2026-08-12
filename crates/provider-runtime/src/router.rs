@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use provider_core::{
     AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
     ProviderModelInputModality, ProviderRequest, ProviderRoute, ProviderRouteCandidate,
-    ProviderRouter, ProviderStream, ProviderVisibility, RoutableProviderModel, StoredProviderModel,
-    WireFormat,
+    ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility, RoutableProviderModel,
+    StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -123,6 +123,32 @@ impl ProviderModelRouter {
                 response_bindings: Mutex::new(ResponseBindings::default()),
             }),
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn routes(
+        &self,
+        user_id: &str,
+        routing_scope: &str,
+        model: &str,
+        native_formats: &[WireFormat],
+        session_id: Option<&str>,
+        previous_response_id: Option<&str>,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<ProviderRouteCandidate> {
+        ProviderRouter::routes(
+            self,
+            &ProviderRouteQuery {
+                user_id,
+                routing_scope,
+                model,
+                native_formats,
+                session_id,
+                previous_response_id,
+                account_ids,
+            },
+        )
     }
 
     pub fn replace_account_models(
@@ -300,16 +326,23 @@ impl ProviderRouter for ProviderModelRouter {
         models.into_values().collect()
     }
 
-    fn routes(
-        &self,
-        user_id: &str,
-        routing_scope: &str,
-        model: &str,
-        native_formats: &[WireFormat],
-        session_id: Option<&str>,
-        previous_response_id: Option<&str>,
-        account_ids: Option<&HashSet<AccountId>>,
-    ) -> Vec<ProviderRouteCandidate> {
+    fn routes(&self, query: &ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
+        let ProviderRouteQuery {
+            user_id,
+            routing_scope,
+            model,
+            native_formats,
+            session_id,
+            previous_response_id,
+            account_ids,
+        } = query;
+        let user_id = *user_id;
+        let routing_scope = *routing_scope;
+        let model = *model;
+        let native_formats = *native_formats;
+        let session_id = *session_id;
+        let previous_response_id = *previous_response_id;
+        let account_ids = *account_ids;
         let now = Instant::now();
         let mut cooldowns = self.cooldowns();
         cooldowns.retain(|_, until| *until > now);

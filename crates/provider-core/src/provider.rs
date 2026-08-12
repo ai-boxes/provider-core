@@ -157,6 +157,16 @@ pub struct RoutableProviderModel {
     pub native_formats: Vec<WireFormat>,
 }
 
+pub struct ProviderRouteQuery<'a> {
+    pub user_id: &'a str,
+    pub routing_scope: &'a str,
+    pub model: &'a str,
+    pub native_formats: &'a [WireFormat],
+    pub session_id: Option<&'a str>,
+    pub previous_response_id: Option<&'a str>,
+    pub account_ids: Option<&'a HashSet<AccountId>>,
+}
+
 /// In-memory model index used before protocol conversion and provider execution.
 pub trait ProviderRouter: Send + Sync {
     fn models(
@@ -165,16 +175,7 @@ pub trait ProviderRouter: Send + Sync {
         account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<RoutableProviderModel>;
 
-    fn routes(
-        &self,
-        user_id: &str,
-        routing_scope: &str,
-        model: &str,
-        native_formats: &[WireFormat],
-        session_id: Option<&str>,
-        previous_response_id: Option<&str>,
-        account_ids: Option<&HashSet<AccountId>>,
-    ) -> Vec<ProviderRouteCandidate>;
+    fn routes(&self, query: &ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate>;
 
     fn commit_session_affinity(
         &self,

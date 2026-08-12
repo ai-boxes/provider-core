@@ -126,15 +126,15 @@ impl ProxyService {
         .filter(|target| self.protocol.supports(request.format, *target))
         .collect::<Vec<_>>();
         let routing_scope = request.metadata.routing_scope.as_deref().unwrap_or(user_id);
-        let routes = self.router.routes(
+        let routes = self.router.routes(&crate::ProviderRouteQuery {
             user_id,
             routing_scope,
-            &request.model,
-            &native_formats,
-            request.metadata.session_id.as_deref(),
-            request.metadata.previous_response_id.as_deref(),
+            model: &request.model,
+            native_formats: &native_formats,
+            session_id: request.metadata.session_id.as_deref(),
+            previous_response_id: request.metadata.previous_response_id.as_deref(),
             account_ids,
-        );
+        });
         if routes.is_empty() {
             Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
@@ -304,29 +304,23 @@ impl ProviderRouter for SingleProviderRouter {
         }
     }
 
-    fn routes(
-        &self,
-        user_id: &str,
-        _routing_scope: &str,
-        model: &str,
-        native_formats: &[WireFormat],
-        _session_id: Option<&str>,
-        _previous_response_id: Option<&str>,
-        _account_ids: Option<&HashSet<AccountId>>,
-    ) -> Vec<ProviderRouteCandidate> {
-        if !self.access.allows(user_id) || !native_formats.contains(&self.provider.native_format())
+    fn routes(&self, query: &crate::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
+        if !self.access.allows(query.user_id)
+            || !query
+                .native_formats
+                .contains(&self.provider.native_format())
         {
             return Vec::new();
         }
         vec![ProviderRouteCandidate {
             account_id: None,
             priority: 0,
-            upstream_model: model.to_owned(),
+            upstream_model: query.model.to_owned(),
             input_modalities: self
                 .provider
                 .models()
                 .iter()
-                .find(|candidate| candidate.id == model)
+                .find(|candidate| candidate.id == query.model)
                 .and_then(|candidate| candidate.input_modalities.clone()),
             responses_lite: false,
             pricing: None,
@@ -521,16 +515,7 @@ mod tests {
             Vec::new()
         }
 
-        fn routes(
-            &self,
-            _user_id: &str,
-            _routing_scope: &str,
-            _model: &str,
-            _native_formats: &[WireFormat],
-            _session_id: Option<&str>,
-            _previous_response_id: Option<&str>,
-            _account_ids: Option<&HashSet<AccountId>>,
-        ) -> Vec<ProviderRouteCandidate> {
+        fn routes(&self, _query: &crate::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
             self.routes.clone()
         }
 
@@ -612,14 +597,14 @@ mod tests {
         })
     }
 
-    fn service(
-        results: &[(&str, RouteResult)],
-    ) -> (
+    type TestService = (
         ProxyService,
         Arc<Mutex<Vec<String>>>,
         Arc<Mutex<u32>>,
         Arc<Mutex<Vec<String>>>,
-    ) {
+    );
+
+    fn service(results: &[(&str, RouteResult)]) -> TestService {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let prepares = Arc::new(Mutex::new(0));
         let committed = Arc::new(Mutex::new(Vec::new()));
