@@ -334,9 +334,7 @@ async fn status_error(operation: &str, response: reqwest::Response) -> ProviderE
     ProviderError::new(kind, message).with_upstream_status(status.as_u16())
 }
 
-async fn read_error_detail(
-    response: reqwest::Response,
-) -> Result<Option<String>, ErrorBodyIssue> {
+async fn read_error_detail(response: reqwest::Response) -> Result<Option<String>, ErrorBodyIssue> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_RESPONSE_SIZE as u64)
@@ -412,7 +410,10 @@ fn truncate_error_detail(text: &str) -> String {
     if cleaned.chars().count() <= MAX_ERROR_DETAIL_CHARS {
         cleaned
     } else {
-        let mut truncated = cleaned.chars().take(MAX_ERROR_DETAIL_CHARS).collect::<String>();
+        let mut truncated = cleaned
+            .chars()
+            .take(MAX_ERROR_DETAIL_CHARS)
+            .collect::<String>();
         truncated.push_str("...");
         truncated
     }
@@ -428,6 +429,14 @@ fn normalize_models(
         if id.is_empty() {
             continue;
         }
+        provider_core::validate_input_modalities(model.input_modalities.as_deref()).map_err(
+            |_| {
+                ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "OpenAI-compatible model returned invalid input_modalities",
+                )
+            },
+        )?;
         let mut provider_model = ProviderModel::new(
             id,
             model
@@ -436,7 +445,8 @@ fn normalize_models(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(default_owner),
-        );
+        )
+        .with_input_modalities(model.input_modalities);
         if let Some(created) = model.created {
             provider_model = provider_model.with_created(created);
         }
@@ -450,6 +460,7 @@ fn normalize_models(
             id.to_owned(),
             DiscoveredProviderModel {
                 upstream_model: id.to_owned(),
+                input_modalities: provider_model.input_modalities.clone(),
                 metadata_json,
                 routable: true,
                 pricing: None,
@@ -470,11 +481,16 @@ struct ModelResponse {
     id: String,
     created: Option<u64>,
     owned_by: Option<String>,
+    input_modalities: Option<Vec<provider_core::ProviderModelInputModality>>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_json_error_message, sanitize_error_detail, truncate_error_detail};
+    use super::{
+        ModelResponse, extract_json_error_message, normalize_models, sanitize_error_detail,
+        truncate_error_detail,
+    };
+    use provider_core::ProviderModelInputModality;
     use serde_json::json;
 
     #[test]
@@ -510,6 +526,46 @@ mod tests {
         assert_eq!(
             sanitize_error_detail(b"  hello\nworld  ").as_deref(),
             Some("hello world")
+        );
+    }
+
+    #[test]
+    fn discovered_input_modalities_are_explicit_and_validated() {
+        let models = normalize_models(
+            vec![ModelResponse {
+                id: "vision".to_owned(),
+                created: None,
+                owned_by: None,
+                input_modalities: Some(vec![
+                    ProviderModelInputModality::Audio,
+                    ProviderModelInputModality::Pdf,
+                ]),
+            }],
+            "openai_compatible",
+        )
+        .expect("valid modalities");
+        assert_eq!(
+            models[0].input_modalities,
+            Some(vec![
+                ProviderModelInputModality::Audio,
+                ProviderModelInputModality::Pdf,
+            ])
+        );
+
+        assert!(
+            normalize_models(
+                vec![ModelResponse {
+                    id: "invalid".to_owned(),
+                    created: None,
+                    owned_by: None,
+                    input_modalities: Some(vec![
+                        ProviderModelInputModality::Video,
+                        ProviderModelInputModality::Video,
+                    ]),
+                }],
+                "openai_compatible",
+            )
+            .is_err()
         );
     }
 }

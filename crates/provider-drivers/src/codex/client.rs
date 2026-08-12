@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     credentials::CodexCredentials,
-    identity::{DEFAULT_BACKEND_ROOT, responses_headers},
+    identity::{DEFAULT_BACKEND_ROOT, responses_model_headers},
     quota::normalize_headers,
     request::PreparedCodexRequest,
 };
@@ -61,9 +61,11 @@ impl CodexClient {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload);
         upstream =
-            responses_headers(upstream, credentials).map_err(|error| CodexClientFailure {
-                error,
-                observed_groups: Vec::new(),
+            responses_model_headers(upstream, credentials, &request.model).map_err(|error| {
+                CodexClientFailure {
+                    error,
+                    observed_groups: Vec::new(),
+                }
             })?;
         upstream = optional_header(
             upstream,
@@ -80,7 +82,6 @@ impl CodexClient {
             .or(request.metadata.thread_id.as_deref());
         upstream = optional_header(upstream, "x-client-request-id", client_request_id)
             .map_err(empty_failure)?;
-
         let response = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, upstream.send())
             .await
             .map_err(|_| CodexClientFailure {
@@ -238,14 +239,18 @@ mod tests {
     use crate::codex::request::{PreparedCodexRequest, prepare_request};
 
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Option<(reqwest::header::HeaderMap, Bytes)>>>);
+    struct Capture(Arc<Mutex<Vec<(reqwest::header::HeaderMap, Bytes)>>>);
 
     async fn success_handler(State(capture): State<Capture>, request: Request) -> Response<Body> {
         let headers = request.headers().clone();
         let body = to_bytes(request.into_body(), 1024 * 1024)
             .await
             .expect("request body");
-        *capture.0.lock().expect("capture lock") = Some((headers, body));
+        capture
+            .0
+            .lock()
+            .expect("capture lock")
+            .push((headers, body));
         Response::builder()
             .status(StatusCode::OK)
             .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
@@ -306,33 +311,76 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(response.observed_groups.len(), 1);
         assert_eq!(response.observed_groups[0].key, "codex");
-        let (headers, captured_body) = capture
-            .0
-            .lock()
-            .expect("capture lock")
-            .clone()
-            .expect("captured request");
+        let captured = capture.0.lock().expect("capture lock").clone();
+        let (headers, captured_body) = &captured[0];
         assert_eq!(
-            header(&headers, reqwest::header::AUTHORIZATION.as_str()),
+            header(headers, reqwest::header::AUTHORIZATION.as_str()),
             "Bearer access-token"
         );
-        assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
-        assert_eq!(header(&headers, "x-openai-fedramp"), "true");
-        assert_eq!(header(&headers, "originator"), "codex_cli_rs");
+        assert_eq!(header(headers, "chatgpt-account-id"), "workspace-1");
+        assert_eq!(header(headers, "x-openai-fedramp"), "true");
+        assert_eq!(header(headers, "originator"), "codex_cli_rs");
         assert!(headers.get("version").is_none());
         assert!(
-            header(&headers, reqwest::header::USER_AGENT.as_str())
+            header(headers, reqwest::header::USER_AGENT.as_str())
                 .starts_with("codex_cli_rs/0.144.5 (")
         );
-        let session_id = header(&headers, "session-id");
+        let session_id = header(headers, "session-id");
         assert_eq!(session_id, "session-1");
-        assert_eq!(header(&headers, "thread-id"), "thread-1");
-        assert_eq!(header(&headers, "x-client-request-id"), "thread-1");
+        assert_eq!(header(headers, "thread-id"), "thread-1");
+        assert_eq!(header(headers, "x-client-request-id"), "thread-1");
         let captured_body: Value =
-            serde_json::from_slice(&captured_body).expect("captured request JSON");
+            serde_json::from_slice(captured_body).expect("captured request JSON");
         assert_eq!(captured_body["model"], "gpt-5.5");
         assert_eq!(captured_body["stream"], true);
         assert_eq!(captured_body["prompt_cache_key"], session_id);
+    }
+
+    #[tokio::test]
+    async fn applies_luna_model_identity_without_forwarding_lite_header() {
+        let capture = Capture::default();
+        let router = Router::new()
+            .route("/codex/responses", post(success_handler))
+            .with_state(capture.clone());
+        let (backend_root, server) = spawn_server(router).await;
+        let client = CodexClient::with_backend_root(&backend_root);
+        let mut metadata = RequestMetadata::default();
+        metadata.responses_lite = true;
+        let prepared = prepare_request(ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.6-luna".to_owned(),
+            payload: Bytes::from_static(br#"{"parallel_tool_calls":true,"input":"hello"}"#),
+            metadata,
+        })
+        .expect("prepared Luna request");
+
+        let credentials = credentials("workspace-1", false, "token");
+        let response = client.execute_stream(&credentials, prepared);
+        let response = match response.await {
+            Ok(response) => response,
+            Err(_) => panic!("Luna stream response failed"),
+        };
+        response
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Luna stream chunks");
+        server.abort();
+
+        let captured = capture.0.lock().expect("capture lock");
+        let (headers, body) = &captured[0];
+        assert_eq!(header(headers, "originator"), "codex-tui");
+        assert_eq!(
+            header(headers, reqwest::header::USER_AGENT.as_str()),
+            "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)"
+        );
+        assert!(
+            headers
+                .get("x-openai-internal-codex-responses-lite")
+                .is_none()
+        );
+        let body: Value = serde_json::from_slice(body).expect("Luna request JSON");
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[tokio::test]
@@ -344,6 +392,7 @@ mod tests {
             .execute_stream(
                 &credentials("workspace-1", false, "access-token"),
                 PreparedCodexRequest {
+                    model: "gpt-5.5".to_owned(),
                     payload: Bytes::from_static(br#"{"model":"gpt-5.5"}"#),
                     metadata: RequestMetadata::default(),
                 },

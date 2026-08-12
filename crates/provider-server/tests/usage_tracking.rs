@@ -48,7 +48,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-
 /// A Codex `response.completed` reporting input and output but no cache details
 /// and no total, which is exactly the shape that must not become zeroes. It names
 /// the model it served, as a real terminal does.
@@ -209,6 +208,8 @@ impl ProviderRouter for ChatLengthRouter {
         }
         vec![ProviderRouteCandidate {
             upstream_model: model.to_owned(),
+            input_modalities: None,
+            responses_lite: false,
             pricing: None,
             route: Arc::new(Self),
         }]

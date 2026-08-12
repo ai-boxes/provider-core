@@ -11,8 +11,9 @@ use std::{
 use async_trait::async_trait;
 use provider_core::{
     AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
-    ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
-    ProviderVisibility, RoutableProviderModel, StoredProviderModel, WireFormat,
+    ProviderModelInputModality, ProviderRequest, ProviderRoute, ProviderRouteCandidate,
+    ProviderRouter, ProviderStream, ProviderVisibility, RoutableProviderModel, StoredProviderModel,
+    WireFormat,
 };
 use thiserror::Error;
 
@@ -212,11 +213,18 @@ impl ProviderRouter for ProviderModelRouter {
                         serde_json::from_str::<ProviderModel>(&model.metadata_json)
                             .expect("stored provider model metadata must be valid");
                     provider_model.id = effective_model;
+                    provider_model =
+                        provider_model.with_input_modalities(model.input_modalities.clone());
                     RoutableProviderModel {
                         model: provider_model,
                         native_formats: Vec::new(),
                     }
                 });
+                let input_modalities = conservative_input_modalities(
+                    entry.model.input_modalities.as_deref(),
+                    model.input_modalities.as_deref(),
+                );
+                entry.model = entry.model.clone().with_input_modalities(input_modalities);
                 if !entry.native_formats.contains(&native_format) {
                     entry.native_formats.push(native_format);
                 }
@@ -252,6 +260,8 @@ impl ProviderRouter for ProviderModelRouter {
                     account_id.clone(),
                     ProviderRouteCandidate {
                         upstream_model: provider_model.upstream_model.clone(),
+                        input_modalities: provider_model.input_modalities.clone(),
+                        responses_lite: model_uses_responses_lite(provider_model),
                         pricing: provider_model.pricing.clone(),
                         route: account.route.clone(),
                     },
@@ -340,6 +350,32 @@ impl ProviderRoute for RuntimeAccountRoute {
             .count_tokens_for(&self.account_id, request)
             .await
     }
+}
+
+fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
+    serde_json::from_str::<serde_json::Value>(&model.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("use_responses_lite")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn conservative_input_modalities(
+    left: Option<&[ProviderModelInputModality]>,
+    right: Option<&[ProviderModelInputModality]>,
+) -> Option<Vec<ProviderModelInputModality>> {
+    let (Some(left), Some(right)) = (left, right) else {
+        return None;
+    };
+    let modalities = left
+        .iter()
+        .filter(|modality| right.contains(modality))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!modalities.is_empty()).then_some(modalities)
 }
 
 fn randomize_routes(inner: &RouterInner, routes: &mut [(AccountId, ProviderRouteCandidate)]) {
@@ -457,22 +493,39 @@ mod tests {
             .expect("second account");
 
         let router = ProviderModelRouter::new();
+        let mut first_shared = stored_model(&first.id, "upstream-a", "shared");
+        first_shared.input_modalities = Some(vec![
+            ProviderModelInputModality::Text,
+            ProviderModelInputModality::Image,
+            ProviderModelInputModality::Audio,
+        ]);
+        let mut first_metadata: serde_json::Value =
+            serde_json::from_str(&first_shared.metadata_json).expect("model metadata");
+        first_metadata["use_responses_lite"] = serde_json::Value::Bool(true);
+        first_shared.metadata_json =
+            serde_json::to_string(&first_metadata).expect("serialize model metadata");
         router
             .replace_account_models(
                 runtime.clone(),
                 first.clone(),
                 vec![
-                    stored_model(&first.id, "upstream-a", "shared"),
+                    first_shared,
                     non_routable_model(&first.id, "grok-imagine-image"),
                 ],
                 access("owner-a", ProviderVisibility::Private),
             )
             .expect("first routes");
+        let mut second_shared = stored_model(&second.id, "upstream-b", "shared");
+        second_shared.input_modalities = Some(vec![
+            ProviderModelInputModality::Text,
+            ProviderModelInputModality::Pdf,
+            ProviderModelInputModality::Audio,
+        ]);
         router
             .replace_account_models(
                 runtime.clone(),
                 second.clone(),
-                vec![stored_model(&second.id, "upstream-b", "shared")],
+                vec![second_shared],
                 access("owner-b", ProviderVisibility::Shared),
             )
             .expect("second routes");
@@ -480,6 +533,13 @@ mod tests {
         let models = router.models("owner-a", None);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model.id, "shared");
+        assert_eq!(
+            models[0].model.input_modalities,
+            Some(vec![
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Audio,
+            ])
+        );
         assert_eq!(models[0].native_formats, [WireFormat::OpenAiResponses]);
         assert!(
             router
@@ -501,6 +561,16 @@ mod tests {
             None,
         );
         assert_eq!(routes.len(), 2);
+        assert!(
+            routes
+                .iter()
+                .any(|route| { route.upstream_model == "upstream-a" && route.responses_lite })
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|route| { route.upstream_model == "upstream-b" && !route.responses_lite })
+        );
         let mut outputs = Vec::new();
         for route in routes {
             let stream = route
@@ -896,6 +966,7 @@ mod tests {
             enabled: true,
             available: true,
             routable: true,
+            input_modalities: None,
             metadata_json: serde_json::to_string(&ProviderModel::new(upstream_model, "test"))
                 .expect("serialize provider model"),
             pricing: None,

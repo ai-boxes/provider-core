@@ -515,15 +515,27 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         }
         for model in snapshot.models {
             let (pricing_source, pricing_json) = encode_model_pricing(model.pricing.as_ref())?;
+            let input_modalities_json = encode_input_modalities(model.input_modalities.as_deref())?;
             sqlx::query(
                 r#"
                 INSERT INTO provider_models
-                    (account_id, upstream_model, enabled, available, routable, metadata_json,
+                    (account_id, upstream_model, enabled, available, routable,
+                     input_modalities_json, input_modalities_source, metadata_json,
                      pricing_source, pricing_json, last_seen_at, created_at, updated_at)
-                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, 1, 1, ?, ?, 'discovery', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, upstream_model) DO UPDATE SET
                     available = 1,
                     routable = excluded.routable,
+                    input_modalities_json = CASE
+                        WHEN provider_models.input_modalities_source = 'manual'
+                            THEN provider_models.input_modalities_json
+                        ELSE excluded.input_modalities_json
+                    END,
+                    input_modalities_source = CASE
+                        WHEN provider_models.input_modalities_source = 'manual'
+                            THEN provider_models.input_modalities_source
+                        ELSE excluded.input_modalities_source
+                    END,
                     metadata_json = excluded.metadata_json,
                     pricing_source = CASE
                         WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
@@ -540,6 +552,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             .bind(account.id.as_str())
             .bind(model.upstream_model)
             .bind(database_bool(model.routable))
+            .bind(input_modalities_json)
             .bind(model.metadata_json)
             .bind(pricing_source)
             .bind(pricing_json)
@@ -552,7 +565,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         }
         let rows = sqlx::query(
             r#"
-            SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+            SELECT account_id, upstream_model, alias, enabled, available, routable,
+                   input_modalities_json, metadata_json,
                    pricing_source, pricing_json, last_seen_at, created_at, updated_at
             FROM provider_models
             WHERE account_id = ?
@@ -803,7 +817,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let rows = if let Some(account_id) = account_id {
             sqlx::query(
                 r#"
-                SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+                SELECT account_id, upstream_model, alias, enabled, available, routable,
+                       input_modalities_json, metadata_json,
                        pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 WHERE account_id = ?
@@ -816,7 +831,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         } else {
             sqlx::query(
                 r#"
-                SELECT account_id, upstream_model, alias, enabled, available, routable, metadata_json,
+                SELECT account_id, upstream_model, alias, enabled, available, routable,
+                       input_modalities_json, metadata_json,
                        pricing_source, pricing_json, last_seen_at, created_at, updated_at
                 FROM provider_models
                 ORDER BY account_id, upstream_model
@@ -881,15 +897,27 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 ));
             }
             let (pricing_source, pricing_json) = encode_model_pricing(model.pricing.as_ref())?;
+            let input_modalities_json = encode_input_modalities(model.input_modalities.as_deref())?;
             sqlx::query(
                 r#"
                 INSERT INTO provider_models
-                    (account_id, upstream_model, enabled, available, routable, metadata_json,
+                    (account_id, upstream_model, enabled, available, routable,
+                     input_modalities_json, input_modalities_source, metadata_json,
                      pricing_source, pricing_json, last_seen_at, updated_at)
-                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, 1, 1, ?, ?, 'discovery', ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, upstream_model) DO UPDATE SET
                     available = 1,
                     routable = excluded.routable,
+                    input_modalities_json = CASE
+                        WHEN provider_models.input_modalities_source = 'manual'
+                            THEN provider_models.input_modalities_json
+                        ELSE excluded.input_modalities_json
+                    END,
+                    input_modalities_source = CASE
+                        WHEN provider_models.input_modalities_source = 'manual'
+                            THEN provider_models.input_modalities_source
+                        ELSE excluded.input_modalities_source
+                    END,
                     metadata_json = excluded.metadata_json,
                     pricing_source = CASE
                         WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
@@ -906,6 +934,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             .bind(account_id.as_str())
             .bind(upstream_model)
             .bind(database_bool(model.routable))
+            .bind(input_modalities_json)
             .bind(model.metadata_json)
             .bind(pricing_source)
             .bind(pricing_json)
@@ -939,11 +968,17 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 })?),
             ),
         };
+        let input_modalities_json = encode_input_modalities(update.input_modalities.as_deref())?;
         let result = sqlx::query(
             r#"
             UPDATE provider_models
             SET alias = ?,
                 enabled = ?,
+                input_modalities_source = CASE
+                    WHEN input_modalities_json IS NOT ? THEN 'manual'
+                    ELSE input_modalities_source
+                END,
+                input_modalities_json = ?,
                 pricing_source = CASE
                     WHEN ? = 0 THEN pricing_source
                     WHEN ? IS NULL THEN NULL
@@ -956,6 +991,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         )
         .bind(update.alias)
         .bind(database_bool(update.enabled))
+        .bind(input_modalities_json.as_deref())
+        .bind(input_modalities_json)
         .bind(database_bool(update_pricing))
         .bind(pricing_json.as_deref())
         .bind(database_bool(update_pricing))
@@ -1832,12 +1869,42 @@ fn stored_model(row: SqliteRow) -> Result<StoredProviderModel, AccountRepository
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         available: row_value::<i64>(&row, "available")? != 0,
         routable: row_value::<i64>(&row, "routable")? != 0,
+        input_modalities: decode_input_modalities(row_value(&row, "input_modalities_json")?)?,
         metadata_json: row_value(&row, "metadata_json")?,
         pricing,
         last_seen_at: row_value(&row, "last_seen_at")?,
         created_at: row_value(&row, "created_at")?,
         updated_at: row_value(&row, "updated_at")?,
     })
+}
+
+fn encode_input_modalities(
+    input_modalities: Option<&[provider_core::ProviderModelInputModality]>,
+) -> Result<Option<String>, AccountRepositoryError> {
+    provider_core::validate_input_modalities(input_modalities)
+        .map_err(AccountRepositoryError::new)?;
+    input_modalities
+        .map(|modalities| {
+            serde_json::to_string(modalities).map_err(|error| {
+                repository_error("failed to encode provider model input modalities", error)
+            })
+        })
+        .transpose()
+}
+
+fn decode_input_modalities(
+    json: Option<String>,
+) -> Result<Option<Vec<provider_core::ProviderModelInputModality>>, AccountRepositoryError> {
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let modalities = serde_json::from_str::<Vec<provider_core::ProviderModelInputModality>>(&json)
+        .map_err(|error| {
+            repository_error("failed to decode provider model input modalities", error)
+        })?;
+    provider_core::validate_input_modalities(Some(&modalities))
+        .map_err(AccountRepositoryError::new)?;
+    Ok(Some(modalities))
 }
 
 fn encode_model_pricing(
@@ -2283,6 +2350,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_model_modality_check_accepts_only_unique_supported_strings() {
+        let repository = SqliteAccountRepository::in_memory()
+            .await
+            .expect("in-memory repository");
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts (id, provider, label, group_label)
+            VALUES ('modality-check', 'openai_compatible', 'Modality Check', 'default')
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("insert provider account");
+
+        for (model, modalities) in [
+            ("all", r#"["video","text","audio","image","pdf"]"#),
+            ("subset", r#"["audio"]"#),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO provider_models
+                    (account_id, upstream_model, input_modalities_json)
+                VALUES ('modality-check', ?, ?)
+                "#,
+            )
+            .bind(model)
+            .bind(modalities)
+            .execute(&repository.pool)
+            .await
+            .expect("valid modality array");
+        }
+
+        for (model, modalities) in [
+            ("unknown", r#"["future"]"#),
+            ("duplicate", r#"["text","text"]"#),
+            ("non-string", "[1]"),
+            ("empty", "[]"),
+        ] {
+            assert!(
+                sqlx::query(
+                    r#"
+                    INSERT INTO provider_models
+                        (account_id, upstream_model, input_modalities_json)
+                    VALUES ('modality-check', ?, ?)
+                    "#,
+                )
+                .bind(model)
+                .bind(modalities)
+                .execute(&repository.pool)
+                .await
+                .is_err(),
+                "invalid modalities {modalities} must be rejected by SQLite"
+            );
+        }
+    }
+
     #[test]
     fn stored_model_pricing_rejects_invalid_price_semantics() {
         let decode =
@@ -2515,6 +2639,7 @@ mod tests {
                 vec![
                     DiscoveredProviderModel {
                         upstream_model: "grok-a".to_owned(),
+                        input_modalities: None,
                         metadata_json: r#"{"version":1}"#.to_owned(),
                         routable: true,
                         pricing: Some(ProviderModelPricingRecord {
@@ -2542,6 +2667,10 @@ mod tests {
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-b".to_owned(),
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Video,
+                            provider_core::ProviderModelInputModality::Image,
+                        ]),
                         metadata_json: "{}".to_owned(),
                         routable: true,
                         pricing: None,
@@ -2559,12 +2688,34 @@ mod tests {
                     ProviderModelOverride {
                         alias: Some("grok-latest".to_owned()),
                         enabled: false,
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Text,
+                        ]),
                         pricing: None,
                         updated_at: 11,
                     },
                 )
                 .await
                 .expect("model override without pricing")
+        );
+        assert!(
+            repository
+                .update_provider_model(
+                    &account_id,
+                    "grok-b",
+                    ProviderModelOverride {
+                        alias: Some("grok-b-latest".to_owned()),
+                        enabled: true,
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Video,
+                            provider_core::ProviderModelInputModality::Image,
+                        ]),
+                        pricing: None,
+                        updated_at: 11,
+                    },
+                )
+                .await
+                .expect("alias-only model override")
         );
         let catalog_model = repository
             .list_provider_models(Some(&account_id))
@@ -2584,49 +2735,75 @@ mod tests {
             "an alias/status-only edit must preserve catalog tiers"
         );
 
-        let repriced = repository
+        let repriced_models = repository
             .synchronize_provider_models(
                 &account_id,
-                vec![DiscoveredProviderModel {
-                    upstream_model: "grok-a".to_owned(),
-                    metadata_json: r#"{"version":1}"#.to_owned(),
-                    routable: true,
-                    pricing: Some(ProviderModelPricingRecord {
-                        source: ProviderModelPricingSource::Catalog,
-                        pricing: ProviderModelPricing {
-                            input: Some("5".to_owned()),
-                            output: Some("6".to_owned()),
-                            cache_read: None,
-                            cache_write: None,
-                            reasoning: None,
-                            input_audio: None,
-                            output_audio: None,
-                            tiers: vec![ProviderModelPricingTier {
-                                threshold_tokens: 200_000,
-                                input: Some("7".to_owned()),
-                                output: Some("8".to_owned()),
+                vec![
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-a".to_owned(),
+                        input_modalities: None,
+                        metadata_json: r#"{"version":1}"#.to_owned(),
+                        routable: true,
+                        pricing: Some(ProviderModelPricingRecord {
+                            source: ProviderModelPricingSource::Catalog,
+                            pricing: ProviderModelPricing {
+                                input: Some("5".to_owned()),
+                                output: Some("6".to_owned()),
                                 cache_read: None,
                                 cache_write: None,
                                 reasoning: None,
                                 input_audio: None,
                                 output_audio: None,
-                            }],
-                        },
-                    }),
-                }],
+                                tiers: vec![ProviderModelPricingTier {
+                                    threshold_tokens: 200_000,
+                                    input: Some("7".to_owned()),
+                                    output: Some("8".to_owned()),
+                                    cache_read: None,
+                                    cache_write: None,
+                                    reasoning: None,
+                                    input_audio: None,
+                                    output_audio: None,
+                                }],
+                            },
+                        }),
+                    },
+                    DiscoveredProviderModel {
+                        upstream_model: "grok-b".to_owned(),
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Audio,
+                            provider_core::ProviderModelInputModality::Pdf,
+                        ]),
+                        metadata_json: "{}".to_owned(),
+                        routable: true,
+                        pricing: None,
+                    },
+                ],
                 12,
             )
             .await
             .expect("catalog repricing sync");
-        let repriced = repriced
-            .into_iter()
+        let repriced = repriced_models
+            .iter()
             .find(|model| model.upstream_model == "grok-a")
             .expect("repriced grok-a")
             .pricing
+            .as_ref()
             .expect("repriced catalog value");
         assert_eq!(repriced.source, ProviderModelPricingSource::Catalog);
         assert_eq!(repriced.pricing.input.as_deref(), Some("5"));
         assert_eq!(repriced.pricing.tiers[0].output.as_deref(), Some("8"));
+        assert_eq!(
+            repriced_models
+                .iter()
+                .find(|model| model.upstream_model == "grok-b")
+                .expect("refreshed grok-b")
+                .input_modalities,
+            Some(vec![
+                provider_core::ProviderModelInputModality::Audio,
+                provider_core::ProviderModelInputModality::Pdf,
+            ]),
+            "editing only the alias must not freeze discovered input modalities"
+        );
 
         assert!(
             repository
@@ -2636,6 +2813,9 @@ mod tests {
                     ProviderModelOverride {
                         alias: Some("grok-latest".to_owned()),
                         enabled: false,
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Text,
+                        ]),
                         pricing: Some(Some(ProviderModelPricing {
                             input: Some("3".to_owned()),
                             output: Some("4".to_owned()),
@@ -2659,6 +2839,10 @@ mod tests {
                 vec![
                     DiscoveredProviderModel {
                         upstream_model: "grok-a".to_owned(),
+                        input_modalities: Some(vec![
+                            provider_core::ProviderModelInputModality::Text,
+                            provider_core::ProviderModelInputModality::Image,
+                        ]),
                         metadata_json: r#"{"version":2}"#.to_owned(),
                         routable: true,
                         pricing: Some(ProviderModelPricingRecord {
@@ -2677,6 +2861,7 @@ mod tests {
                     },
                     DiscoveredProviderModel {
                         upstream_model: "grok-c".to_owned(),
+                        input_modalities: None,
                         metadata_json: "{}".to_owned(),
                         routable: true,
                         pricing: None,
@@ -2695,6 +2880,11 @@ mod tests {
         assert!(!model_a.enabled);
         assert!(model_a.available);
         assert_eq!(model_a.metadata_json, r#"{"version":2}"#);
+        assert_eq!(
+            model_a.input_modalities,
+            Some(vec![provider_core::ProviderModelInputModality::Text]),
+            "model synchronization must preserve manually configured input modalities"
+        );
         assert_eq!(
             model_a.pricing,
             Some(ProviderModelPricingRecord {
@@ -2734,6 +2924,7 @@ mod tests {
                     ProviderModelOverride {
                         alias: None,
                         enabled: true,
+                        input_modalities: None,
                         pricing: Some(None),
                         updated_at: 21,
                     },
@@ -3011,8 +3202,14 @@ mod tests {
             repository.admit_api_key_quota(&key_id),
             repository.admit_api_key_quota(&key_id),
         );
-        assert_eq!(left.expect("left admission"), QuotaAdmissionOutcome::Admitted);
-        assert_eq!(right.expect("right admission"), QuotaAdmissionOutcome::Admitted);
+        assert_eq!(
+            left.expect("left admission"),
+            QuotaAdmissionOutcome::Admitted
+        );
+        assert_eq!(
+            right.expect("right admission"),
+            QuotaAdmissionOutcome::Admitted
+        );
 
         sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = ?")
             .bind(key_id.as_str())

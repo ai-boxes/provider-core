@@ -1132,7 +1132,12 @@ mod tests {
         let captured_metadata = Arc::new(Mutex::new(Vec::new()));
         let service = ProxyService::new(
             Arc::new(TestProvider {
-                models: vec![ProviderModel::new("grok-4.5", "xai")],
+                models: vec![
+                    ProviderModel::new("grok-4.5", "xai").with_input_modalities(Some(vec![
+                        provider_core::ProviderModelInputModality::Text,
+                        provider_core::ProviderModelInputModality::Image,
+                    ])),
+                ],
                 metadata: captured_metadata.clone(),
             }),
             Arc::new(DefaultProtocolBridge),
@@ -1174,6 +1179,11 @@ mod tests {
         )
         .await;
         assert_eq!(models["data"][0]["id"], "grok-4.5");
+        assert_eq!(
+            models["data"][0]["input_modalities"],
+            json!(["text", "image"])
+        );
+        assert_eq!(models["data"][0]["supports_image_detail_original"], true);
         assert_eq!(models["object"], "list");
 
         let claude_models = response_json(

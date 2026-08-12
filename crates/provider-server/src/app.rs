@@ -32,6 +32,49 @@ use crate::{
 /// How long shutdown waits for queued usage facts before giving up on them.
 const USAGE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+struct CatalogApplyState {
+    pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogRunMode {
+    Periodic,
+    ApplyStoredUntilSuccess,
+    Inactive,
+}
+
+fn catalog_run_mode(sync_enabled: bool, snapshot_available: bool) -> CatalogRunMode {
+    if sync_enabled {
+        CatalogRunMode::Periodic
+    } else if snapshot_available {
+        CatalogRunMode::ApplyStoredUntilSuccess
+    } else {
+        CatalogRunMode::Inactive
+    }
+}
+
+impl CatalogApplyState {
+    fn new(snapshot_available: bool) -> Self {
+        Self {
+            pending: snapshot_available,
+        }
+    }
+
+    fn observe_fetch(&mut self, outcome: RefreshOutcome) {
+        if outcome == RefreshOutcome::Installed {
+            self.pending = true;
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn applied(&mut self) {
+        self.pending = false;
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn Error>> {
     // Before anything touches the database. Startup recovery assumes any request
     // still marked in-flight was left by a dead run, which only holds while this
@@ -51,12 +94,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     ));
     let stored_catalog = refresher.install_stored().await;
     match stored_catalog.as_deref() {
-        Some(revision) => println!("price catalog {} loaded from storage", &revision[..12]),
+        Some(revision) => println!("model catalog {} loaded from storage", &revision[..12]),
         None if catalog_sync_enabled() => {
             let outcome = refresher.refresh_once().await;
-            println!("initial price catalog refresh: {outcome:?}");
+            println!("initial model catalog refresh: {outcome:?}");
         }
-        None => println!("no stored price catalog; model prices remain unconfigured"),
+        None => println!("no stored model catalog; model prices and capabilities are unknown"),
     }
 
     let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
@@ -141,25 +184,58 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         query: usage_repository,
     };
 
-    let manager = ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices);
-    if catalog_sync_enabled() {
-        let refresher = Arc::clone(&refresher);
-        let manager = manager.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
-            loop {
-                ticker.tick().await;
-                if refresher.refresh_once().await == RefreshOutcome::Installed
-                    && let Err(error) = manager
+    let manager =
+        ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices.clone());
+    let sync_enabled = catalog_sync_enabled();
+    let snapshot_available = prices.current().is_some();
+    match catalog_run_mode(sync_enabled, snapshot_available) {
+        CatalogRunMode::Periodic => {
+            let refresher = Arc::clone(&refresher);
+            let manager = manager.clone();
+            let mut apply = CatalogApplyState::new(snapshot_available);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
+                loop {
+                    ticker.tick().await;
+                    apply.observe_fetch(refresher.refresh_once().await);
+                    if apply.is_pending() {
+                        match manager
+                            .refresh_enabled_model_catalogs(unix_timestamp())
+                            .await
+                        {
+                            Ok(_) => apply.applied(),
+                            Err(error) => {
+                                eprintln!(
+                                    "failed to apply model catalog to routed models: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        CatalogRunMode::ApplyStoredUntilSuccess => {
+            println!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
+                loop {
+                    ticker.tick().await;
+                    match manager
                         .refresh_enabled_model_catalogs(unix_timestamp())
                         .await
-                {
-                    eprintln!("failed to apply refreshed prices to routed models: {error}");
+                    {
+                        Ok(_) => break,
+                        Err(error) => eprintln!(
+                            "failed to apply stored model catalog to routed models; will retry: {error}"
+                        ),
+                    }
                 }
-            }
-        });
-    } else {
-        println!("price catalog sync disabled by {CATALOG_SYNC_ENV}");
+            });
+        }
+        CatalogRunMode::Inactive => {
+            println!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
+        }
     }
     let listen_address = listen_address();
     let listener = TcpListener::bind(&listen_address).await?;
@@ -217,4 +293,53 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_snapshot_stays_pending_across_fetch_and_apply_failures() {
+        let mut state = CatalogApplyState::new(true);
+
+        state.observe_fetch(RefreshOutcome::Failed("network"));
+        assert!(state.is_pending());
+
+        state.observe_fetch(RefreshOutcome::Unchanged);
+        assert!(
+            state.is_pending(),
+            "an apply failure leaves the installed snapshot pending for the next tick"
+        );
+
+        state.applied();
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn unchanged_catalog_is_not_reapplied_after_success() {
+        let mut state = CatalogApplyState::new(false);
+
+        state.observe_fetch(RefreshOutcome::Installed);
+        assert!(state.is_pending());
+        state.applied();
+
+        state.observe_fetch(RefreshOutcome::AlreadyCurrent);
+        assert!(!state.is_pending());
+        state.observe_fetch(RefreshOutcome::Unchanged);
+        assert!(!state.is_pending());
+        state.observe_fetch(RefreshOutcome::Failed("network"));
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn disabled_network_sync_retries_stored_catalog_until_applied() {
+        assert_eq!(
+            catalog_run_mode(false, true),
+            CatalogRunMode::ApplyStoredUntilSuccess
+        );
+        assert_eq!(catalog_run_mode(false, false), CatalogRunMode::Inactive);
+        assert_eq!(catalog_run_mode(true, true), CatalogRunMode::Periodic);
+        assert_eq!(catalog_run_mode(true, false), CatalogRunMode::Periodic);
+    }
 }

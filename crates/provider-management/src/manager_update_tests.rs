@@ -454,6 +454,7 @@ impl ProviderAccount for TestAccount {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
         Ok(vec![DiscoveredProviderModel {
             upstream_model: "test-model".to_owned(),
+            input_modalities: None,
             metadata_json: "{}".to_owned(),
             routable: true,
             pricing: None,
@@ -505,6 +506,7 @@ fn stored_model() -> StoredProviderModel {
         enabled: true,
         available: true,
         routable: true,
+        input_modalities: None,
         metadata_json: "{}".to_owned(),
         pricing: None,
         last_seen_at: Some(10),

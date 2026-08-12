@@ -103,7 +103,6 @@ fn normalize_models(
                 });
                 let routable = model.visibility.as_deref() == Some("list")
                     && model.supported_in_api
-                    && !model.use_responses_lite
                     && compatible;
                 let metadata = serde_json::json!({
                     "id": id,
@@ -128,6 +127,7 @@ fn normalize_models(
                     id.to_owned(),
                     DiscoveredProviderModel {
                         upstream_model: id.to_owned(),
+                        input_modalities: None,
                         metadata_json,
                         routable,
                         pricing: None,
@@ -141,12 +141,12 @@ fn normalize_models(
                 if id.is_empty() {
                     continue;
                 }
-                let metadata_json = serde_json::to_string(&serde_json::json!({
+                let metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
                     "owned_by": "openai",
-                }))
-                .map_err(|_| {
+                });
+                let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                     ProviderError::new(
                         ProviderErrorKind::Internal,
                         "failed to normalize Codex model metadata",
@@ -156,6 +156,7 @@ fn normalize_models(
                     id.to_owned(),
                     DiscoveredProviderModel {
                         upstream_model: id.to_owned(),
+                        input_modalities: None,
                         metadata_json,
                         routable: true,
                         pricing: None,
@@ -267,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filters_codex_models_by_visibility_api_lite_and_compatibility() {
+    fn filters_codex_models_by_visibility_api_and_compatibility() {
         let response: ModelsResponse = serde_json::from_value(serde_json::json!({
             "models": [
                 {
@@ -276,6 +277,12 @@ mod tests {
                     "visibility": "list",
                     "supported_in_api": true,
                     "minimal_client_version": "0.124.0",
+                    "use_responses_lite": false
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
+                    "visibility": "list",
+                    "supported_in_api": true,
                     "use_responses_lite": false
                 },
                 {
@@ -308,7 +315,12 @@ mod tests {
 
         let models = normalize_models(response).expect("normalized models");
         assert!(model(&models, "gpt-5.5").routable);
-        assert!(!model(&models, "lite-only").routable);
+        let spark = model(&models, "gpt-5.3-codex-spark");
+        assert_eq!(spark.input_modalities, None);
+        let spark_metadata: Value =
+            serde_json::from_str(&spark.metadata_json).expect("spark metadata");
+        assert!(spark_metadata.get("input_modalities").is_none());
+        assert!(model(&models, "lite-only").routable);
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
@@ -323,6 +335,10 @@ mod tests {
         let models = normalize_models(response).expect("normalized models");
 
         assert!(model(&models, "gpt-openai").routable);
+        assert_eq!(model(&models, "gpt-openai").input_modalities, None);
+        let metadata: Value = serde_json::from_str(&model(&models, "gpt-openai").metadata_json)
+            .expect("model metadata");
+        assert!(metadata.get("input_modalities").is_none());
         assert_eq!(
             codex_models()
                 .iter()

@@ -884,11 +884,23 @@ mod focused_tests {
         let trusted: IpAddr = "172.29.250.3".parse().expect("ip");
         let peer = SocketAddr::from(([172, 29, 250, 3], 443));
         let mut headers = HeaderMap::new();
-        assert!(!secure_cookie_for_request(Some(peer), &headers, Some(trusted)));
+        assert!(!secure_cookie_for_request(
+            Some(peer),
+            &headers,
+            Some(trusted)
+        ));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert!(secure_cookie_for_request(Some(peer), &headers, Some(trusted)));
+        assert!(secure_cookie_for_request(
+            Some(peer),
+            &headers,
+            Some(trusted)
+        ));
         let other = SocketAddr::from(([127, 0, 0, 1], 443));
-        assert!(!secure_cookie_for_request(Some(other), &headers, Some(trusted)));
+        assert!(!secure_cookie_for_request(
+            Some(other),
+            &headers,
+            Some(trusted)
+        ));
         assert!(!secure_cookie_for_request(None, &headers, Some(trusted)));
     }
 

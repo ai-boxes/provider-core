@@ -15,8 +15,9 @@ use axum::{
 };
 use provider_auth::{AuthenticatedSession, UserRole};
 use provider_core::{
-    AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind, ProviderModelOverride,
-    ProviderModelPricing, ProviderVisibility, StoredProviderModel,
+    AccountId, ProviderAccountSummary, ProviderAccountUpdate, ProviderKind,
+    ProviderModelInputModality, ProviderModelOverride, ProviderModelPricing, ProviderVisibility,
+    StoredProviderModel,
 };
 use provider_drivers::compatible_api_key_credential;
 use provider_management::{
@@ -358,7 +359,7 @@ async fn list_models(
         .manager
         .list_models(session.user.id.as_str(), &account_id)
         .await?;
-    Ok(data(Value::Array(models.iter().map(model_json).collect())))
+    Ok(data(models_json(&models)))
 }
 
 async fn refresh_models(
@@ -430,6 +431,7 @@ async fn update_model(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let pricing = updated_pricing(request.pricing_changed, request.pricing)?;
+    let input_modalities = request.input_modalities.into_modalities()?;
     let models = state
         .manager
         .update_model(
@@ -439,12 +441,13 @@ async fn update_model(
             ProviderModelOverride {
                 alias,
                 enabled: request.enabled,
+                input_modalities,
                 pricing,
                 updated_at: unix_timestamp(),
             },
         )
         .await?;
-    Ok(data(Value::Array(models.iter().map(model_json).collect())))
+    Ok(data(models_json(&models)))
 }
 
 async fn start_oauth_session(
@@ -563,9 +566,30 @@ struct UpdateModelRequest {
     upstream_model: String,
     alias: Option<String>,
     enabled: bool,
+    input_modalities: InputModalitiesPatch,
     pricing_changed: bool,
     #[serde(default)]
     pricing: ModelPricingPatch,
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct InputModalitiesPatch(Value);
+
+impl InputModalitiesPatch {
+    fn into_modalities(self) -> Result<Option<Vec<ProviderModelInputModality>>, ApiError> {
+        let input_modalities: Option<Vec<ProviderModelInputModality>> = serde_json::from_value(
+            self.0,
+        )
+        .map_err(|_| {
+            ApiError::invalid_request(
+                "input_modalities must be null or a non-empty array of unique supported modalities",
+            )
+        })?;
+        provider_core::validate_input_modalities(input_modalities.as_deref())
+            .map_err(ApiError::invalid_request)?;
+        Ok(input_modalities)
+    }
 }
 
 #[derive(Default)]
@@ -755,8 +779,26 @@ fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiErro
 
 fn model_snapshot_json(snapshot: &ModelCatalogSnapshot) -> Value {
     json!({
-        "models": snapshot.models.iter().map(model_json).collect::<Vec<_>>()
+        "models": models_json(&snapshot.models)
     })
+}
+
+fn models_json(models: &[StoredProviderModel]) -> Value {
+    Value::Array(
+        models
+            .iter()
+            .filter(|model| model_is_visible(model))
+            .map(model_json)
+            .collect(),
+    )
+}
+
+fn model_is_visible(model: &StoredProviderModel) -> bool {
+    serde_json::from_str::<Value>(&model.metadata_json)
+        .expect("stored provider model metadata must be valid JSON")
+        .get("visibility")
+        .and_then(Value::as_str)
+        .is_none_or(|visibility| visibility == "list")
 }
 
 fn model_json(model: &StoredProviderModel) -> Value {
@@ -768,6 +810,10 @@ fn model_json(model: &StoredProviderModel) -> Value {
         "enabled": model.enabled,
         "available": model.available,
         "routable": model.routable,
+        "input_modalities": model.input_modalities,
+        "supports_image_detail_original": model.input_modalities.as_deref().is_some_and(|modalities| {
+            modalities.contains(&ProviderModelInputModality::Image)
+        }),
         "metadata": serde_json::from_str::<Value>(&model.metadata_json)
             .expect("stored provider model metadata must be valid JSON"),
         "pricing": model.pricing.as_ref().map(|record| &record.pricing),
@@ -962,6 +1008,7 @@ mod tests {
     use provider_core::{
         AccountId, CredentialKind, ProviderKind, ProviderManagementRepository,
         ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
+        StoredProviderModel,
     };
     use provider_drivers::{
         codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
@@ -989,8 +1036,41 @@ mod tests {
 
     use super::{
         ModelPricingPatch, ProviderHealthParams, SetEnabledRequest, UpdateModelRequest,
-        require_super_admin, unix_timestamp, updated_pricing,
+        model_is_visible, require_super_admin, unix_timestamp, updated_pricing,
     };
+
+    fn stored_model_with_metadata(metadata_json: &str) -> StoredProviderModel {
+        StoredProviderModel {
+            account_id: AccountId::new("account-1").expect("account ID"),
+            upstream_model: "model-1".to_owned(),
+            alias: None,
+            enabled: true,
+            available: true,
+            routable: true,
+            input_modalities: None,
+            metadata_json: metadata_json.to_owned(),
+            pricing: None,
+            last_seen_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn hides_models_that_are_not_listed_by_upstream() {
+        assert!(model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"public","visibility":"list"}"#,
+        )));
+        assert!(!model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"hidden","visibility":"hide"}"#,
+        )));
+        assert!(!model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"internal","visibility":"none"}"#,
+        )));
+        assert!(model_is_visible(&stored_model_with_metadata(
+            r#"{"id":"compatible"}"#,
+        )));
+    }
 
     fn management_headers(session_token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1058,22 +1138,42 @@ mod tests {
 
     #[test]
     fn model_update_pricing_request_is_strict_and_preserves_field_presence() {
+        assert!(
+            serde_json::from_str::<UpdateModelRequest>(
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":false}"#,
+            )
+            .is_err(),
+            "input_modalities is a required management contract field"
+        );
         let missing: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":false}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":false}"#,
         )
         .expect("missing pricing field");
         assert!(matches!(missing.pricing, ModelPricingPatch::Missing));
 
         let null: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":null}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":null}"#,
         )
         .expect("explicit null pricing");
         assert!(matches!(null.pricing, ModelPricingPatch::Null));
 
         let value: UpdateModelRequest = serde_json::from_str(
-            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["video","audio","pdf","image","text"],"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null}]}}"#,
         )
         .expect("complete pricing object");
+        let Ok(input_modalities) = value.input_modalities.into_modalities() else {
+            panic!("valid input modalities");
+        };
+        assert_eq!(
+            input_modalities,
+            Some(vec![
+                provider_core::ProviderModelInputModality::Video,
+                provider_core::ProviderModelInputModality::Audio,
+                provider_core::ProviderModelInputModality::Pdf,
+                provider_core::ProviderModelInputModality::Image,
+                provider_core::ProviderModelInputModality::Text,
+            ])
+        );
         let ModelPricingPatch::Value(value) = value.pricing else {
             panic!("pricing value");
         };
@@ -1081,15 +1181,26 @@ mod tests {
         assert_eq!(pricing.tiers.len(), 1);
         assert_eq!(pricing.tiers[0].threshold_tokens, 200_000);
 
+        let duplicate: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","text"],"pricing_changed":false}"#,
+        )
+        .expect("modality strings parse before contract validation");
+        assert!(duplicate.input_modalities.into_modalities().is_err());
+        let unknown: UpdateModelRequest = serde_json::from_str(
+            r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":["text","future"],"pricing_changed":false}"#,
+        )
+        .expect("modality payload is validated after request shape parsing");
+        assert!(unknown.input_modalities.into_modalities().is_err());
+
         assert!(
             serde_json::from_str::<UpdateModelRequest>(
-                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"extra":true}]}}"#,
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":{"input":"1","output":"2","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"tiers":[{"threshold_tokens":200000,"input":"2","output":"4","cache_read":null,"cache_write":null,"reasoning":null,"input_audio":null,"output_audio":null,"extra":true}]}}"#,
             )
             .is_err()
         );
         assert!(
             serde_json::from_str::<UpdateModelRequest>(
-                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"pricing_changed":true,"pricing":{"input":"1","output":"2"}}"#,
+                r#"{"upstream_model":"model-a","alias":null,"enabled":true,"input_modalities":null,"pricing_changed":true,"pricing":{"input":"1","output":"2"}}"#,
             )
             .is_err()
         );
@@ -1449,12 +1560,7 @@ mod tests {
         let server = tokio::spawn(
             axum::serve(
                 listener,
-                router_with_management(
-                    service,
-                    manager,
-                    auth,
-                    api_keys,
-                ),
+                router_with_management(service, manager, auth, api_keys),
             )
             .into_future(),
         );
@@ -1929,7 +2035,7 @@ mod tests {
             .headers(management_headers(&member_session_token))
             .header(header::CONTENT_TYPE, "application/json")
             .body(
-                r#"{"upstream_model":"model-a","alias":"no","enabled":true,"pricing_changed":false}"#,
+                r#"{"upstream_model":"model-a","alias":"no","enabled":true,"input_modalities":null,"pricing_changed":false}"#,
             )
             .send()
             .await
@@ -2073,12 +2179,7 @@ mod tests {
         let management_server = tokio::spawn(
             axum::serve(
                 management_listener,
-                router_with_management(
-                    service,
-                    manager.clone(),
-                    auth,
-                    api_keys,
-                ),
+                router_with_management(service, manager.clone(), auth, api_keys),
             )
             .into_future(),
         );

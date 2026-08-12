@@ -9,6 +9,9 @@ pub struct ProviderModel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<u64>,
     pub owned_by: String,
+    pub input_modalities: Option<Vec<ProviderModelInputModality>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_image_detail_original: bool,
 }
 
 impl ProviderModel {
@@ -19,6 +22,8 @@ impl ProviderModel {
             object: "model".to_owned(),
             created: None,
             owned_by: owned_by.into(),
+            input_modalities: None,
+            supports_image_detail_original: false,
         }
     }
 
@@ -26,6 +31,50 @@ impl ProviderModel {
     pub const fn with_created(mut self, created: u64) -> Self {
         self.created = Some(created);
         self
+    }
+
+    #[must_use]
+    pub fn with_input_modalities(
+        mut self,
+        input_modalities: Option<Vec<ProviderModelInputModality>>,
+    ) -> Self {
+        self.supports_image_detail_original = input_modalities
+            .as_deref()
+            .is_some_and(|modalities| modalities.contains(&ProviderModelInputModality::Image));
+        self.input_modalities = input_modalities;
+        self
+    }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelInputModality {
+    Text,
+    Image,
+    Pdf,
+    Audio,
+    Video,
+}
+
+pub fn validate_input_modalities(
+    input_modalities: Option<&[ProviderModelInputModality]>,
+) -> Result<(), &'static str> {
+    let Some(input_modalities) = input_modalities else {
+        return Ok(());
+    };
+    if input_modalities.is_empty()
+        || input_modalities
+            .iter()
+            .enumerate()
+            .any(|(index, modality)| input_modalities[index + 1..].contains(modality))
+    {
+        Err("input_modalities must be null or a non-empty array of unique supported modalities")
+    } else {
+        Ok(())
     }
 }
 
@@ -94,6 +143,7 @@ pub struct ProviderModelPricingRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredProviderModel {
     pub upstream_model: String,
+    pub input_modalities: Option<Vec<ProviderModelInputModality>>,
     pub metadata_json: String,
     pub routable: bool,
     pub pricing: Option<ProviderModelPricingRecord>,
@@ -107,6 +157,7 @@ pub struct StoredProviderModel {
     pub enabled: bool,
     pub available: bool,
     pub routable: bool,
+    pub input_modalities: Option<Vec<ProviderModelInputModality>>,
     pub metadata_json: String,
     pub pricing: Option<ProviderModelPricingRecord>,
     pub last_seen_at: Option<i64>,
@@ -125,10 +176,74 @@ impl StoredProviderModel {
 pub struct ProviderModelOverride {
     pub alias: Option<String>,
     pub enabled: bool,
+    pub input_modalities: Option<Vec<ProviderModelInputModality>>,
     pub pricing: Option<Option<ProviderModelPricing>>,
     pub updated_at: i64,
 }
 
 pub trait ProviderModelPricingCatalog: Send + Sync {
     fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing>;
+
+    fn exact_input_modalities(
+        &self,
+        upstream_model: &str,
+    ) -> Option<Vec<ProviderModelInputModality>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn model_capability_metadata_is_explicit_and_derives_original_image_detail() {
+        assert_eq!(
+            serde_json::to_value(ProviderModel::new("unknown", "owner")).expect("serialize"),
+            json!({
+                "id": "unknown",
+                "object": "model",
+                "owned_by": "owner",
+                "input_modalities": null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderModel::new("vision", "owner").with_input_modalities(
+                Some(vec![
+                    ProviderModelInputModality::Text,
+                    ProviderModelInputModality::Image,
+                ])
+            ))
+            .expect("serialize"),
+            json!({
+                "id": "vision",
+                "object": "model",
+                "owned_by": "owner",
+                "input_modalities": ["text", "image"],
+                "supports_image_detail_original": true
+            })
+        );
+    }
+
+    #[test]
+    fn modality_contract_accepts_ordered_unique_supported_modalities() {
+        assert!(validate_input_modalities(None).is_ok());
+        assert!(validate_input_modalities(Some(&[ProviderModelInputModality::Text])).is_ok());
+        assert!(
+            validate_input_modalities(Some(&[
+                ProviderModelInputModality::Video,
+                ProviderModelInputModality::Image,
+                ProviderModelInputModality::Pdf,
+            ]))
+            .is_ok()
+        );
+        assert!(validate_input_modalities(Some(&[])).is_err());
+        assert!(
+            validate_input_modalities(Some(&[
+                ProviderModelInputModality::Audio,
+                ProviderModelInputModality::Audio,
+            ]))
+            .is_err()
+        );
+    }
 }

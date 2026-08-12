@@ -9,6 +9,10 @@ pub(crate) const DEFAULT_AUTH_ISSUER: &str = "https://auth.openai.com";
 pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const ORIGINATOR: &str = "codex_cli_rs";
 pub(crate) const CODEX_CLI_VERSION: &str = "0.144.5";
+const LUNA_MODEL: &str = "gpt-5.6-luna";
+const LUNA_ORIGINATOR: &str = "codex-tui";
+const LUNA_USER_AGENT: &str =
+    "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)";
 
 pub(crate) fn user_agent() -> String {
     let os = os_info::get();
@@ -56,6 +60,23 @@ pub(crate) fn responses_headers(
     Ok(auth_headers(request, credentials)?
         .header("originator", ORIGINATOR)
         .header(reqwest::header::USER_AGENT, user_agent()))
+}
+
+pub(crate) fn responses_model_headers(
+    request: RequestBuilder,
+    credentials: &CodexCredentials,
+    model: &str,
+) -> Result<RequestBuilder, ProviderError> {
+    let request = auth_headers(request, credentials)?;
+    if model == LUNA_MODEL {
+        Ok(request
+            .header("originator", LUNA_ORIGINATOR)
+            .header(reqwest::header::USER_AGENT, LUNA_USER_AGENT))
+    } else {
+        Ok(request
+            .header("originator", ORIGINATOR)
+            .header(reqwest::header::USER_AGENT, user_agent()))
+    }
 }
 
 pub(crate) fn quota_headers(

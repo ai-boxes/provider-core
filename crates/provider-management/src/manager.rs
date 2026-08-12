@@ -630,9 +630,9 @@ impl ProviderManager {
         Ok(ModelCatalogSnapshot { models })
     }
 
-    /// Re-discover every enabled account after the shared price catalog changes.
-    /// The repository synchronization updates catalog-sourced prices and the
-    /// activation replaces the routing snapshot before the cycle completes.
+    /// Re-discover every enabled account after the shared model catalog changes.
+    /// Repository synchronization updates catalog-sourced prices and capabilities,
+    /// then activation replaces the routing snapshot before the cycle completes.
     pub async fn refresh_enabled_model_catalogs(
         &self,
         now: i64,
