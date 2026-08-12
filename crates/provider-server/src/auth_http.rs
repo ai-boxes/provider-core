@@ -73,7 +73,10 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/registration-codes", post(create_registration_code))
-        .route("/api/v1/users/{user_id}", put(update_user))
+        .route(
+            "/api/v1/users/{user_id}",
+            put(update_user).delete(delete_user),
+        )
         .route("/api/v1/users/{user_id}/role", put(update_user_role))
         .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
@@ -283,6 +286,18 @@ async fn update_user(
         )
         .await?;
     Ok(data(user_json(&user)))
+}
+
+async fn delete_user(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, AuthApiError> {
+    state
+        .api_keys
+        .delete_user(&state.auth, &session.user, &parse_user_id(&user_id)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn reset_user_password(
@@ -861,7 +876,12 @@ impl From<AuthError> for AuthApiError {
             AuthError::LastEnabledSuperAdmin => Self {
                 status: StatusCode::CONFLICT,
                 error_type: "conflict_error",
-                message: "the last enabled super_admin cannot be demoted or disabled",
+                message: "the last enabled super_admin cannot be demoted, disabled, or deleted",
+            },
+            AuthError::UserHasProviderAccounts => Self {
+                status: StatusCode::CONFLICT,
+                error_type: "conflict_error",
+                message: "delete the user's provider accounts before deleting the user",
             },
             AuthError::InvalidRegistrationCode => {
                 Self::invalid_request("invitation code is invalid or expired")

@@ -27,6 +27,14 @@ pub enum UserUpdateOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserDeleteOutcome {
+    Deleted,
+    NotFound,
+    LastEnabledSuperAdmin,
+    HasProviderAccounts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuotaAdmissionOutcome {
     Admitted,
     Unlimited,
@@ -93,6 +101,9 @@ pub trait AuthRepository: Send + Sync {
         password_hash: String,
         updated_at: i64,
     ) -> Result<bool, AuthRepositoryError>;
+
+    async fn delete_user(&self, user_id: &UserId)
+    -> Result<UserDeleteOutcome, AuthRepositoryError>;
 
     async fn create_session(&self, session: NewSession) -> Result<(), AuthRepositoryError>;
 

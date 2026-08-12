@@ -11,8 +11,8 @@ use crate::{
     ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey,
     CredentialError, InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
     QuotaAdmissionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
-    UserId, UserRole, UserSummary, UserUpdateOutcome, digest_secret, hash_password,
-    issue_registration_code, issue_session, parse_quota_limit_usd, verify_password,
+    UserDeleteOutcome, UserId, UserRole, UserSummary, UserUpdateOutcome, digest_secret,
+    hash_password, issue_registration_code, issue_session, parse_quota_limit_usd, verify_password,
 };
 
 pub const REGISTRATION_CODE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -296,6 +296,23 @@ impl AuthService {
             .await?
             .ok_or(AuthError::NotFound)?;
         Ok(user_summary(&user))
+    }
+
+    pub async fn delete_user(
+        &self,
+        actor: &UserSummary,
+        user_id: &UserId,
+    ) -> Result<(), AuthError> {
+        require_super_admin(actor)?;
+        if actor.id == *user_id {
+            return Err(AuthError::Forbidden);
+        }
+        match self.repository.delete_user(user_id).await? {
+            UserDeleteOutcome::Deleted => Ok(()),
+            UserDeleteOutcome::NotFound => Err(AuthError::NotFound),
+            UserDeleteOutcome::LastEnabledSuperAdmin => Err(AuthError::LastEnabledSuperAdmin),
+            UserDeleteOutcome::HasProviderAccounts => Err(AuthError::UserHasProviderAccounts),
+        }
     }
 
     async fn create_session(&self, user: UserSummary, now: i64) -> Result<SessionGrant, AuthError> {
@@ -602,6 +619,23 @@ impl ApiKeyAuthenticator {
         }
     }
 
+    pub async fn delete_user(
+        &self,
+        auth: &AuthService,
+        actor: &UserSummary,
+        user_id: &UserId,
+    ) -> Result<(), AuthError> {
+        let _mutation = self.mutation.lock().await;
+        let removed = self.remove_owner_active(user_id);
+        match auth.delete_user(actor, user_id).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.restore_many_active(removed);
+                Err(error)
+            }
+        }
+    }
+
     /// Soft-admit a finite-quota key when lifetime spent is still under limit.
     /// Actual USD spend is applied later from observed usage.
     pub async fn admit_quota(&self, key: &AuthenticatedApiKey) -> Result<(), AuthError> {
@@ -845,6 +879,8 @@ pub enum AuthError {
     NotFound,
     #[error("the last enabled super_admin cannot be demoted or disabled")]
     LastEnabledSuperAdmin,
+    #[error("user owns provider accounts")]
+    UserHasProviderAccounts,
     #[error("registration code is invalid or expired")]
     InvalidRegistrationCode,
     #[error("username must contain 1 to 128 characters")]

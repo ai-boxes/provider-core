@@ -1067,6 +1067,113 @@ async fn role_updates_revoke_sessions_and_preserve_the_last_enabled_super_admin(
 }
 
 #[tokio::test]
+async fn deleting_user_removes_sessions_and_keys_but_preserves_providers_and_last_admin() {
+    let repository = SqliteAccountRepository::in_memory()
+        .await
+        .expect("in-memory repository");
+    let admin_id = UserId::new("delete-admin").expect("user ID");
+    repository
+        .create_initial_user(
+            NewUser {
+                id: admin_id.clone(),
+                username: "delete-admin".to_owned(),
+                password_hash: "password-hash".to_owned(),
+                role: UserRole::SuperAdmin,
+                enabled: true,
+                created_at: 100,
+            },
+            test_session("delete-admin-session", admin_id.clone(), 51),
+        )
+        .await
+        .expect("create initial user");
+    assert_eq!(
+        repository
+            .delete_user(&admin_id)
+            .await
+            .expect("protect last super admin"),
+        UserDeleteOutcome::LastEnabledSuperAdmin
+    );
+
+    let user_id = UserId::new("delete-user").expect("user ID");
+    repository
+        .create_user(NewUser {
+            id: user_id.clone(),
+            username: "delete-user".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 101,
+        })
+        .await
+        .expect("create user");
+    repository
+        .create_session(test_session("delete-user-session", user_id.clone(), 52))
+        .await
+        .expect("create user session");
+    sqlx::query(
+        "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('delete-user-key', ?, 'group', 'key', 'pode-delete-user-key', 1, '0', 101, 101)",
+    )
+    .bind(user_id.as_str())
+    .execute(&repository.pool)
+    .await
+    .expect("create user API key");
+    assert_eq!(
+        repository.delete_user(&user_id).await.expect("delete user"),
+        UserDeleteOutcome::Deleted
+    );
+    assert!(
+        repository
+            .load_user(&user_id)
+            .await
+            .expect("load deleted user")
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_sessions WHERE user_id = ?")
+            .bind(user_id.as_str())
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count deleted sessions"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE owner_user_id = ?")
+            .bind(user_id.as_str())
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count deleted keys"),
+        0
+    );
+
+    let provider_owner_id = UserId::new("provider-owner").expect("user ID");
+    repository
+        .create_user(NewUser {
+            id: provider_owner_id.clone(),
+            username: "provider-owner".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 102,
+        })
+        .await
+        .expect("create provider owner");
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, owner_user_id, provider, label, group_label) VALUES ('owned-provider', ?, 'openai_compatible', 'Owned', 'group')",
+    )
+    .bind(provider_owner_id.as_str())
+    .execute(&repository.pool)
+    .await
+    .expect("create owned provider");
+    assert_eq!(
+        repository
+            .delete_user(&provider_owner_id)
+            .await
+            .expect("protect provider owner"),
+        UserDeleteOutcome::HasProviderAccounts
+    );
+}
+
+#[tokio::test]
 async fn concurrent_super_admin_updates_preserve_one_enabled_super_admin() {
     let path = std::env::temp_dir().join(format!(
         "provider-core-super-admin-race-{}-{}.db",

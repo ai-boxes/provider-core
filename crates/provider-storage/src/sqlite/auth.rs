@@ -472,6 +472,89 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn delete_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<UserDeleteOutcome, AuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start user deletion transaction", error)
+        })?;
+        sqlx::query(
+            r#"
+            UPDATE auth_setup
+            SET initial_user_id = (
+                SELECT id FROM users WHERE id != ? ORDER BY created_at, id LIMIT 1
+            )
+            WHERE initial_user_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(user_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to transfer setup ownership", error))?;
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM users
+            WHERE id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM provider_accounts WHERE owner_user_id = users.id
+              )
+              AND (
+                  role != 'super_admin'
+                  OR enabled = 0
+                  OR EXISTS (
+                      SELECT 1
+                      FROM users AS other
+                      WHERE other.id != users.id
+                        AND other.role = 'super_admin'
+                        AND other.enabled = 1
+                  )
+              )
+            "#,
+        )
+        .bind(user_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to delete user", error))?;
+        if deleted.rows_affected() == 0 {
+            let target = sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = ?")
+                .bind(user_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    auth_repository_error("failed to check user deletion target", error)
+                })?;
+            let outcome = match target {
+                None => UserDeleteOutcome::NotFound,
+                Some(_) => {
+                    let provider_count = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM provider_accounts WHERE owner_user_id = ?",
+                    )
+                    .bind(user_id.as_str())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        auth_repository_error("failed to check user provider ownership", error)
+                    })?;
+                    if provider_count > 0 {
+                        UserDeleteOutcome::HasProviderAccounts
+                    } else {
+                        UserDeleteOutcome::LastEnabledSuperAdmin
+                    }
+                }
+            };
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back rejected user deletion", error)
+            })?;
+            return Ok(outcome);
+        }
+        transaction.commit().await.map_err(|error| {
+            auth_repository_error("failed to commit user deletion transaction", error)
+        })?;
+        Ok(UserDeleteOutcome::Deleted)
+    }
+
     async fn create_session(&self, session: NewSession) -> Result<(), AuthRepositoryError> {
         sqlx::query(
             r#"
