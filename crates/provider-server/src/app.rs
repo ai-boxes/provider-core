@@ -113,6 +113,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         let account_id = account.id.clone();
         let kind = account.provider;
         let access = account.access();
+        let priority = account.priority;
         let account = match runtime.build_account(account) {
             Ok(account) => account,
             Err(error) => {
@@ -131,7 +132,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
-        runtime.install_account(kind, account, models, access).await;
+        runtime
+            .install_account(kind, account, models, access, priority)
+            .await;
     }
 
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));

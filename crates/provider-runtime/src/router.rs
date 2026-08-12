@@ -1,10 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState},
-    hash::BuildHasher,
-    sync::{
-        Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant},
 };
 
@@ -26,12 +22,18 @@ pub struct ProviderModelRouter {
 
 const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(60 * 60);
 const SESSION_AFFINITY_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
+const QUOTA_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const AUTH_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const PRECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
+const RESPONSE_BINDING_TTL: Duration = Duration::from_secs(60 * 60);
 
 struct RouterInner {
     accounts: RwLock<BTreeMap<AccountId, RoutedAccount>>,
     affinities: Mutex<SessionAffinities>,
-    selection_state: RandomState,
-    selection_counter: AtomicU64,
+    selections: Mutex<HashMap<SelectionKey, u64>>,
+    cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
+    response_bindings: Mutex<HashMap<ResponseBindingKey, ResponseBinding>>,
 }
 
 #[derive(Default)]
@@ -42,9 +44,33 @@ struct SessionAffinities {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionAffinityKey {
-    user_id: String,
+    routing_scope: String,
     model: String,
     session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SelectionKey {
+    routing_scope: String,
+    model: String,
+    priority: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CooldownKey {
+    account_id: AccountId,
+    model: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResponseBindingKey {
+    routing_scope: String,
+    response_id: String,
+}
+
+struct ResponseBinding {
+    account_id: AccountId,
+    bound_at: Instant,
 }
 
 struct SessionAffinity {
@@ -57,6 +83,7 @@ struct RoutedAccount {
     access: ProviderAccountAccess,
     models: Vec<StoredProviderModel>,
     route: Arc<RuntimeAccountRoute>,
+    priority: u32,
 }
 
 struct RuntimeAccountRoute {
@@ -84,8 +111,9 @@ impl ProviderModelRouter {
             inner: Arc::new(RouterInner {
                 accounts: RwLock::new(BTreeMap::new()),
                 affinities: Mutex::new(SessionAffinities::default()),
-                selection_state: RandomState::new(),
-                selection_counter: AtomicU64::new(0),
+                selections: Mutex::new(HashMap::new()),
+                cooldowns: Mutex::new(HashMap::new()),
+                response_bindings: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -96,6 +124,7 @@ impl ProviderModelRouter {
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
         access: ProviderAccountAccess,
+        priority: u32,
     ) -> Result<(), ProviderModelRouterError> {
         if account.provider_name() != runtime.provider_name() {
             return Err(ProviderModelRouterError::ProviderMismatch);
@@ -113,6 +142,7 @@ impl ProviderModelRouter {
                 access,
                 models,
                 route,
+                priority,
             },
         );
         Ok(())
@@ -124,6 +154,10 @@ impl ProviderModelRouter {
             self.affinities()
                 .entries
                 .retain(|_, affinity| affinity.account_id != *account_id);
+            self.cooldowns()
+                .retain(|key, _| key.account_id != *account_id);
+            self.response_bindings()
+                .retain(|_, binding| binding.account_id != *account_id);
         }
         removed
     }
@@ -185,6 +219,29 @@ impl ProviderModelRouter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn selections(&self) -> std::sync::MutexGuard<'_, HashMap<SelectionKey, u64>> {
+        self.inner
+            .selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cooldowns(&self) -> std::sync::MutexGuard<'_, HashMap<CooldownKey, Instant>> {
+        self.inner
+            .cooldowns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn response_bindings(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ResponseBindingKey, ResponseBinding>> {
+        self.inner
+            .response_bindings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl ProviderRouter for ProviderModelRouter {
@@ -236,17 +293,26 @@ impl ProviderRouter for ProviderModelRouter {
     fn routes(
         &self,
         user_id: &str,
+        routing_scope: &str,
         model: &str,
         native_formats: &[WireFormat],
         session_id: Option<&str>,
+        previous_response_id: Option<&str>,
         account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate> {
+        let now = Instant::now();
+        let mut cooldowns = self.cooldowns();
+        cooldowns.retain(|_, until| *until > now);
         let mut routes = Vec::new();
         for (account_id, account) in self.account_snapshot().iter() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
                 || !native_formats.contains(&account.route.native_format())
                 || account_ids.is_some_and(|ids| !ids.contains(account_id))
+                || cooldowns.contains_key(&CooldownKey {
+                    account_id: account_id.clone(),
+                    model: model.to_owned(),
+                })
             {
                 continue;
             }
@@ -259,6 +325,8 @@ impl ProviderRouter for ProviderModelRouter {
                 routes.push((
                     account_id.clone(),
                     ProviderRouteCandidate {
+                        account_id: Some(account_id.clone()),
+                        priority: account.priority,
                         upstream_model: provider_model.upstream_model.clone(),
                         input_modalities: provider_model.input_modalities.clone(),
                         responses_lite: model_uses_responses_lite(provider_model),
@@ -272,16 +340,42 @@ impl ProviderRouter for ProviderModelRouter {
             return Vec::new();
         }
 
+        routes.sort_by(|left, right| {
+            left.1
+                .priority
+                .cmp(&right.1.priority)
+                .then(left.0.cmp(&right.0))
+        });
+
+        if let Some(previous_response_id) = previous_response_id {
+            let mut bindings = self.response_bindings();
+            bindings
+                .retain(|_, binding| now.duration_since(binding.bound_at) < RESPONSE_BINDING_TTL);
+            let bound = bindings
+                .get(&ResponseBindingKey {
+                    routing_scope: routing_scope.to_owned(),
+                    response_id: previous_response_id.to_owned(),
+                })
+                .map(|binding| binding.account_id.clone());
+            return bound
+                .and_then(|bound| {
+                    routes
+                        .into_iter()
+                        .find(|(account_id, _)| *account_id == bound)
+                })
+                .map(|(_, route)| vec![route])
+                .unwrap_or_default();
+        }
+
         let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
-            randomize_routes(&self.inner, &mut routes);
+            rotate_round_robin(self, routing_scope, model, &mut routes);
             return routes.into_iter().map(|(_, route)| route).collect();
         };
         let key = SessionAffinityKey {
-            user_id: user_id.to_owned(),
+            routing_scope: routing_scope.to_owned(),
             model: model.to_owned(),
             session_id: session_id.to_owned(),
         };
-        let now = Instant::now();
         let mut affinities = self.affinities();
         if affinities.last_cleanup.is_none_or(|last_cleanup| {
             now.duration_since(last_cleanup) >= SESSION_AFFINITY_CLEANUP_INTERVAL
@@ -304,15 +398,73 @@ impl ProviderRouter for ProviderModelRouter {
             affinities.entries.remove(&key);
         }
 
-        randomize_routes(&self.inner, &mut routes);
-        affinities.entries.insert(
-            key,
+        drop(affinities);
+        rotate_round_robin(self, routing_scope, model, &mut routes);
+        routes.into_iter().map(|(_, route)| route).collect()
+    }
+
+    fn commit_session_affinity(
+        &self,
+        routing_scope: &str,
+        model: &str,
+        session_id: Option<&str>,
+        account_id: &AccountId,
+    ) {
+        let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        self.affinities().entries.insert(
+            SessionAffinityKey {
+                routing_scope: routing_scope.to_owned(),
+                model: model.to_owned(),
+                session_id: session_id.to_owned(),
+            },
             SessionAffinity {
-                account_id: routes[0].0.clone(),
-                last_used: now,
+                account_id: account_id.clone(),
+                last_used: Instant::now(),
             },
         );
-        routes.into_iter().map(|(_, route)| route).collect()
+    }
+
+    fn record_route_failure(
+        &self,
+        account_id: &AccountId,
+        model: &str,
+        reason: provider_core::ProviderFailoverReason,
+    ) {
+        let duration = match reason {
+            provider_core::ProviderFailoverReason::AuthenticationExhausted => AUTH_COOLDOWN,
+            provider_core::ProviderFailoverReason::QuotaExhausted => QUOTA_COOLDOWN,
+            provider_core::ProviderFailoverReason::RateLimited => RATE_LIMIT_COOLDOWN,
+            provider_core::ProviderFailoverReason::PreconnectFailure => PRECONNECT_COOLDOWN,
+        };
+        self.cooldowns().insert(
+            CooldownKey {
+                account_id: account_id.clone(),
+                model: model.to_owned(),
+            },
+            Instant::now() + duration,
+        );
+    }
+
+    fn record_route_success(&self, account_id: &AccountId, model: &str) {
+        self.cooldowns().remove(&CooldownKey {
+            account_id: account_id.clone(),
+            model: model.to_owned(),
+        });
+    }
+
+    fn bind_response_id(&self, routing_scope: &str, response_id: &str, account_id: &AccountId) {
+        self.response_bindings().insert(
+            ResponseBindingKey {
+                routing_scope: routing_scope.to_owned(),
+                response_id: response_id.to_owned(),
+            },
+            ResponseBinding {
+                account_id: account_id.clone(),
+                bound_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -324,6 +476,10 @@ impl ProviderRoute for RuntimeAccountRoute {
 
     fn native_format(&self) -> WireFormat {
         self.runtime.native_format()
+    }
+
+    fn supports_previous_response_id(&self) -> bool {
+        self.runtime.provider_name() == "codex"
     }
 
     fn usage_profile(&self) -> Option<provider_core::usage::ProviderUsageProfile> {
@@ -378,21 +534,31 @@ fn conservative_input_modalities(
     (!modalities.is_empty()).then_some(modalities)
 }
 
-fn randomize_routes(inner: &RouterInner, routes: &mut [(AccountId, ProviderRouteCandidate)]) {
-    if routes.len() > 1 {
-        let index = random_index(
-            &inner.selection_state,
-            &inner.selection_counter,
-            routes.len(),
-        );
-        routes.rotate_left(index);
+fn rotate_round_robin(
+    router: &ProviderModelRouter,
+    routing_scope: &str,
+    model: &str,
+    routes: &mut [(AccountId, ProviderRouteCandidate)],
+) {
+    if routes.len() <= 1 {
+        return;
     }
-}
-
-fn random_index(state: &RandomState, counter: &AtomicU64, length: usize) -> usize {
-    let value = counter.fetch_add(1, Ordering::Relaxed);
-    let length = u64::try_from(length).expect("route count must fit u64");
-    usize::try_from(state.hash_one(value) % length).expect("route index must fit usize")
+    let priority = routes[0].1.priority;
+    let tier_len = routes
+        .iter()
+        .take_while(|(_, candidate)| candidate.priority == priority)
+        .count();
+    let key = SelectionKey {
+        routing_scope: routing_scope.to_owned(),
+        model: model.to_owned(),
+        priority,
+    };
+    let mut selections = router.selections();
+    let cursor = selections.entry(key).or_default();
+    let index = usize::try_from(*cursor % u64::try_from(tier_len).expect("tier length fits u64"))
+        .expect("round-robin index fits usize");
+    *cursor = cursor.wrapping_add(1);
+    routes[..tier_len].rotate_left(index);
 }
 
 #[cfg(test)]
@@ -513,6 +679,7 @@ mod tests {
                     non_routable_model(&first.id, "grok-imagine-image"),
                 ],
                 access("owner-a", ProviderVisibility::Private),
+                0,
             )
             .expect("first routes");
         let mut second_shared = stored_model(&second.id, "upstream-b", "shared");
@@ -527,6 +694,7 @@ mod tests {
                 second.clone(),
                 vec![second_shared],
                 access("owner-b", ProviderVisibility::Shared),
+                0,
             )
             .expect("second routes");
 
@@ -545,8 +713,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "grok-imagine-image",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -555,8 +725,10 @@ mod tests {
 
         let routes = router.routes(
             "owner-a",
+            "owner-a",
             "shared",
             &[WireFormat::OpenAiResponses],
+            None,
             None,
             None,
         );
@@ -610,8 +782,10 @@ mod tests {
         assert_eq!(filtered_models[0].model.id, "shared");
         let filtered_routes = router.routes(
             "owner-a",
+            "owner-a",
             "shared",
             &[WireFormat::OpenAiResponses],
+            None,
             None,
             Some(&only_second),
         );
@@ -621,8 +795,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     Some(&HashSet::new()),
                 )
@@ -633,8 +809,10 @@ mod tests {
             router
                 .routes(
                     "owner-b",
+                    "owner-b",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -645,8 +823,10 @@ mod tests {
             router
                 .routes(
                     "other-user",
+                    "other-user",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -662,8 +842,10 @@ mod tests {
             router
                 .routes(
                     "other-user",
+                    "other-user",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -673,8 +855,10 @@ mod tests {
             router
                 .routes(
                     "owner-b",
+                    "owner-b",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -693,8 +877,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -705,8 +891,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -721,8 +909,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "shared",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -732,8 +922,10 @@ mod tests {
             router
                 .routes(
                     "owner-a",
+                    "owner-a",
                     "updated",
                     &[WireFormat::OpenAiResponses],
+                    None,
                     None,
                     None
                 )
@@ -766,6 +958,7 @@ mod tests {
                 first.clone(),
                 vec![stored_model(&first.id, "upstream-a", "shared")],
                 access("owner", ProviderVisibility::Shared),
+                0,
             )
             .expect("first route");
         router
@@ -774,24 +967,35 @@ mod tests {
                 second.clone(),
                 vec![stored_model(&second.id, "upstream-b", "shared")],
                 access("owner", ProviderVisibility::Shared),
+                0,
             )
             .expect("second route");
 
         let first_selection = router.routes(
             "caller",
+            "caller",
             "shared",
             &[WireFormat::OpenAiResponses],
             Some("cc_session"),
             None,
+            None,
         );
         let selected_model = first_selection[0].upstream_model.clone();
+        let selected_account = if selected_model == "upstream-a" {
+            &first.id
+        } else {
+            &second.id
+        };
+        router.commit_session_affinity("caller", "shared", Some("cc_session"), selected_account);
         assert_eq!(
             router.routes(
+                "caller",
                 "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
                 Some("cc_session"),
-                None
+                None,
+                None,
             )[0]
             .upstream_model,
             selected_model
@@ -800,9 +1004,11 @@ mod tests {
             router
                 .routes(
                     "caller",
+                    "caller",
                     "shared",
                     &[WireFormat::OpenAiResponses],
                     Some("different_session"),
+                    None,
                     None
                 )
                 .len(),
@@ -822,35 +1028,43 @@ mod tests {
                 third.clone(),
                 vec![stored_model(&third.id, "upstream-c", "shared")],
                 access("owner", ProviderVisibility::Shared),
+                0,
             )
             .expect("third route");
         assert_eq!(
             router.routes(
                 "caller",
+                "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
                 Some("cc_session"),
-                None
+                None,
+                None,
             )[0]
             .upstream_model,
             selected_model
         );
 
-        let selected_account = if selected_model == "upstream-a" {
-            &first.id
-        } else {
-            &second.id
-        };
         assert!(router.remove_account(selected_account));
         let replacement = router.routes(
+            "caller",
             "caller",
             "shared",
             &[WireFormat::OpenAiResponses],
             Some("cc_session"),
             None,
+            None,
         )[0]
         .upstream_model
         .clone();
+        let replacement_account = if replacement == "upstream-a" {
+            &first.id
+        } else if replacement == "upstream-b" {
+            &second.id
+        } else {
+            &third.id
+        };
+        router.commit_session_affinity("caller", "shared", Some("cc_session"), replacement_account);
         assert_ne!(replacement, selected_model);
         assert!(matches!(
             replacement.as_str(),
@@ -859,10 +1073,12 @@ mod tests {
         assert_eq!(
             router.routes(
                 "caller",
+                "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
                 Some("cc_session"),
-                None
+                None,
+                None,
             )[0]
             .upstream_model,
             replacement
@@ -887,10 +1103,11 @@ mod tests {
                 account.clone(),
                 vec![stored_model(&account.id, "upstream", "shared")],
                 access("owner", ProviderVisibility::Shared),
+                0,
             )
             .expect("route");
         let expired_key = SessionAffinityKey {
-            user_id: "caller".to_owned(),
+            routing_scope: "caller".to_owned(),
             model: "shared".to_owned(),
             session_id: "expired-session".to_owned(),
         };
@@ -905,18 +1122,21 @@ mod tests {
         assert_eq!(
             router.routes(
                 "caller",
+                "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
                 Some("active-session"),
+                None,
                 None
             )[0]
             .upstream_model,
             "upstream"
         );
+        router.commit_session_affinity("caller", "shared", Some("active-session"), &account.id);
         let affinities = router.affinities();
         assert!(!affinities.entries.contains_key(&expired_key));
         assert!(affinities.entries.contains_key(&SessionAffinityKey {
-            user_id: "caller".to_owned(),
+            routing_scope: "caller".to_owned(),
             model: "shared".to_owned(),
             session_id: "active-session".to_owned(),
         }));
@@ -933,17 +1153,187 @@ mod tests {
         assert_eq!(
             router.routes(
                 "caller",
+                "caller",
                 "shared",
                 &[WireFormat::OpenAiResponses],
                 Some("expired-session"),
+                None,
                 None
             )[0]
             .upstream_model,
             "upstream"
         );
         let affinities = router.affinities();
-        assert!(affinities.entries[&expired_key].last_used > expired_at);
+        assert!(!affinities.entries.contains_key(&expired_key));
         drop(affinities);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn priority_round_robin_cooldown_and_response_bindings_are_scoped() {
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let high_a = Arc::new(TestAccount {
+            id: AccountId::new("priority-a").expect("account ID"),
+        });
+        let high_b = Arc::new(TestAccount {
+            id: AccountId::new("priority-b").expect("account ID"),
+        });
+        let low = Arc::new(TestAccount {
+            id: AccountId::new("priority-low").expect("account ID"),
+        });
+        for account in [&high_a, &high_b, &low] {
+            runtime.register(account.clone()).await.expect("register");
+        }
+        let router = ProviderModelRouter::new();
+        for (account, upstream, priority) in [
+            (&high_a, "upstream-a", 0),
+            (&high_b, "upstream-b", 0),
+            (&low, "upstream-low", 10),
+        ] {
+            router
+                .replace_account_models(
+                    runtime.clone(),
+                    account.clone(),
+                    vec![stored_model(&account.id, upstream, "shared")],
+                    access("owner", ProviderVisibility::Shared),
+                    priority,
+                )
+                .expect("route");
+        }
+
+        let first = router.routes(
+            "caller",
+            "key-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        let second = router.routes(
+            "caller",
+            "key-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(first[2].priority, 10);
+        assert_eq!(second[2].priority, 10);
+        assert_ne!(first[0].account_id, second[0].account_id);
+
+        let cooled = first[0].account_id.clone().expect("account");
+        router.record_route_failure(
+            &cooled,
+            "shared",
+            provider_core::ProviderFailoverReason::RateLimited,
+        );
+        let after_cooldown = router.routes(
+            "caller",
+            "key-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !after_cooldown
+                .iter()
+                .any(|candidate| candidate.account_id.as_ref() == Some(&cooled))
+        );
+        router.record_route_success(&cooled, "shared");
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "key-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .iter()
+                .any(|candidate| candidate.account_id.as_ref() == Some(&cooled))
+        );
+
+        router.bind_response_id("key-a", "resp-1", &high_a.id);
+        let bound = router.routes(
+            "caller",
+            "key-a",
+            "shared",
+            &[WireFormat::OpenAiResponses],
+            None,
+            Some("resp-1"),
+            None,
+        );
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].account_id.as_ref(), Some(&high_a.id));
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "key-b",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some("resp-1"),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "key-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some("unknown"),
+                    None,
+                )
+                .is_empty()
+        );
+        router.response_bindings().insert(
+            ResponseBindingKey {
+                routing_scope: "key-a".to_owned(),
+                response_id: "expired".to_owned(),
+            },
+            ResponseBinding {
+                account_id: high_b.id.clone(),
+                bound_at: Instant::now() - RESPONSE_BINDING_TTL - Duration::from_secs(1),
+            },
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "key-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some("expired"),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(router.remove_account(&high_a.id));
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "key-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some("resp-1"),
+                    None,
+                )
+                .is_empty()
+        );
         runtime.shutdown();
     }
 

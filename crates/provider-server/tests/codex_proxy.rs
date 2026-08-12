@@ -165,6 +165,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
                 kind: ProviderKind::Codex,
                 label: "Codex".to_owned(),
                 group_label: "default".to_owned(),
+                priority: 0,
                 credential_json: SecretString::from(
                     json!({
                         "type": "codex",
@@ -293,7 +294,9 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.5", "input": "rate-limit" }).to_string())
+        // The preceding repeated 401 cools this account for gpt-5.5. Use a
+        // different routing model to verify 429 mapping independently.
+        .body(json!({ "model": "gpt-5.6-sol", "input": "rate-limit" }).to_string())
         .send()
         .await
         .expect("rate limited request");

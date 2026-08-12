@@ -93,6 +93,21 @@ pub enum LogicalWriteOutcome {
 }
 
 /// One attempt's complete facts, written once after its response ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptFailoverReason {
+    AuthenticationExhausted,
+    QuotaExhausted,
+    RateLimited,
+    PreconnectFailure,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttemptFacts {
     pub attempt_id: String,
@@ -109,6 +124,8 @@ pub struct AttemptFacts {
     /// When the first output token was observed on the upstream stream.
     pub first_token_at_ms: Option<i64>,
     pub completed_at_ms: i64,
+    pub outcome: Option<AttemptOutcome>,
+    pub failover_reason: Option<AttemptFailoverReason>,
     pub dispatch_evidence: DispatchEvidence,
     pub tracking: TrackingState,
     pub contract: UsageContractSnapshot,

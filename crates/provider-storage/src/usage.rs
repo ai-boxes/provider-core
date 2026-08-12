@@ -22,11 +22,11 @@ use provider_core::{
     },
 };
 use provider_usage::{
-    AttemptFacts, AttemptSequence, CostReason, CostStatus, DeliveryOutcome, DispatchEvidence,
-    ExecutionOutcome, InlinePriceRecord, LogicalRequestStart, LogicalRequestTerminal,
-    LogicalStatus, LogicalWriteOutcome, ObservedCatalogCost, PriceResolution, StoredCatalog,
-    StoredLogicalRequest, TrackingGapReason, TrackingState, UsageRepository, UsageRepositoryError,
-    UsdAtoms, gap_bucket,
+    AttemptFacts, AttemptFailoverReason, AttemptOutcome, AttemptSequence, CostReason, CostStatus,
+    DeliveryOutcome, DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
+    LogicalRequestTerminal, LogicalStatus, LogicalWriteOutcome, ObservedCatalogCost,
+    PriceResolution, StoredCatalog, StoredLogicalRequest, TrackingGapReason, TrackingState,
+    UsageRepository, UsageRepositoryError, UsdAtoms, gap_bucket,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
@@ -218,6 +218,11 @@ impl UsageRepository for SqliteUsageRepository {
                 "a not-invoked attempt cannot carry observed usage or a cost estimate",
             ));
         }
+        if facts.failover_reason.is_some() && facts.outcome != Some(AttemptOutcome::Failed) {
+            return Err(UsageRepositoryError::new(
+                "an attempt failover reason requires a failed attempt outcome",
+            ));
+        }
 
         // The attempt row and the lifetime API-key spend must commit together.
         // IMMEDIATE takes SQLite's write lock before reading spent_atoms, so two
@@ -240,7 +245,8 @@ impl UsageRepository for SqliteUsageRepository {
             INSERT INTO usage_attempts (
                 id, logical_request_id, sequence,
                 provider, account_id, configured_model, provider_reported_model,
-                started_at_ms, first_token_at_ms, completed_at_ms, dispatch_evidence,
+                started_at_ms, first_token_at_ms, completed_at_ms, attempt_outcome,
+                failover_reason, dispatch_evidence,
                 tracking_state, tracking_gap_reason,
                 contract_version, normalization_version, inclusion_json,
                 cache_capability, cache_eligibility, cache_reporting_expectation,
@@ -255,7 +261,7 @@ impl UsageRepository for SqliteUsageRepository {
             )
             VALUES (
                 ?, ?, ?,
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?,
                 ?, ?, ?,
@@ -282,6 +288,8 @@ impl UsageRepository for SqliteUsageRepository {
         .bind(facts.started_at_ms)
         .bind(facts.first_token_at_ms)
         .bind(facts.completed_at_ms)
+        .bind(facts.outcome.map(attempt_outcome_str))
+        .bind(facts.failover_reason.map(attempt_failover_reason_str))
         .bind(dispatch_evidence_str(facts.dispatch_evidence))
         .bind(tracking_state)
         .bind(gap_reason)
@@ -1219,6 +1227,44 @@ fn delivery_outcome_from(value: &str) -> Result<DeliveryOutcome, UsageRepository
     }
 }
 
+const fn attempt_outcome_str(outcome: AttemptOutcome) -> &'static str {
+    match outcome {
+        AttemptOutcome::Succeeded => "succeeded",
+        AttemptOutcome::Failed => "failed",
+        AttemptOutcome::Cancelled => "cancelled",
+    }
+}
+
+fn attempt_outcome_from(value: &str) -> Result<AttemptOutcome, UsageRepositoryError> {
+    match value {
+        "succeeded" => Ok(AttemptOutcome::Succeeded),
+        "failed" => Ok(AttemptOutcome::Failed),
+        "cancelled" => Ok(AttemptOutcome::Cancelled),
+        other => Err(unknown_value("attempt outcome", other)),
+    }
+}
+
+const fn attempt_failover_reason_str(reason: AttemptFailoverReason) -> &'static str {
+    match reason {
+        AttemptFailoverReason::AuthenticationExhausted => "authentication_exhausted",
+        AttemptFailoverReason::QuotaExhausted => "quota_exhausted",
+        AttemptFailoverReason::RateLimited => "rate_limited",
+        AttemptFailoverReason::PreconnectFailure => "preconnect_failure",
+    }
+}
+
+fn attempt_failover_reason_from(
+    value: &str,
+) -> Result<AttemptFailoverReason, UsageRepositoryError> {
+    match value {
+        "authentication_exhausted" => Ok(AttemptFailoverReason::AuthenticationExhausted),
+        "quota_exhausted" => Ok(AttemptFailoverReason::QuotaExhausted),
+        "rate_limited" => Ok(AttemptFailoverReason::RateLimited),
+        "preconnect_failure" => Ok(AttemptFailoverReason::PreconnectFailure),
+        other => Err(unknown_value("attempt failover reason", other)),
+    }
+}
+
 const fn dispatch_evidence_str(evidence: DispatchEvidence) -> &'static str {
     match evidence {
         DispatchEvidence::NotInvoked => "not_invoked",
@@ -1608,6 +1654,8 @@ pub(crate) fn attempt_facts(row: SqliteRow) -> Result<AttemptFacts, UsageReposit
     let tracking_state: String = row.get("tracking_state");
     let gap_reason: Option<String> = row.get("tracking_gap_reason");
     let evidence: String = row.get("dispatch_evidence");
+    let outcome: Option<String> = row.get("attempt_outcome");
+    let failover_reason: Option<String> = row.get("failover_reason");
     let sequence: i64 = row.get("sequence");
 
     Ok(AttemptFacts {
@@ -1625,6 +1673,11 @@ pub(crate) fn attempt_facts(row: SqliteRow) -> Result<AttemptFacts, UsageReposit
         started_at_ms: row.get("started_at_ms"),
         first_token_at_ms: row.get("first_token_at_ms"),
         completed_at_ms: row.get("completed_at_ms"),
+        outcome: outcome.as_deref().map(attempt_outcome_from).transpose()?,
+        failover_reason: failover_reason
+            .as_deref()
+            .map(attempt_failover_reason_from)
+            .transpose()?,
         dispatch_evidence: dispatch_evidence_from(&evidence)?,
         tracking: tracking_from(&tracking_state, gap_reason.as_deref())?,
         contract,
@@ -1781,6 +1834,8 @@ mod tests {
             started_at_ms: 1_700_000_000_100,
             first_token_at_ms: None,
             completed_at_ms: 1_700_000_001_500,
+            outcome: None,
+            failover_reason: None,
             dispatch_evidence: DispatchEvidence::ResponseObserved,
             tracking: TrackingState::Complete,
             contract: contract(),

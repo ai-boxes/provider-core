@@ -498,6 +498,8 @@ mod tests {
                 started_at_ms: 1_700_000_090_000,
                 first_token_at_ms: None,
                 completed_at_ms: AT_MS,
+                outcome: None,
+                failover_reason: None,
                 dispatch_evidence: DispatchEvidence::ResponseObserved,
                 tracking: TrackingState::Complete,
                 contract: UsageContractSnapshot {

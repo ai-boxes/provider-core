@@ -126,6 +126,7 @@ impl AccountRepository for SqliteAccountRepository {
                 a.provider,
                 a.label,
                 a.group_label,
+                a.priority,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -142,7 +143,7 @@ impl AccountRepository for SqliteAccountRepository {
             FROM provider_accounts AS a
             LEFT JOIN provider_credentials AS c ON c.account_id = a.id
             WHERE a.enabled = 1
-            ORDER BY a.created_at, a.id
+            ORDER BY a.priority, a.created_at, a.id
             "#,
         )
         .fetch_all(&self.pool)
@@ -276,6 +277,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.provider,
                 a.label,
                 a.group_label,
+                a.priority,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -288,7 +290,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             INNER JOIN provider_credentials AS c ON c.account_id = a.id
             WHERE a.owner_user_id IS NOT NULL
               AND (a.owner_user_id = ? OR a.visibility = 'shared')
-            ORDER BY a.created_at, a.id
+            ORDER BY a.priority, a.created_at, a.id
             "#,
         )
         .bind(actor_user_id)
@@ -312,6 +314,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.provider,
                 a.label,
                 a.group_label,
+                a.priority,
                 a.config_json,
                 a.enabled,
                 a.auth_state,
@@ -360,8 +363,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 r#"
                 INSERT INTO provider_accounts
                     (id, owner_user_id, visibility, provider, label, group_label, config_json,
-                     enabled, auth_state, safe_error_code, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     priority, enabled, auth_state, safe_error_code, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 "#,
             )
@@ -372,6 +375,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
             .bind(&account.label)
             .bind(&account.group_label)
             .bind(&account.config_json)
+            .bind(i64::from(account.priority))
             .bind(database_bool(account.enabled))
             .bind(account.auth_state.as_str())
             .bind(account.safe_error_code.as_deref())
@@ -419,7 +423,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 sqlx::query(
                     r#"
                     UPDATE provider_accounts
-                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, config_json = ?,
+                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, priority = ?, config_json = ?,
                         enabled = ?, auth_state = ?, safe_error_code = ?, updated_at = ?
                     WHERE id = ?
                     "#,
@@ -428,6 +432,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 .bind(account.visibility.as_str())
                 .bind(&account.label)
                 .bind(&account.group_label)
+                .bind(i64::from(account.priority))
                 .bind(&account.config_json)
                 .bind(database_bool(account.enabled))
                 .bind(account.auth_state.as_str())
@@ -440,7 +445,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 sqlx::query(
                     r#"
                     UPDATE provider_accounts
-                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, config_json = ?,
+                    SET owner_user_id = ?, visibility = ?, label = ?, group_label = ?, priority = ?, config_json = ?,
                         enabled = ?, updated_at = ?
                     WHERE id = ?
                     "#,
@@ -449,6 +454,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 .bind(account.visibility.as_str())
                 .bind(&account.label)
                 .bind(&account.group_label)
+                .bind(i64::from(account.priority))
                 .bind(&account.config_json)
                 .bind(database_bool(account.enabled))
                 .bind(account.updated_at)
@@ -602,8 +608,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let inserted = sqlx::query(
             r#"
             INSERT INTO provider_accounts
-                (id, owner_user_id, visibility, provider, label, group_label, config_json, enabled, auth_state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                (id, owner_user_id, visibility, provider, label, group_label, priority, config_json, enabled, auth_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
             ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -613,6 +619,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .bind(account.provider.as_str())
         .bind(account.label)
         .bind(account.group_label)
+        .bind(i64::from(account.priority))
         .bind(account.config_json)
         .bind(database_bool(account.enabled))
         .execute(&mut *transaction)
@@ -662,12 +669,13 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             UPDATE provider_accounts
-            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
+            SET label = ?, group_label = ?, priority = ?, config_json = ?, visibility = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(update.label)
         .bind(update.group_label)
+        .bind(i64::from(update.priority))
         .bind(update.config_json)
         .bind(update.visibility.as_str())
         .bind(update.updated_at)
@@ -699,12 +707,13 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let account_result = sqlx::query(
             r#"
             UPDATE provider_accounts
-            SET label = ?, group_label = ?, config_json = ?, visibility = ?, updated_at = ?
+            SET label = ?, group_label = ?, priority = ?, config_json = ?, visibility = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(account.label)
         .bind(account.group_label)
+        .bind(i64::from(account.priority))
         .bind(account.config_json)
         .bind(account.visibility.as_str())
         .bind(account.updated_at)
@@ -1797,6 +1806,7 @@ fn stored_account(
         provider,
         label: row_value(&row, "label")?,
         group_label: row_value(&row, "group_label")?,
+        priority: non_negative_u32(row_value(&row, "priority")?, "provider account priority")?,
         config_json: row_value(&row, "config_json")?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
@@ -1840,6 +1850,7 @@ fn account_summary(row: SqliteRow) -> Result<ProviderAccountSummary, AccountRepo
         provider,
         label: row_value(&row, "label")?,
         group_label: row_value(&row, "group_label")?,
+        priority: non_negative_u32(row_value(&row, "priority")?, "provider account priority")?,
         config_json: row_value(&row, "config_json")?,
         credential_kind,
         credential_revision: row_value::<i64>(&row, "revision")?
@@ -2091,6 +2102,12 @@ fn non_negative_u64(value: i64, field: &str) -> Result<u64, AccountRepositoryErr
         .map_err(|_| AccountRepositoryError::new(format!("{field} must not be negative")))
 }
 
+fn non_negative_u32(value: i64, field: &str) -> Result<u32, AccountRepositoryError> {
+    value
+        .try_into()
+        .map_err(|_| AccountRepositoryError::new(format!("invalid {field}")))
+}
+
 fn positive_u32(value: i64, field: &str) -> Result<u32, AccountRepositoryError> {
     let value = u32::try_from(value)
         .map_err(|_| AccountRepositoryError::new(format!("{field} is out of range")))?;
@@ -2186,6 +2203,7 @@ mod tests {
             provider: ProviderKind::OpenAiCompatible,
             label: "Original".to_owned(),
             group_label: "default".to_owned(),
+            priority: 0,
             config_json: r#"{"base_url":"https://example.com"}"#.to_owned(),
             enabled: true,
             auth_state: AccountAuthState::Active,
@@ -2541,6 +2559,7 @@ mod tests {
             provider: ProviderKind::Codex,
             label: "Codex Main".to_owned(),
             group_label: "default".to_owned(),
+            priority: 0,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {
@@ -2602,6 +2621,7 @@ mod tests {
             provider: ProviderKind::Grok,
             label: "Grok Models".to_owned(),
             group_label: "default".to_owned(),
+            priority: 0,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: provider_core::NewCredential {

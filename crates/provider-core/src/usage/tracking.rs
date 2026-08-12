@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ProviderKind, ProviderModelPricingRecord,
+    ProviderFailoverReason, ProviderKind, ProviderModelPricingRecord,
     usage::{RawUsageFields, UsageContractSnapshot},
 };
 
@@ -97,4 +97,11 @@ pub trait AttemptTracking: Send + Sync {
     /// which proves it received the request — from a transport failure, which
     /// proves only that the send was attempted.
     fn failed(&self, answered: bool);
+
+    /// The call failed with an explicit, reviewed reason that permits account
+    /// failover. Implementations that do not persist attempt audit can keep the
+    /// ordinary failure behavior.
+    fn failed_with_reason(&self, answered: bool, _failover_reason: ProviderFailoverReason) {
+        self.failed(answered);
+    }
 }

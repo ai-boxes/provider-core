@@ -33,6 +33,7 @@ pub struct DirectProviderAccountInput {
     pub kind: ProviderKind,
     pub label: String,
     pub group_label: String,
+    pub priority: u32,
     pub config_json: String,
     pub api_key: SecretString,
     pub visibility: ProviderVisibility,
@@ -42,6 +43,7 @@ pub struct CredentialProviderAccountInput {
     pub kind: ProviderKind,
     pub label: String,
     pub group_label: String,
+    pub priority: u32,
     pub credential_json: SecretString,
     pub visibility: ProviderVisibility,
 }
@@ -73,6 +75,7 @@ pub struct OAuthSessionSnapshot {
     pub account_id: AccountId,
     pub label: String,
     pub group_label: String,
+    pub priority: u32,
     pub status: OAuthSessionStatus,
     pub challenge: ProviderOAuthChallenge,
     pub error: Option<String>,
@@ -163,6 +166,7 @@ impl ProviderManager {
                 config_json: input.config_json,
                 api_key: input.api_key,
             },
+            input.priority,
             input.visibility,
             now,
         )
@@ -186,6 +190,7 @@ impl ProviderManager {
                 group_label,
                 credential_json: input.credential_json,
             },
+            input.priority,
             input.visibility,
             now,
         )
@@ -198,6 +203,7 @@ impl ProviderManager {
         kind: ProviderKind,
         label: String,
         group_label: String,
+        priority: u32,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
         if matches!(
@@ -231,6 +237,7 @@ impl ProviderManager {
             account_id: account_id.clone(),
             label: label.clone(),
             group_label: group_label.clone(),
+            priority,
             status: OAuthSessionStatus::Pending,
             challenge: started.challenge,
             error: None,
@@ -261,6 +268,7 @@ impl ProviderManager {
                                 group_label,
                                 credential_json,
                             },
+                            priority,
                             visibility,
                             unix_timestamp(),
                         )
@@ -376,6 +384,7 @@ impl ProviderManager {
         owner_user_id: &str,
         kind: ProviderKind,
         input: AccountProvisioningInput,
+        priority: u32,
         visibility: ProviderVisibility,
         now: i64,
     ) -> Result<CreatedProviderAccount, ProviderManagerError> {
@@ -387,6 +396,7 @@ impl ProviderManager {
             provider: prepared.provider,
             label: prepared.label,
             group_label: prepared.group_label,
+            priority,
             config_json: prepared.config_json,
             enabled: prepared.enabled,
             auth_state: AccountAuthState::Active,
@@ -436,7 +446,8 @@ impl ProviderManager {
             .control
             .prepare_account_update(current.provider, update)?;
         let reset_models = current.config_json != update.config_json;
-        if !reset_models {
+        let rebuild_runtime = reset_models || current.priority != update.priority;
+        if !rebuild_runtime {
             let access_changed = current.visibility != update.visibility;
             if !self
                 .repository
@@ -455,6 +466,7 @@ impl ProviderManager {
         let mut candidate = current.clone();
         candidate.label = update.label;
         candidate.group_label = update.group_label;
+        candidate.priority = update.priority;
         candidate.config_json = update.config_json;
         candidate.visibility = update.visibility;
         candidate.updated_at = update.updated_at;
@@ -491,6 +503,7 @@ impl ProviderManager {
         let mut candidate = current.clone();
         candidate.label = update.label;
         candidate.group_label = update.group_label;
+        candidate.priority = update.priority;
         candidate.config_json = update.config_json;
         candidate.visibility = update.visibility;
         candidate.updated_at = update.updated_at;
@@ -967,7 +980,13 @@ impl ProviderManager {
         };
         if stored.enabled {
             self.control
-                .install_account(stored.provider, account, models.clone(), stored.access())
+                .install_account(
+                    stored.provider,
+                    account,
+                    models.clone(),
+                    stored.access(),
+                    stored.priority,
+                )
                 .await;
         } else {
             self.control.remove_account(&stored.id).await;
@@ -1166,6 +1185,7 @@ fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
         provider: account.provider,
         label: account.label.clone(),
         group_label: account.group_label.clone(),
+        priority: account.priority,
         config_json: account.config_json.clone(),
         credential_kind: account.credential.kind,
         credential_revision: account.credential.revision,
@@ -1218,6 +1238,7 @@ mod tests {
                 account_id: AccountId::new("account").expect("account ID"),
                 label: "Grok".to_owned(),
                 group_label: "default".to_owned(),
+                priority: 0,
                 status: OAuthSessionStatus::Pending,
                 challenge: ProviderOAuthChallenge {
                     verification_uri: "https://example.com/device".to_owned(),

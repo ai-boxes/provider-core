@@ -142,6 +142,7 @@ pub trait ProviderControl: ProviderQuotaControl + Send + Sync {
         account: Arc<dyn ProviderAccount>,
         models: Vec<StoredProviderModel>,
         access: ProviderAccountAccess,
+        priority: u32,
     );
 
     fn update_account_access(&self, account_id: &AccountId, access: ProviderAccountAccess) -> bool;

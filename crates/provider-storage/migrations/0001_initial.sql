@@ -48,6 +48,7 @@ CREATE TABLE provider_accounts (
     group_label TEXT NOT NULL CHECK (
         length(trim(group_label)) > 0 AND length(group_label) <= 64
     ),
+    priority INTEGER NOT NULL DEFAULT 0 CHECK (priority >= 0),
     config_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(config_json)),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     auth_state TEXT NOT NULL DEFAULT 'active'
@@ -321,6 +322,17 @@ CREATE TABLE usage_attempts (
         )
     ),
     completed_at_ms INTEGER NOT NULL,
+    attempt_outcome TEXT CHECK (
+        attempt_outcome IS NULL OR attempt_outcome IN ('succeeded', 'failed', 'cancelled')
+    ),
+    failover_reason TEXT CHECK (
+        failover_reason IS NULL OR failover_reason IN (
+            'authentication_exhausted',
+            'quota_exhausted',
+            'rate_limited',
+            'preconnect_failure'
+        )
+    ),
     dispatch_evidence TEXT NOT NULL CHECK (
         dispatch_evidence IN ('not_invoked', 'dispatch_invoked', 'response_observed')
     ),
@@ -382,6 +394,7 @@ CREATE TABLE usage_attempts (
     cost_atoms INTEGER,
     cost_reasons_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(cost_reasons_json)),
     UNIQUE (logical_request_id, sequence),
+    CHECK (failover_reason IS NULL OR attempt_outcome = 'failed'),
     CHECK ((tracking_state = 'gap') = (tracking_gap_reason IS NOT NULL)),
     CHECK ((price_resolution = 'resolved') = (price_json IS NOT NULL)),
     CHECK ((cost_status = 'unavailable') = (cost_atoms IS NULL)),

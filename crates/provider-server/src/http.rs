@@ -325,14 +325,19 @@ async fn responses(
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::OpenAiResponses)?;
     let (payload, logical) =
         parse_tracked_payload(&state, &key, WireFormat::OpenAiResponses, &body).await?;
-    let request =
-        match proxy_request_from_payload(WireFormat::OpenAiResponses, &headers, body, payload) {
-            Ok(request) => request,
-            Err(error) => {
-                finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
-                return Err(error);
-            }
-        };
+    let request = match proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure);
+            return Err(error);
+        }
+    };
     proxy_prepared_stream(&state, &key, request, logical).await
 }
 
@@ -711,6 +716,15 @@ fn proxy_request_for_key_from_payload(
     key: &AuthenticatedApiKey,
 ) -> Result<ProxyRequest, HttpError> {
     let mut request = proxy_request_from_payload(protocol, headers, body, payload)?;
+    request.metadata.routing_scope = Some(key.key_id.to_string());
+    request.metadata.previous_response_id = serde_json::from_slice::<Value>(&request.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     if protocol == WireFormat::ClaudeMessages {
         let mut payload: Value = serde_json::from_slice(&request.payload)
             .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
@@ -1023,6 +1037,7 @@ mod tests {
                     provider: ProviderKind::OpenAiCompatible,
                     label: "seed".to_owned(),
                     group_label: group_label.to_owned(),
+                    priority: 0,
                     config_json: "{}".to_owned(),
                     enabled: true,
                     credential: NewCredential {
@@ -1232,12 +1247,15 @@ mod tests {
         expected_metadata.session_id = Some("session-1".to_owned());
         expected_metadata.thread_id = Some("thread:1".to_owned());
         expected_metadata.client_request_id = Some("request_1".to_owned());
+        expected_metadata.routing_scope = Some(created_key.summary.id.to_string());
+        let mut anthropic_metadata = RequestMetadata::default();
+        anthropic_metadata.routing_scope = Some(created_key.summary.id.to_string());
         assert_eq!(
             captured_metadata
                 .lock()
                 .expect("metadata capture lock")
                 .as_slice(),
-            [expected_metadata, RequestMetadata::default()]
+            [expected_metadata, anthropic_metadata]
         );
 
         let invalid_metadata = client

@@ -109,6 +109,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
             provider: ProviderKind::OpenAiCompatible,
             label,
             group_label,
+            priority: 0,
             config_json: config.to_json()?,
             enabled: true,
             credential: NewCredential {
@@ -212,11 +213,17 @@ impl ProviderAccount for OpenAiCompatibleAccount {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload)
             .bearer_auth(self.credentials.api_key.expose_secret());
-        let response = upstream.send().await.map_err(|_| {
-            ProviderError::new(
+        let response = upstream.send().await.map_err(|error| {
+            let provider_error = ProviderError::new(
                 ProviderErrorKind::Upstream,
                 "OpenAI-compatible upstream request failed",
-            )
+            );
+            if error.is_connect() {
+                provider_error
+                    .with_failover_reason(provider_core::ProviderFailoverReason::PreconnectFailure)
+            } else {
+                provider_error
+            }
         })?;
         let status = response.status();
         if !status.is_success() {
@@ -331,7 +338,12 @@ async fn status_error(operation: &str, response: reqwest::Response) -> ProviderE
             format!("{operation} returned HTTP {status} with an oversized error response")
         }
     };
-    ProviderError::new(kind, message).with_upstream_status(status.as_u16())
+    let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
+    match status.as_u16() {
+        402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
+        429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),
+        _ => error,
+    }
 }
 
 async fn read_error_detail(response: reqwest::Response) -> Result<Option<String>, ErrorBodyIssue> {

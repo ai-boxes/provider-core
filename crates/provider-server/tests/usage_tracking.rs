@@ -198,15 +198,19 @@ impl ProviderRouter for ChatLengthRouter {
     fn routes(
         &self,
         _user_id: &str,
+        _routing_scope: &str,
         model: &str,
         native_formats: &[WireFormat],
         _session_id: Option<&str>,
+        _previous_response_id: Option<&str>,
         _account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderRouteCandidate> {
         if model != "gpt-5.5" || !native_formats.contains(&WireFormat::OpenAiChatCompletions) {
             return Vec::new();
         }
         vec![ProviderRouteCandidate {
+            account_id: None,
+            priority: 0,
             upstream_model: model.to_owned(),
             input_modalities: None,
             responses_lite: false,
@@ -356,6 +360,7 @@ async fn deployment_with_pricing(
                 kind: ProviderKind::Codex,
                 label: "Codex".to_owned(),
                 group_label: "default".to_owned(),
+                priority: 0,
                 credential_json: SecretString::from(
                     json!({
                         "type": "codex",

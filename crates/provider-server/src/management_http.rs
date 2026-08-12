@@ -159,6 +159,7 @@ async fn create_account(
             label,
             group_label,
             credential_json,
+            priority,
             visibility,
         } => {
             state
@@ -169,6 +170,7 @@ async fn create_account(
                         kind: provider,
                         label,
                         group_label,
+                        priority: priority.unwrap_or(0),
                         credential_json: SecretString::from(json_document(credential_json)),
                         visibility: visibility.unwrap_or_default(),
                     },
@@ -182,6 +184,7 @@ async fn create_account(
             group_label,
             base_url,
             api_key,
+            priority,
             visibility,
         } => {
             state
@@ -192,6 +195,7 @@ async fn create_account(
                         kind: provider,
                         label,
                         group_label,
+                        priority: priority.unwrap_or(0),
                         config_json: json!({ "base_url": base_url }).to_string(),
                         api_key: SecretString::from(api_key),
                         visibility: visibility.unwrap_or_default(),
@@ -217,16 +221,18 @@ async fn update_account(
         group_label,
         base_url,
         visibility,
+        priority,
         api_key,
     } = request;
     if label.is_none()
         && group_label.is_none()
         && base_url.is_none()
         && visibility.is_none()
+        && priority.is_none()
         && api_key.is_none()
     {
         return Err(ApiError::invalid_request(
-            "account update requires label, group_label, base_url, visibility, or api_key",
+            "account update requires label, group_label, base_url, visibility, priority, or api_key",
         ));
     }
     let account_id = parse_account_id(&account_id)?;
@@ -263,8 +269,11 @@ async fn update_account(
             })
         })
         .transpose()?;
-    let metadata_requested =
-        label.is_some() || group_label.is_some() || base_url.is_some() || visibility.is_some();
+    let metadata_requested = label.is_some()
+        || group_label.is_some()
+        || base_url.is_some()
+        || visibility.is_some()
+        || priority.is_some();
     let metadata = if metadata_requested {
         let label = label.unwrap_or_else(|| current.label.clone());
         let group_label = group_label.unwrap_or_else(|| current.group_label.clone());
@@ -280,6 +289,7 @@ async fn update_account(
         Some(ProviderAccountUpdate {
             label,
             group_label,
+            priority: priority.unwrap_or(current.priority),
             config_json,
             visibility: visibility.unwrap_or(current.visibility),
             updated_at: unix_timestamp(),
@@ -464,6 +474,7 @@ async fn start_oauth_session(
             request.provider,
             request.label,
             request.group_label,
+            request.priority.unwrap_or(0),
             request.visibility.unwrap_or_default(),
         )
         .await?;
@@ -512,6 +523,7 @@ enum CreateAccountRequest {
         label: String,
         group_label: String,
         credential_json: Value,
+        priority: Option<u32>,
         visibility: Option<ProviderVisibility>,
     },
     Direct {
@@ -520,6 +532,7 @@ enum CreateAccountRequest {
         group_label: String,
         base_url: String,
         api_key: String,
+        priority: Option<u32>,
         visibility: Option<ProviderVisibility>,
     },
 }
@@ -531,6 +544,7 @@ struct UpdateAccountRequest {
     group_label: Option<String>,
     base_url: Option<String>,
     visibility: Option<ProviderVisibility>,
+    priority: Option<u32>,
     api_key: Option<String>,
 }
 
@@ -716,6 +730,7 @@ struct StartOAuthRequest {
     provider: ProviderKind,
     label: String,
     group_label: String,
+    priority: Option<u32>,
     visibility: Option<ProviderVisibility>,
 }
 
@@ -734,6 +749,7 @@ fn account_json(account: &ProviderAccountSummary) -> Value {
         "provider": account.provider.as_str(),
         "label": account.label,
         "group_label": account.group_label,
+        "priority": account.priority,
         "config": serde_json::from_str::<Value>(&account.config_json)
             .expect("stored provider config must be valid JSON"),
         "credential_kind": account.credential_kind.as_str(),
@@ -839,6 +855,7 @@ fn oauth_session_json(session: &OAuthSessionSnapshot) -> Value {
         "account_id": session.account_id.as_str(),
         "label": session.label,
         "group_label": session.group_label,
+        "priority": session.priority,
         "status": status,
         "challenge": {
             "verification_uri": session.challenge.verification_uri,
@@ -1424,6 +1441,7 @@ mod tests {
                     kind: ProviderKind::Grok,
                     label: "shared Grok".to_owned(),
                     group_label: "default".to_owned(),
+                    priority: 0,
                     credential_json,
                     visibility: provider_core::ProviderVisibility::Shared,
                 },

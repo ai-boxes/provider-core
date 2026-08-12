@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use provider_core::{
-    ProviderKind, ProviderModelPricingRecord,
+    ProviderFailoverReason, ProviderKind, ProviderModelPricingRecord,
     usage::{
         AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
         RequestTracking, UsageContractSnapshot, normalize_usage,
@@ -32,8 +32,8 @@ use crate::{
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
     price::{InlinePriceRecord, ModelInlinePriceRecordV2, PriceResolution},
     repository::{
-        AttemptFacts, LogicalRequestStart, LogicalRequestTerminal, LogicalWriteOutcome,
-        UsageRepository,
+        AttemptFacts, AttemptFailoverReason, AttemptOutcome, LogicalRequestStart,
+        LogicalRequestTerminal, LogicalWriteOutcome, UsageRepository,
     },
     writer::{
         QuotaLedgerPermit, QuotaLedgerReceipt, QuotaLedgerWriter, UsageFact, UsageWrite,
@@ -245,6 +245,8 @@ impl LogicalTracker {
                 first_token_at_ms: None,
                 tracking: TrackingState::Complete,
                 success_terminal: false,
+                outcome: None,
+                failover_reason: None,
                 closed: false,
             }),
         })
@@ -390,6 +392,8 @@ struct AttemptState {
     tracking: TrackingState,
     /// Whether the upstream stream reached its documented successful terminal.
     success_terminal: bool,
+    outcome: Option<AttemptOutcome>,
+    failover_reason: Option<AttemptFailoverReason>,
     closed: bool,
 }
 
@@ -459,6 +463,7 @@ impl AttemptTracker {
                     reason: TrackingGapReason::AmbiguousCancel,
                 };
             }
+            state.outcome = Some(AttemptOutcome::Cancelled);
         }
         self.close();
     }
@@ -528,6 +533,14 @@ impl AttemptTracker {
                 started_at_ms: self.started_at_ms,
                 first_token_at_ms: state.first_token_at_ms,
                 completed_at_ms: (self.logical.now_ms)(),
+                outcome: Some(state.outcome.unwrap_or_else(|| {
+                    if state.success_terminal {
+                        AttemptOutcome::Succeeded
+                    } else {
+                        AttemptOutcome::Failed
+                    }
+                })),
+                failover_reason: state.failover_reason,
                 dispatch_evidence: state.evidence,
                 tracking: state.tracking,
                 contract: self.spec.contract,
@@ -576,6 +589,7 @@ impl Drop for AttemptTracker {
                 state.tracking = TrackingState::Gap {
                     reason: TrackingGapReason::AmbiguousCancel,
                 };
+                state.outcome = Some(AttemptOutcome::Cancelled);
                 true
             }
         };
@@ -661,13 +675,39 @@ impl AttemptTracking for AttemptTracker {
     }
 
     fn failed(&self, answered: bool) {
+        self.fail(answered, None);
+    }
+
+    fn failed_with_reason(&self, answered: bool, failover_reason: ProviderFailoverReason) {
+        self.fail(answered, Some(failover_reason));
+    }
+}
+
+impl AttemptTracker {
+    fn fail(&self, answered: bool, failover_reason: Option<ProviderFailoverReason>) {
         self.advance(if answered {
             DispatchEvidence::ResponseObserved
         } else {
             // The send was attempted, but nothing proves the provider received it.
             DispatchEvidence::DispatchInvoked
         });
+        {
+            let mut state = self.lock();
+            state.outcome = Some(AttemptOutcome::Failed);
+            state.failover_reason = failover_reason.map(map_failover_reason);
+        }
         self.close();
+    }
+}
+
+const fn map_failover_reason(reason: ProviderFailoverReason) -> AttemptFailoverReason {
+    match reason {
+        ProviderFailoverReason::AuthenticationExhausted => {
+            AttemptFailoverReason::AuthenticationExhausted
+        }
+        ProviderFailoverReason::QuotaExhausted => AttemptFailoverReason::QuotaExhausted,
+        ProviderFailoverReason::RateLimited => AttemptFailoverReason::RateLimited,
+        ProviderFailoverReason::PreconnectFailure => AttemptFailoverReason::PreconnectFailure,
     }
 }
 
@@ -1019,6 +1059,10 @@ mod tests {
         assert_eq!(attempts.len(), 2, "a refresh retry is a second attempt");
         assert_eq!(attempts[0].sequence, AttemptSequence(1));
         assert_eq!(attempts[1].sequence, AttemptSequence(2));
+        assert_eq!(attempts[0].outcome, Some(AttemptOutcome::Failed));
+        assert_eq!(attempts[0].failover_reason, None);
+        assert_eq!(attempts[1].outcome, Some(AttemptOutcome::Succeeded));
+        assert_eq!(attempts[1].failover_reason, None);
         let terminal = &harness.repository.terminals()[0];
         assert_eq!(
             terminal.final_attempt_id.as_deref(),
@@ -1035,6 +1079,71 @@ mod tests {
             attempts[0].dispatch_evidence,
             DispatchEvidence::ResponseObserved,
             "a failure status still proves the provider answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_failover_reasons_are_persisted_on_failed_attempts() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-failover-reasons"))
+            .await;
+        let cases = [
+            (
+                ProviderFailoverReason::AuthenticationExhausted,
+                AttemptFailoverReason::AuthenticationExhausted,
+            ),
+            (
+                ProviderFailoverReason::QuotaExhausted,
+                AttemptFailoverReason::QuotaExhausted,
+            ),
+            (
+                ProviderFailoverReason::RateLimited,
+                AttemptFailoverReason::RateLimited,
+            ),
+            (
+                ProviderFailoverReason::PreconnectFailure,
+                AttemptFailoverReason::PreconnectFailure,
+            ),
+        ];
+
+        for (provider_reason, _) in cases {
+            logical
+                .open_attempt(spec(priced()))
+                .failed_with_reason(false, provider_reason);
+        }
+        logical.finish();
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+
+        let attempts = harness.repository.attempts();
+        for (attempt, (_, expected_reason)) in attempts.iter().zip(cases) {
+            assert_eq!(attempt.outcome, Some(AttemptOutcome::Failed));
+            assert_eq!(attempt.failover_reason, Some(expected_reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_persists_cancelled_without_failover_reason() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-cancelled-attempt"))
+            .await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.cancelled(Some(codex_usage()));
+        logical.finish();
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+
+        let facts = &harness.repository.attempts()[0];
+        assert_eq!(facts.outcome, Some(AttemptOutcome::Cancelled));
+        assert_eq!(facts.failover_reason, None);
+        assert_eq!(
+            facts.tracking,
+            TrackingState::Gap {
+                reason: TrackingGapReason::AmbiguousCancel
+            }
         );
     }
 

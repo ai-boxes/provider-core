@@ -11,6 +11,11 @@ pub struct RequestMetadata {
     pub thread_id: Option<String>,
     pub client_request_id: Option<String>,
     pub responses_lite: bool,
+    /// Internal caller scope used for routing state. It is never forwarded as a
+    /// credential and is derived from the authenticated API key ID.
+    pub routing_scope: Option<String>,
+    /// Parsed request linkage used to prevent unsafe cross-account replay.
+    pub previous_response_id: Option<String>,
 }
 
 /// Provider-neutral request envelope that preserves the source JSON payload.

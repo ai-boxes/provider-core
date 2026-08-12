@@ -299,7 +299,7 @@ impl ProviderRuntime {
         let first_request = request.clone();
 
         match self
-            .execute_attempt(&entry, first_request, pricing, tracking)
+            .execute_attempt(&entry, first_request, pricing, tracking, None)
             .await
         {
             Err(error) if error.upstream_status() == Some(401) => {
@@ -311,8 +311,22 @@ impl ProviderRuntime {
                 // A failed refresh is not a model call, so it must not invent a
                 // second attempt.
                 refresh.map_err(refresh_provider_error)?;
-                self.execute_attempt(&entry, request, pricing, tracking)
+                match self
+                    .execute_attempt(
+                        &entry,
+                        request,
+                        pricing,
+                        tracking,
+                        Some(provider_core::ProviderFailoverReason::AuthenticationExhausted),
+                    )
                     .await
+                {
+                    Err(error) if error.upstream_status() == Some(401) => Err(error
+                        .with_failover_reason(
+                            provider_core::ProviderFailoverReason::AuthenticationExhausted,
+                        )),
+                    result => result,
+                }
             }
             result => result,
         }
@@ -329,6 +343,7 @@ impl ProviderRuntime {
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
+        unauthorized_failover_reason: Option<provider_core::ProviderFailoverReason>,
     ) -> Result<ProviderStream, ProviderError> {
         let format = request.format;
         let attempt =
@@ -357,7 +372,12 @@ impl ProviderRuntime {
                 Ok(observe_usage(stream, attempt, format))
             }
             Err(error) => {
-                attempt.failed(error.upstream_status().is_some());
+                let failover_reason = attempt_failover_reason(&error, unauthorized_failover_reason);
+                if let Some(reason) = failover_reason {
+                    attempt.failed_with_reason(error.upstream_status().is_some(), reason);
+                } else {
+                    attempt.failed(error.upstream_status().is_some());
+                }
                 Err(error)
             }
         }
@@ -418,6 +438,17 @@ impl ProviderRuntime {
     async fn account_entry(&self, account_id: &AccountId) -> Option<Arc<AccountEntry>> {
         self.inner.accounts.read().await.get(account_id).cloned()
     }
+}
+
+fn attempt_failover_reason(
+    error: &ProviderError,
+    unauthorized_failover_reason: Option<provider_core::ProviderFailoverReason>,
+) -> Option<provider_core::ProviderFailoverReason> {
+    error.failover_reason().or_else(|| {
+        (error.upstream_status() == Some(401))
+            .then_some(unauthorized_failover_reason)
+            .flatten()
+    })
 }
 
 impl Drop for RuntimeInner {
@@ -847,6 +878,39 @@ mod tests {
                 credential_revision,
             })
         }
+    }
+
+    #[test]
+    fn explicit_failover_reason_wins_for_attempt_audit() {
+        let error = ProviderError::new(ProviderErrorKind::RateLimited, "limited")
+            .with_upstream_status(429)
+            .with_failover_reason(provider_core::ProviderFailoverReason::RateLimited);
+
+        assert_eq!(
+            attempt_failover_reason(
+                &error,
+                Some(provider_core::ProviderFailoverReason::AuthenticationExhausted),
+            ),
+            Some(provider_core::ProviderFailoverReason::RateLimited)
+        );
+    }
+
+    #[test]
+    fn only_retry_exhausting_unauthorized_gets_implicit_auth_failover() {
+        let unauthorized = ProviderError::new(ProviderErrorKind::Authentication, "unauthorized")
+            .with_upstream_status(401);
+        let ordinary =
+            ProviderError::new(ProviderErrorKind::Upstream, "failed").with_upstream_status(500);
+
+        assert_eq!(attempt_failover_reason(&unauthorized, None), None);
+        assert_eq!(attempt_failover_reason(&ordinary, None), None);
+        assert_eq!(
+            attempt_failover_reason(
+                &unauthorized,
+                Some(provider_core::ProviderFailoverReason::AuthenticationExhausted),
+            ),
+            Some(provider_core::ProviderFailoverReason::AuthenticationExhausted)
+        );
     }
 
     #[tokio::test]

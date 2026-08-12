@@ -91,11 +91,15 @@ impl CodexClient {
                 ),
                 observed_groups: Vec::new(),
             })?
-            .map_err(|_| CodexClientFailure {
-                error: ProviderError::new(
-                    ProviderErrorKind::Upstream,
-                    "Codex upstream request failed",
-                ),
+            .map_err(|error| CodexClientFailure {
+                error: if error.is_connect() {
+                    ProviderError::new(ProviderErrorKind::Upstream, "Codex upstream request failed")
+                        .with_failover_reason(
+                            provider_core::ProviderFailoverReason::PreconnectFailure,
+                        )
+                } else {
+                    ProviderError::new(ProviderErrorKind::Upstream, "Codex upstream request failed")
+                },
                 observed_groups: Vec::new(),
             })?;
         let status = response.status();
@@ -176,7 +180,14 @@ async fn status_error(response: reqwest::Response, status: StatusCode) -> Provid
             format!("Codex upstream returned HTTP {status} with an oversized error response")
         }
     };
-    ProviderError::new(kind, message).with_upstream_status(status.as_u16())
+    let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited)
+    } else if status == StatusCode::PAYMENT_REQUIRED || rate_limited {
+        error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted)
+    } else {
+        error
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -406,6 +417,10 @@ mod tests {
         };
         assert_eq!(failure.error.kind(), ProviderErrorKind::RateLimited);
         assert_eq!(failure.error.upstream_status(), Some(429));
+        assert_eq!(
+            failure.error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::RateLimited)
+        );
         assert_eq!(failure.observed_groups.len(), 1);
         assert_eq!(failure.observed_groups[0].key, "codex");
     }
