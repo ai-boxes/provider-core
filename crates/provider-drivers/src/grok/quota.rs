@@ -148,7 +148,7 @@ struct UsagePeriod {
 #[serde(rename_all = "camelCase")]
 struct ProductUsage {
     product: String,
-    usage_percent: f64,
+    usage_percent: Option<f64>,
 }
 
 fn normalize_billing(
@@ -280,6 +280,7 @@ fn normalize_product_usage(
     usage: &ProductUsage,
     warnings: &mut Vec<String>,
 ) -> Option<QuotaBreakdown> {
+    let usage_percent = usage.usage_percent?;
     let (key, label) = match usage.product.trim() {
         "GrokBuild" => ("grok_build", "GrokBuild"),
         "GrokChat" => ("grok_chat", "GrokChat"),
@@ -292,7 +293,7 @@ fn normalize_product_usage(
         key: key.to_owned(),
         label: label.to_owned(),
         used: QuotaAmount::Decimal(normalized_percent(
-            usage.usage_percent,
+            usage_percent,
             "product_usage_percent_clamped",
             warnings,
         )),
@@ -362,11 +363,23 @@ async fn response_json<T: for<'de> Deserialize<'de>>(
                 format!("{operation} response was too large"),
             ),
         })?;
-    serde_json::from_slice(&body).map_err(|_| {
-        ProviderQuotaError::new(
-            ProviderQuotaErrorKind::InvalidResponse,
-            format!("{operation} returned invalid JSON"),
-        )
+    serde_json::from_slice(&body).map_err(|error| {
+        let detail = match error.classify() {
+            serde_json::error::Category::Data => format!(
+                "{operation} returned unexpected data at line {}, column {}",
+                error.line(),
+                error.column()
+            ),
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => format!(
+                "{operation} returned invalid JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ),
+            serde_json::error::Category::Io => {
+                format!("failed to decode {operation} response")
+            }
+        };
+        ProviderQuotaError::new(ProviderQuotaErrorKind::InvalidResponse, detail)
     })
 }
 
@@ -540,5 +553,20 @@ mod tests {
             snapshot.groups[0].metrics[0].used,
             Some(QuotaAmount::Decimal(75.0))
         );
+    }
+
+    #[test]
+    fn product_without_usage_percent_is_ignored() {
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/billing_current.json"))
+                .expect("current fixture");
+        response["config"]["productUsage"]
+            .as_array_mut()
+            .expect("product usage")
+            .push(serde_json::json!({"product": "GrokCode"}));
+        let response: BillingResponse = serde_json::from_value(response).expect("billing response");
+        let snapshot = normalize_billing("grok-main", response).expect("normalized quota");
+
+        assert_eq!(snapshot.groups[0].metrics[0].breakdown.len(), 2);
     }
 }
