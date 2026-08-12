@@ -501,7 +501,7 @@ async fn quota_ledger_records_observed_cost_above_reservation_and_keeps_writer_r
 }
 
 #[tokio::test]
-async fn quota_ledger_settles_exact_keeps_dispatched_unknown_and_releases_undispatched() {
+async fn quota_ledger_settles_exact_and_releases_unknown_costs() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
     insert_reservation(&repository, "req-unknown", "key-1", "100").await;
@@ -564,7 +564,7 @@ async fn quota_ledger_settles_exact_keeps_dispatched_unknown_and_releases_undisp
         vec![
             ("settled".to_owned(), Some("40".to_owned())),
             ("released".to_owned(), None),
-            ("reserved".to_owned(), None),
+            ("released".to_owned(), None),
         ]
     );
 }
@@ -799,7 +799,77 @@ async fn startup_recovery_settles_complete_dispatched_attempts() {
 }
 
 #[tokio::test]
-async fn startup_recovery_keeps_dispatched_claim_without_complete_cost_reserved() {
+async fn startup_recovery_sums_complete_attempts_ignores_partial_and_is_idempotent() {
+    let repository = repository().await;
+    insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+    repository
+        .begin_quota_request(&start("req-recover-mixed"))
+        .await
+        .expect("begin quota request");
+    mark_dispatched(&repository, "req-recover-mixed").await;
+
+    for (attempt_id, sequence, atoms, status) in [
+        (
+            "att-complete-1",
+            1,
+            40,
+            CostStatus::CompleteForObservedCatalogComponents,
+        ),
+        ("att-partial", 2, 500, CostStatus::Partial),
+        (
+            "att-complete-2",
+            3,
+            30,
+            CostStatus::CompleteForObservedCatalogComponents,
+        ),
+    ] {
+        let mut facts = attempt("req-recover-mixed", attempt_id, sequence);
+        facts.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(atoms),
+            status,
+            reasons: if status == CostStatus::Partial {
+                vec![CostReason::UnmodeledBillableComponent]
+            } else {
+                Vec::new()
+            },
+            calculator_version: 1,
+        };
+        repository
+            .record_attempt(&facts)
+            .await
+            .expect("record mixed recovery attempt");
+    }
+
+    assert_eq!(
+        repository
+            .recover_quota_reservations(100)
+            .await
+            .expect("recover mixed attempts"),
+        1
+    );
+    assert_eq!(
+        repository
+            .recover_quota_reservations(200)
+            .await
+            .expect("repeat mixed recovery"),
+        0
+    );
+    let ledger: (String, Option<String>) =
+        sqlx::query_as("SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = ?")
+            .bind("req-recover-mixed")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("load recovered mixed ledger");
+    assert_eq!(ledger, ("settled".to_owned(), Some("70".to_owned())));
+    let spent: String = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load recovered mixed spend");
+    assert_eq!(spent, "70");
+}
+
+#[tokio::test]
+async fn startup_recovery_releases_dispatched_claim_without_complete_cost() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
     repository
@@ -812,16 +882,16 @@ async fn startup_recovery_keeps_dispatched_claim_without_complete_cost_reserved(
         repository
             .recover_quota_reservations(100)
             .await
-            .expect("keep incomplete dispatched reservation unresolved"),
-        0
+            .expect("release incomplete dispatched reservation"),
+        1
     );
     let state: String = sqlx::query_scalar(
         "SELECT state FROM api_key_quota_ledger WHERE entry_id = 'req-recover-unknown'",
     )
     .fetch_one(&repository.pool)
     .await
-    .expect("load unresolved ledger");
-    assert_eq!(state, "reserved");
+    .expect("load recovered ledger");
+    assert_eq!(state, "released");
 }
 
 #[tokio::test]

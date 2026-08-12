@@ -547,7 +547,7 @@ impl UsageRepository for SqliteUsageRepository {
                 .await
                 .map_err(|error| usage_error("failed to settle quota reservation", error))?;
                 add_api_key_spend(&mut connection, &entry.api_key_id, settled_atoms).await?;
-            } else if !entry.dispatched {
+            } else {
                 sqlx::query(
                     r#"
                     UPDATE api_key_quota_ledger
@@ -589,80 +589,72 @@ impl UsageRepository for SqliteUsageRepository {
             .await
             .map_err(|error| usage_error("failed to start quota recovery transaction", error))?;
         let result = async {
-        let rows = sqlx::query(
-            r#"
-            SELECT entry_id, api_key_id, dispatched_at_ms
-            FROM api_key_quota_ledger
-            WHERE state = 'reserved'
-            ORDER BY entry_id
-            "#,
-        )
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| usage_error("failed to load unresolved quota reservations", error))?;
-            let mut recovered = 0_u64;
-        for row in rows {
-            let entry_id: String = row
-                .try_get("entry_id")
-                .map_err(|error| usage_error("failed to decode recovered quota entry", error))?;
-            let api_key_id: String = row
-                .try_get("api_key_id")
-                .map_err(|error| usage_error("failed to decode recovered quota key", error))?;
-            let dispatched_at_ms: Option<i64> = row
-                .try_get("dispatched_at_ms")
-                .map_err(|error| usage_error("failed to decode recovered dispatch marker", error))?;
-            if dispatched_at_ms.is_none() {
-                sqlx::query(
-                    "UPDATE api_key_quota_ledger SET state = 'released', resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
-                )
-                .bind(now_ms)
-                .bind(&entry_id)
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| usage_error("failed to release undispatched quota claim", error))?;
-                recovered = recovered
-                    .checked_add(1)
-                    .ok_or_else(|| UsageRepositoryError::new("too many quota claims to recover"))?;
-                continue;
-            }
-
-            let costs: Vec<i64> = sqlx::query_scalar(
+            let rows = sqlx::query(
                 r#"
-                SELECT cost_atoms
-                FROM usage_attempts
-                WHERE logical_request_id = ?
-                  AND cost_status = 'complete_for_observed_catalog_components'
-                ORDER BY sequence
+                SELECT entry_id, api_key_id
+                FROM api_key_quota_ledger
+                WHERE state = 'reserved'
+                ORDER BY entry_id
                 "#,
             )
-            .bind(&entry_id)
             .fetch_all(&mut *connection)
             .await
-            .map_err(|error| usage_error("failed to load recovered attempt costs", error))?;
-            if costs.is_empty() {
-                continue;
+            .map_err(|error| usage_error("failed to load unresolved quota reservations", error))?;
+            let mut recovered = 0_u64;
+            for row in rows {
+                let entry_id: String = row.try_get("entry_id").map_err(|error| {
+                    usage_error("failed to decode recovered quota entry", error)
+                })?;
+                let api_key_id: String = row.try_get("api_key_id").map_err(|error| {
+                    usage_error("failed to decode recovered quota key", error)
+                })?;
+                let costs: Vec<i64> = sqlx::query_scalar(
+                    r#"
+                    SELECT cost_atoms
+                    FROM usage_attempts
+                    WHERE logical_request_id = ?
+                      AND cost_status = 'complete_for_observed_catalog_components'
+                    ORDER BY sequence
+                    "#,
+                )
+                .bind(&entry_id)
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(|error| usage_error("failed to load recovered attempt costs", error))?;
+                if costs.is_empty() {
+                    sqlx::query(
+                        "UPDATE api_key_quota_ledger SET state = 'released', settled_atoms = NULL, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
+                    )
+                    .bind(now_ms)
+                    .bind(&entry_id)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| usage_error("failed to release recovered quota claim", error))?;
+                } else {
+                    let mut settled_atoms = "0".to_owned();
+                    for cost in costs {
+                        settled_atoms = add_atoms(&settled_atoms, &cost.to_string()).map_err(|_| {
+                            UsageRepositoryError::new("recovered quota spend overflowed")
+                        })?;
+                    }
+                    sqlx::query(
+                        "UPDATE api_key_quota_ledger SET state = 'settled', settled_atoms = ?, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
+                    )
+                    .bind(&settled_atoms)
+                    .bind(now_ms)
+                    .bind(&entry_id)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| usage_error("failed to settle recovered quota claim", error))?;
+                    add_api_key_spend(&mut connection, &api_key_id, &settled_atoms).await?;
+                }
+                recovered = recovered.checked_add(1).ok_or_else(|| {
+                    UsageRepositoryError::new("too many quota claims to recover")
+                })?;
             }
-            let mut settled_atoms = "0".to_owned();
-            for cost in costs {
-                settled_atoms = add_atoms(&settled_atoms, &cost.to_string())
-                    .map_err(|_| UsageRepositoryError::new("recovered quota spend overflowed"))?;
-            }
-            sqlx::query(
-                "UPDATE api_key_quota_ledger SET state = 'settled', settled_atoms = ?, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
-            )
-            .bind(&settled_atoms)
-            .bind(now_ms)
-            .bind(&entry_id)
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to settle recovered quota claim", error))?;
-            add_api_key_spend(&mut connection, &api_key_id, &settled_atoms).await?;
-            recovered = recovered
-                .checked_add(1)
-                .ok_or_else(|| UsageRepositoryError::new("too many quota claims to recover"))?;
+            Ok(recovered)
         }
-        Ok(recovered)
-        }.await;
+        .await;
         match result {
             Ok(recovered) => {
                 sqlx::query("COMMIT")

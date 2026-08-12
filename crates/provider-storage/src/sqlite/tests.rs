@@ -1105,7 +1105,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
             .admit_api_key_quota(&key_id)
             .await
             .expect("ambiguous claim admission"),
-        QuotaAdmissionOutcome::Exceeded
+        QuotaAdmissionOutcome::Admitted
     );
 }
 
