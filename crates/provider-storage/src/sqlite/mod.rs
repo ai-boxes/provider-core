@@ -10,7 +10,7 @@ use provider_auth::{
     ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey,
     NewRegistrationCode, NewSession, NewUser, QuotaAdmissionOutcome, RegisterUserOutcome,
     SessionId, StoredApiKey, StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserRole,
-    UserSummary, atoms_ge,
+    UserSummary, UserUpdateOutcome, atoms_ge,
 };
 #[cfg(test)]
 use provider_core::ProviderModelPricingTier;

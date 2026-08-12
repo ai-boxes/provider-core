@@ -296,18 +296,55 @@ impl AuthRepository for SqliteAccountRepository {
         user_id: &UserId,
         enabled: bool,
         updated_at: i64,
-    ) -> Result<bool, AuthRepositoryError> {
+    ) -> Result<UserUpdateOutcome, AuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(|error| {
             auth_repository_error("failed to start user status transaction", error)
         })?;
-        let result = sqlx::query("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?")
-            .bind(database_bool(enabled))
-            .bind(updated_at)
-            .bind(user_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| auth_repository_error("failed to update user status", error))?;
-        if result.rows_affected() > 0 && !enabled {
+        let result = sqlx::query(
+            r#"
+            UPDATE users
+            SET enabled = ?, updated_at = ?
+            WHERE id = ?
+              AND (
+                  ? = 1
+                  OR role != 'super_admin'
+                  OR enabled = 0
+                  OR EXISTS (
+                      SELECT 1
+                      FROM users AS other
+                      WHERE other.id != users.id
+                        AND other.role = 'super_admin'
+                        AND other.enabled = 1
+                  )
+              )
+            "#,
+        )
+        .bind(database_bool(enabled))
+        .bind(updated_at)
+        .bind(user_id.as_str())
+        .bind(database_bool(enabled))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to update user status", error))?;
+        if result.rows_affected() == 0 {
+            let exists =
+                sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
+                    .bind(user_id.as_str())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        auth_repository_error("failed to check user status target", error)
+                    })?;
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back rejected user status update", error)
+            })?;
+            return Ok(if exists == 0 {
+                UserUpdateOutcome::NotFound
+            } else {
+                UserUpdateOutcome::LastEnabledSuperAdmin
+            });
+        }
+        if !enabled {
             sqlx::query(
                 "UPDATE user_sessions SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL",
             )
@@ -329,7 +366,77 @@ impl AuthRepository for SqliteAccountRepository {
         transaction.commit().await.map_err(|error| {
             auth_repository_error("failed to commit user status transaction", error)
         })?;
-        Ok(result.rows_affected() > 0)
+        Ok(UserUpdateOutcome::Updated)
+    }
+
+    async fn set_user_role(
+        &self,
+        user_id: &UserId,
+        role: UserRole,
+        updated_at: i64,
+    ) -> Result<UserUpdateOutcome, AuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            auth_repository_error("failed to start user role transaction", error)
+        })?;
+        let result = sqlx::query(
+            r#"
+            UPDATE users
+            SET role = ?, updated_at = ?
+            WHERE id = ?
+              AND role != ?
+              AND (
+                  role != 'super_admin'
+                  OR enabled = 0
+                  OR ? = 'super_admin'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM users AS other
+                      WHERE other.id != users.id
+                        AND other.role = 'super_admin'
+                        AND other.enabled = 1
+                  )
+              )
+            "#,
+        )
+        .bind(role.as_str())
+        .bind(updated_at)
+        .bind(user_id.as_str())
+        .bind(role.as_str())
+        .bind(role.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to update user role", error))?;
+        if result.rows_affected() == 0 {
+            let current_role =
+                sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = ?")
+                    .bind(user_id.as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        auth_repository_error("failed to check user role target", error)
+                    })?;
+            transaction.rollback().await.map_err(|error| {
+                auth_repository_error("failed to roll back rejected user role update", error)
+            })?;
+            return Ok(match current_role.as_deref() {
+                None => UserUpdateOutcome::NotFound,
+                Some(current) if current == role.as_str() => UserUpdateOutcome::Updated,
+                Some(_) => UserUpdateOutcome::LastEnabledSuperAdmin,
+            });
+        }
+        sqlx::query(
+            "UPDATE user_sessions SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(user_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to revoke role-updated sessions", error))?;
+        transaction.commit().await.map_err(|error| {
+            auth_repository_error("failed to commit user role transaction", error)
+        })?;
+        Ok(UserUpdateOutcome::Updated)
     }
 
     async fn reset_user_password(

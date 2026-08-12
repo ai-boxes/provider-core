@@ -19,7 +19,7 @@ use axum::{
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthError, AuthService,
     AuthenticatedSession, CreateApiKeyInput, CreatedApiKey, CreatedRegistrationCode,
-    CredentialError, SessionGrant, UserId, UserSummary,
+    CredentialError, SessionGrant, UserId, UserRole, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
@@ -74,6 +74,7 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/registration-codes", post(create_registration_code))
         .route("/api/v1/users/{user_id}", put(update_user))
+        .route("/api/v1/users/{user_id}/role", put(update_user_role))
         .route("/api/v1/users/{user_id}/password", put(reset_user_password))
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route(
@@ -303,6 +304,25 @@ async fn reset_user_password(
     Ok(data(user_json(&user)))
 }
 
+async fn update_user_role(
+    State(state): State<AuthHttpState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(user_id): Path<String>,
+    request: Result<Json<UpdateUserRoleRequest>, JsonRejection>,
+) -> Result<Json<Value>, AuthApiError> {
+    let request = json_request(request)?;
+    let user = state
+        .auth
+        .set_user_role(
+            &session.user,
+            &parse_user_id(&user_id)?,
+            request.role,
+            unix_timestamp(),
+        )
+        .await?;
+    Ok(data(user_json(&user)))
+}
+
 async fn list_keys(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -450,6 +470,12 @@ struct RegisterUserRequest {
 #[serde(deny_unknown_fields)]
 struct UpdateUserRequest {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateUserRoleRequest {
+    role: UserRole,
 }
 
 #[derive(Deserialize)]
@@ -832,6 +858,11 @@ impl From<AuthError> for AuthApiError {
             | AuthError::InvalidApiKey => Self::unauthorized(),
             AuthError::Forbidden => Self::forbidden(),
             AuthError::NotFound => Self::not_found(),
+            AuthError::LastEnabledSuperAdmin => Self {
+                status: StatusCode::CONFLICT,
+                error_type: "conflict_error",
+                message: "the last enabled super_admin cannot be demoted or disabled",
+            },
             AuthError::InvalidRegistrationCode => {
                 Self::invalid_request("invitation code is invalid or expired")
             }

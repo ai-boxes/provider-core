@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     ApiKeyId, NewApiKey, NewRegistrationCode, NewSession, NewUser, SessionId, StoredApiKey,
-    StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserSummary,
+    StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserRole, UserSummary,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +17,13 @@ pub enum RegisterUserOutcome {
     Created,
     InvalidCode,
     Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserUpdateOutcome {
+    Updated,
+    NotFound,
+    LastEnabledSuperAdmin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,7 +78,14 @@ pub trait AuthRepository: Send + Sync {
         user_id: &UserId,
         enabled: bool,
         updated_at: i64,
-    ) -> Result<bool, AuthRepositoryError>;
+    ) -> Result<UserUpdateOutcome, AuthRepositoryError>;
+
+    async fn set_user_role(
+        &self,
+        user_id: &UserId,
+        role: UserRole,
+        updated_at: i64,
+    ) -> Result<UserUpdateOutcome, AuthRepositoryError>;
 
     async fn reset_user_password(
         &self,

@@ -918,7 +918,7 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
                 id: user_id.clone(),
                 username: "admin".to_owned(),
                 password_hash: "password-hash".to_owned(),
-                role: UserRole::SuperAdmin,
+                role: UserRole::User,
                 enabled: true,
                 created_at: 100,
             },
@@ -940,11 +940,12 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
     .await
     .expect("create API key");
 
-    assert!(
+    assert_eq!(
         repository
             .set_user_enabled(&user_id, false, 200)
             .await
-            .expect("disable user")
+            .expect("disable user"),
+        UserUpdateOutcome::Updated
     );
     let state = sqlx::query(
         r#"
@@ -969,11 +970,12 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
         0
     );
 
-    assert!(
+    assert_eq!(
         repository
             .set_user_enabled(&user_id, true, 300)
             .await
-            .expect("re-enable user")
+            .expect("re-enable user"),
+        UserUpdateOutcome::Updated
     );
     let key_enabled =
         sqlx::query_scalar::<_, i64>("SELECT enabled FROM api_keys WHERE id = 'disabled-user-key'")
@@ -981,6 +983,160 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
             .await
             .expect("load API key state");
     assert_eq!(key_enabled, 0);
+}
+
+#[tokio::test]
+async fn role_updates_revoke_sessions_and_preserve_the_last_enabled_super_admin() {
+    let repository = SqliteAccountRepository::in_memory()
+        .await
+        .expect("in-memory repository");
+    let first_id = UserId::new("first-role-admin").expect("user ID");
+    repository
+        .create_initial_user(
+            NewUser {
+                id: first_id.clone(),
+                username: "first-role-admin".to_owned(),
+                password_hash: "password-hash".to_owned(),
+                role: UserRole::SuperAdmin,
+                enabled: true,
+                created_at: 100,
+            },
+            test_session("first-role-session", first_id.clone(), 31),
+        )
+        .await
+        .expect("create initial user");
+    assert_eq!(
+        repository
+            .set_user_role(&first_id, UserRole::User, 200)
+            .await
+            .expect("protect last super admin"),
+        UserUpdateOutcome::LastEnabledSuperAdmin
+    );
+
+    let second_id = UserId::new("second-role-user").expect("user ID");
+    repository
+        .create_user(NewUser {
+            id: second_id.clone(),
+            username: "second-role-user".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::User,
+            enabled: true,
+            created_at: 201,
+        })
+        .await
+        .expect("create user");
+    repository
+        .create_session(test_session("second-role-session", second_id.clone(), 32))
+        .await
+        .expect("create user session");
+    sqlx::query(
+        "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('role-update-key', ?, 'group', 'key', 'pode-role-update-key', 1, '0', 201, 201)",
+    )
+    .bind(second_id.as_str())
+    .execute(&repository.pool)
+    .await
+    .expect("create user API key");
+    assert_eq!(
+        repository
+            .set_user_role(&second_id, UserRole::SuperAdmin, 202)
+            .await
+            .expect("promote user"),
+        UserUpdateOutcome::Updated
+    );
+    let session_revoked_at = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT revoked_at FROM user_sessions WHERE user_id = ?",
+    )
+    .bind(second_id.as_str())
+    .fetch_one(&repository.pool)
+    .await
+    .expect("load promoted user session");
+    assert_eq!(session_revoked_at, Some(202));
+    let key_enabled =
+        sqlx::query_scalar::<_, i64>("SELECT enabled FROM api_keys WHERE id = 'role-update-key'")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("load promoted user API key");
+    assert_eq!(key_enabled, 1);
+    assert_eq!(
+        repository
+            .set_user_role(&first_id, UserRole::User, 203)
+            .await
+            .expect("demote one of multiple super admins"),
+        UserUpdateOutcome::Updated
+    );
+}
+
+#[tokio::test]
+async fn concurrent_super_admin_updates_preserve_one_enabled_super_admin() {
+    let path = std::env::temp_dir().join(format!(
+        "provider-core-super-admin-race-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    let repository = SqliteAccountRepository::connect(&path, [0x5a; 32])
+        .await
+        .expect("file repository");
+    let first_id = UserId::new("race-first").expect("user ID");
+    repository
+        .create_initial_user(
+            NewUser {
+                id: first_id.clone(),
+                username: "race-first".to_owned(),
+                password_hash: "password-hash".to_owned(),
+                role: UserRole::SuperAdmin,
+                enabled: true,
+                created_at: 100,
+            },
+            test_session("race-first-session", first_id.clone(), 41),
+        )
+        .await
+        .expect("create first super admin");
+    let second_id = UserId::new("race-second").expect("user ID");
+    repository
+        .create_user(NewUser {
+            id: second_id.clone(),
+            username: "race-second".to_owned(),
+            password_hash: "password-hash".to_owned(),
+            role: UserRole::SuperAdmin,
+            enabled: true,
+            created_at: 101,
+        })
+        .await
+        .expect("create second super admin");
+
+    let first_update = repository.set_user_role(&first_id, UserRole::User, 200);
+    let second_update = repository.set_user_enabled(&second_id, false, 200);
+    let (first_outcome, second_outcome) = tokio::join!(first_update, second_update);
+    let outcomes = [
+        first_outcome.expect("first update"),
+        second_outcome.expect("second update"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserUpdateOutcome::Updated)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserUpdateOutcome::LastEnabledSuperAdmin)
+            .count(),
+        1
+    );
+    let enabled_super_admins = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE role = 'super_admin' AND enabled = 1",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("count enabled super admins");
+    assert_eq!(enabled_super_admins, 1);
+    drop(repository);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

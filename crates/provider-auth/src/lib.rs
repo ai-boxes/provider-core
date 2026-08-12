@@ -21,7 +21,7 @@ pub use model::{
 };
 pub use repository::{
     AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, QuotaAdmissionOutcome,
-    RegisterUserOutcome,
+    RegisterUserOutcome, UserUpdateOutcome,
 };
 pub use service::{
     ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedApiKey, AuthenticatedSession,
