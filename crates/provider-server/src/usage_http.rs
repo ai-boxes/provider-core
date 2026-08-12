@@ -519,6 +519,8 @@ mod tests {
         let cost = compute_observed_catalog_cost(&observation, &contract, &price);
 
         AttemptFacts {
+            outcome: None,
+            failover_reason: None,
             attempt_id: "attempt-2".to_owned(),
             logical_request_id: "request-1".to_owned(),
             sequence: AttemptSequence(2),

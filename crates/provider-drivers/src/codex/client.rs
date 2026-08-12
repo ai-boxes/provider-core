@@ -91,11 +91,15 @@ impl CodexClient {
                 ),
                 observed_groups: Vec::new(),
             })?
-            .map_err(|_| CodexClientFailure {
-                error: ProviderError::new(
-                    ProviderErrorKind::Upstream,
-                    "Codex upstream request failed",
-                ),
+            .map_err(|error| CodexClientFailure {
+                error: if error.is_connect() {
+                    ProviderError::new(ProviderErrorKind::Upstream, "Codex upstream request failed")
+                        .with_failover_reason(
+                            provider_core::ProviderFailoverReason::PreconnectFailure,
+                        )
+                } else {
+                    ProviderError::new(ProviderErrorKind::Upstream, "Codex upstream request failed")
+                },
                 observed_groups: Vec::new(),
             })?;
         let status = response.status();
@@ -150,13 +154,11 @@ async fn status_error(response: reqwest::Response, status: StatusCode) -> Provid
         Ok(body) => (reviewed_error_token(&body), None),
         Err(issue) => (None, Some(issue)),
     };
-    let rate_limited = error_token.as_deref().is_some_and(|token| {
-        token.contains("rate_limit")
-            || token.contains("usage_limit")
-            || token.contains("credits_depleted")
-            || token.contains("quota")
-    });
-    let kind = if rate_limited || status == StatusCode::TOO_MANY_REQUESTS {
+    let quota_token = error_token
+        .as_deref()
+        .is_some_and(is_quota_exhaustion_token);
+    let quota_exhausted = is_quota_exhaustion_status(status, quota_token);
+    let kind = if quota_exhausted || status == StatusCode::TOO_MANY_REQUESTS {
         ProviderErrorKind::RateLimited
     } else {
         match status {
@@ -176,7 +178,30 @@ async fn status_error(response: reqwest::Response, status: StatusCode) -> Provid
             format!("Codex upstream returned HTTP {status} with an oversized error response")
         }
     };
-    ProviderError::new(kind, message).with_upstream_status(status.as_u16())
+    let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited)
+    } else if quota_exhausted {
+        error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted)
+    } else {
+        error
+    }
+}
+
+fn is_quota_exhaustion_token(token: &str) -> bool {
+    matches!(
+        token,
+        "usage_limit_reached"
+            | "credits_depleted"
+            | "workspace_member_credits_depleted"
+            | "insufficient_quota"
+            | "quota_exhausted"
+    )
+}
+
+fn is_quota_exhaustion_status(status: StatusCode, quota_token: bool) -> bool {
+    status == StatusCode::PAYMENT_REQUIRED
+        || (matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN) && quota_token)
 }
 
 #[derive(Clone, Copy)]
@@ -406,8 +431,54 @@ mod tests {
         };
         assert_eq!(failure.error.kind(), ProviderErrorKind::RateLimited);
         assert_eq!(failure.error.upstream_status(), Some(429));
+        assert_eq!(
+            failure.error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::RateLimited)
+        );
         assert_eq!(failure.observed_groups.len(), 1);
         assert_eq!(failure.observed_groups[0].key, "codex");
+    }
+
+    #[test]
+    fn quota_failover_tokens_use_an_exact_allowlist() {
+        for token in [
+            "usage_limit_reached",
+            "credits_depleted",
+            "workspace_member_credits_depleted",
+            "insufficient_quota",
+            "quota_exhausted",
+        ] {
+            assert!(is_quota_exhaustion_token(token));
+        }
+        for token in [
+            "quota_parameter_invalid",
+            "rate_limit_configuration_error",
+            "usage_limit_unknown",
+            "credits_depleted_later",
+        ] {
+            assert!(!is_quota_exhaustion_token(token));
+        }
+    }
+
+    #[test]
+    fn quota_tokens_never_override_ambiguous_or_server_statuses() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(!is_quota_exhaustion_status(status, true));
+        }
+        assert!(is_quota_exhaustion_status(
+            StatusCode::PAYMENT_REQUIRED,
+            false
+        ));
+        assert!(is_quota_exhaustion_status(StatusCode::BAD_REQUEST, true));
+        assert!(is_quota_exhaustion_status(StatusCode::FORBIDDEN, true));
+        assert!(!is_quota_exhaustion_status(StatusCode::UNAUTHORIZED, true));
+        assert!(!is_quota_exhaustion_status(StatusCode::NOT_FOUND, true));
     }
 
     fn credentials(account_id: &str, is_fedramp: bool, access_token: &str) -> CodexCredentials {

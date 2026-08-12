@@ -56,6 +56,7 @@ async fn stores_only_v1_ciphertext_and_fails_closed_with_the_wrong_key() {
                     provider: provider_core::ProviderKind::OpenAiCompatible,
                     label: "Encrypted".to_owned(),
                     group_label: "default".to_owned(),
+                    priority: 0,
                     config_json: r#"{"base_url":"https://api.example.com/v1"}"#.to_owned(),
                     enabled: true,
                     auth_state: AccountAuthState::Active,

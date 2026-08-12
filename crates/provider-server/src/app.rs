@@ -113,6 +113,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         let account_id = account.id.clone();
         let kind = account.provider;
         let access = account.access();
+        let priority = account.priority;
         let account = match runtime.build_account(account) {
             Ok(account) => account,
             Err(error) => {
@@ -131,19 +132,22 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
-        runtime.install_account(kind, account, models, access).await;
+        runtime
+            .install_account(kind, account, models, access, priority)
+            .await;
     }
 
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
     let auth = AuthService::new(repository.clone());
 
-    // Usage facts share the accounts database. A prior run's unresolved quota
-    // reservations are released because no terminal cost can be invented.
+    // Usage facts share the accounts database. Recovery releases claims that
+    // never reached an upstream and settles dispatched claims conservatively
+    // when their exact cost was lost during a crash.
     let recovered_quota = usage_repository
         .recover_quota_reservations(system_clock_ms())
         .await?;
     if recovered_quota > 0 {
-        eprintln!("released {recovered_quota} unresolved quota reservation(s)");
+        eprintln!("recovered {recovered_quota} unresolved quota claim(s)");
     }
     let recovered = usage_repository
         .recover_in_flight_requests(unix_timestamp() * 1000)

@@ -69,10 +69,16 @@ impl GrokClient {
         .body(payload);
 
         let response = request.send().await.map_err(|error| {
-            ProviderError::new(
+            let provider_error = ProviderError::new(
                 ProviderErrorKind::Upstream,
                 format!("Grok upstream request failed: {error}"),
-            )
+            );
+            if error.is_connect() {
+                provider_error
+                    .with_failover_reason(provider_core::ProviderFailoverReason::PreconnectFailure)
+            } else {
+                provider_error
+            }
         })?;
 
         let status = response.status();
@@ -109,8 +115,17 @@ fn status_error(status: StatusCode) -> ProviderError {
         _ => ProviderErrorKind::Upstream,
     };
 
-    ProviderError::new(kind, format!("Grok upstream returned HTTP {status}"))
-        .with_upstream_status(status.as_u16())
+    let error = ProviderError::new(kind, format!("Grok upstream returned HTTP {status}"))
+        .with_upstream_status(status.as_u16());
+    match status {
+        StatusCode::PAYMENT_REQUIRED => {
+            error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted)
+        }
+        StatusCode::TOO_MANY_REQUESTS => {
+            error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited)
+        }
+        _ => error,
+    }
 }
 
 #[cfg(test)]

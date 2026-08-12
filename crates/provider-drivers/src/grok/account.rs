@@ -236,6 +236,7 @@ impl ManagedProviderDriver for GrokDriver {
             provider: ProviderKind::Grok,
             label,
             group_label,
+            priority: 0,
             config_json: "{}".to_owned(),
             enabled: true,
             credential: NewCredential {
