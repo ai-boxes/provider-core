@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use provider_auth::add_atoms;
+use provider_auth::{add_atoms, atoms_ge};
 use provider_core::usage::BillableObservation;
 use provider_usage::{
     AttemptFacts, AttemptOutcome, CostStatus, DispatchEvidence, LogicalRequestStart,
@@ -77,6 +77,41 @@ async fn add_api_key_spend(
             .map_err(|error| usage_error("failed to update API key spend", error))?;
     }
     Ok(())
+}
+
+fn remaining_atoms(limit: &str, spent: &str) -> Result<String, UsageRepositoryError> {
+    if atoms_ge(spent, limit)
+        .map_err(|_| UsageRepositoryError::new("invalid recovered quota value"))?
+    {
+        return Ok("0".to_owned());
+    }
+
+    let limit = limit.as_bytes().iter().rev();
+    let mut spent = spent.as_bytes().iter().rev();
+    let mut borrow = 0_i16;
+    let mut digits = Vec::new();
+    for limit_digit in limit {
+        let mut digit = i16::from(*limit_digit - b'0') - borrow;
+        if let Some(spent_digit) = spent.next() {
+            digit -= i16::from(*spent_digit - b'0');
+        }
+        if digit < 0 {
+            digit += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        digits.push((digit as u8) + b'0');
+    }
+    if borrow != 0 || spent.next().is_some() {
+        return Err(UsageRepositoryError::new("invalid recovered quota value"));
+    }
+    while digits.len() > 1 && digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    digits.reverse();
+    String::from_utf8(digits)
+        .map_err(|_| UsageRepositoryError::new("invalid recovered quota value"))
 }
 
 #[async_trait]
@@ -591,7 +626,7 @@ impl UsageRepository for SqliteUsageRepository {
         let result = async {
             let rows = sqlx::query(
                 r#"
-                SELECT entry_id, api_key_id
+                SELECT entry_id, api_key_id, dispatched_at_ms
                 FROM api_key_quota_ledger
                 WHERE state = 'reserved'
                 ORDER BY entry_id
@@ -608,6 +643,9 @@ impl UsageRepository for SqliteUsageRepository {
                 let api_key_id: String = row.try_get("api_key_id").map_err(|error| {
                     usage_error("failed to decode recovered quota key", error)
                 })?;
+                let dispatched_at_ms: Option<i64> = row.try_get("dispatched_at_ms").map_err(|error| {
+                    usage_error("failed to decode recovered quota dispatch", error)
+                })?;
                 let costs: Vec<i64> = sqlx::query_scalar(
                     r#"
                     SELECT cost_atoms
@@ -621,7 +659,8 @@ impl UsageRepository for SqliteUsageRepository {
                 .fetch_all(&mut *connection)
                 .await
                 .map_err(|error| usage_error("failed to load recovered attempt costs", error))?;
-                if costs.is_empty() {
+                let has_complete_cost = !costs.is_empty();
+                if !has_complete_cost && dispatched_at_ms.is_none() {
                     sqlx::query(
                         "UPDATE api_key_quota_ledger SET state = 'released', settled_atoms = NULL, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
                     )
@@ -636,6 +675,20 @@ impl UsageRepository for SqliteUsageRepository {
                         settled_atoms = add_atoms(&settled_atoms, &cost.to_string()).map_err(|_| {
                             UsageRepositoryError::new("recovered quota spend overflowed")
                         })?;
+                    }
+                    if !has_complete_cost && dispatched_at_ms.is_some() {
+                        let quota: Option<(Option<String>, String)> = sqlx::query_as(
+                            "SELECT quota_limit_atoms, spent_atoms FROM api_keys WHERE id = ?",
+                        )
+                        .bind(&api_key_id)
+                        .fetch_optional(&mut *connection)
+                        .await
+                        .map_err(|error| {
+                            usage_error("failed to load recovered quota limit", error)
+                        })?;
+                        if let Some((Some(limit), spent)) = quota {
+                            settled_atoms = remaining_atoms(&limit, &spent)?;
+                        }
                     }
                     sqlx::query(
                         "UPDATE api_key_quota_ledger SET state = 'settled', settled_atoms = ?, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",

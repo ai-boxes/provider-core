@@ -115,7 +115,7 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
     }
 
     let migration_1 = &MIGRATOR.migrations[0];
-    let migration_3 = &MIGRATOR.migrations[2];
+    let bundled_migrations = [&MIGRATOR.migrations[1], &MIGRATOR.migrations[2]];
     let mut connection = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *connection)
@@ -125,19 +125,21 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
             .bind(migration_1.checksum.as_ref())
             .execute(&mut *connection)
             .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO _sqlx_migrations (
-                version, description, success, checksum, execution_time
-            ) VALUES (?, ?, 1, ?, 0)
-            ON CONFLICT (version) DO NOTHING
-            "#,
-        )
-        .bind(migration_3.version)
-        .bind(migration_3.description.as_ref())
-        .bind(migration_3.checksum.as_ref())
-        .execute(&mut *connection)
-        .await?;
+        for migration in bundled_migrations {
+            sqlx::query(
+                r#"
+                INSERT INTO _sqlx_migrations (
+                    version, description, success, checksum, execution_time
+                ) VALUES (?, ?, 1, ?, 0)
+                ON CONFLICT (version) DO NOTHING
+                "#,
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&mut *connection)
+            .await?;
+        }
         Ok::<(), sqlx::Error>(())
     }
     .await;

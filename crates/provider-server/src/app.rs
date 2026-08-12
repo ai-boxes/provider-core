@@ -140,9 +140,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
     let auth = AuthService::new(repository.clone());
 
-    // Usage facts share the accounts database. Recovery settles claims when
-    // durable complete attempt costs exist and releases claims without complete
-    // costs so uncertain requests do not freeze the affected key.
+    // Usage facts share the accounts database. Recovery releases claims that
+    // never reached an upstream and settles dispatched claims conservatively
+    // when their exact cost was lost during a crash.
     let recovered_quota = usage_repository
         .recover_quota_reservations(system_clock_ms())
         .await?;

@@ -869,9 +869,13 @@ async fn startup_recovery_sums_complete_attempts_ignores_partial_and_is_idempote
 }
 
 #[tokio::test]
-async fn startup_recovery_releases_dispatched_claim_without_complete_cost() {
+async fn startup_recovery_exhausts_key_for_dispatched_claim_without_complete_cost() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+    sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = 'key-1'")
+        .execute(&repository.pool)
+        .await
+        .expect("seed existing spend");
     repository
         .begin_quota_request(&start("req-recover-unknown"))
         .await
@@ -882,16 +886,122 @@ async fn startup_recovery_releases_dispatched_claim_without_complete_cost() {
         repository
             .recover_quota_reservations(100)
             .await
-            .expect("release incomplete dispatched reservation"),
+            .expect("settle incomplete dispatched reservation conservatively"),
         1
     );
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM api_key_quota_ledger WHERE entry_id = 'req-recover-unknown'",
+    let ledger: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = 'req-recover-unknown'",
     )
     .fetch_one(&repository.pool)
     .await
     .expect("load recovered ledger");
-    assert_eq!(state, "released");
+    assert_eq!(
+        ledger,
+        ("settled".to_owned(), Some("9999999999999900".to_owned()))
+    );
+    let spent: String = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load conservatively recovered spend");
+    assert_eq!(spent, "9999999999999999");
+}
+
+#[tokio::test]
+async fn startup_recovery_keeps_a_complete_zero_cost_exact() {
+    let repository = repository().await;
+    insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
+    repository
+        .begin_quota_request(&start("req-recover-zero"))
+        .await
+        .expect("begin quota request");
+    mark_dispatched(&repository, "req-recover-zero").await;
+
+    let mut facts = attempt("req-recover-zero", "att-recover-zero", 1);
+    facts.cost = ObservedCatalogCost {
+        total_known: UsdAtoms::ZERO,
+        status: CostStatus::CompleteForObservedCatalogComponents,
+        reasons: Vec::new(),
+        calculator_version: 1,
+    };
+    repository
+        .record_attempt(&facts)
+        .await
+        .expect("record zero-cost attempt");
+
+    assert_eq!(
+        repository
+            .recover_quota_reservations(100)
+            .await
+            .expect("recover exact zero cost"),
+        1
+    );
+    let ledger: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = 'req-recover-zero'",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("load zero-cost ledger");
+    assert_eq!(ledger, ("settled".to_owned(), Some("0".to_owned())));
+}
+
+#[tokio::test]
+async fn startup_recovery_settles_missing_key_dispatch_without_blocking_startup() {
+    let repository = repository().await;
+    insert_api_key(&repository, "key-1", Some("100")).await;
+    repository
+        .begin_quota_request(&start("req-deleted-key"))
+        .await
+        .expect("begin quota request");
+    mark_dispatched(&repository, "req-deleted-key").await;
+    sqlx::query("DELETE FROM api_keys WHERE id = 'key-1'")
+        .execute(&repository.pool)
+        .await
+        .expect("delete API key after dispatch");
+
+    assert_eq!(
+        repository
+            .recover_quota_reservations(100)
+            .await
+            .expect("recover deleted key claim"),
+        1
+    );
+    let ledger: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = 'req-deleted-key'",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("load deleted key ledger");
+    assert_eq!(ledger, ("settled".to_owned(), Some("0".to_owned())));
+}
+
+#[tokio::test]
+async fn startup_recovery_settles_now_unlimited_key_without_blocking_startup() {
+    let repository = repository().await;
+    insert_api_key(&repository, "key-1", Some("100")).await;
+    repository
+        .begin_quota_request(&start("req-unlimited-key"))
+        .await
+        .expect("begin quota request");
+    mark_dispatched(&repository, "req-unlimited-key").await;
+    sqlx::query("UPDATE api_keys SET quota_limit_atoms = NULL WHERE id = 'key-1'")
+        .execute(&repository.pool)
+        .await
+        .expect("remove quota after dispatch");
+
+    assert_eq!(
+        repository
+            .recover_quota_reservations(100)
+            .await
+            .expect("recover unlimited key claim"),
+        1
+    );
+    let ledger: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, settled_atoms FROM api_key_quota_ledger WHERE entry_id = 'req-unlimited-key'",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("load unlimited key ledger");
+    assert_eq!(ledger, ("settled".to_owned(), Some("0".to_owned())));
 }
 
 #[tokio::test]

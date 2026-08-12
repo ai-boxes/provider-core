@@ -152,7 +152,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .execute(&mut connection)
         .await
         .expect("restore bundled migration checksum");
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (3, 4)")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (2, 3, 4)")
         .execute(&mut connection)
         .await
         .expect("restore bundled migration versions");
