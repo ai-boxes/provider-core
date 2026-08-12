@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -6,7 +8,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -26,9 +28,12 @@ use provider_usage::{
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tower::{ServiceExt, service_fn, util::BoxCloneSyncService};
+use tower_http::services::{ServeDir, ServeFile};
 
 const CLAUDE_MODEL_PREFIX: &str = "claude-fable-5-dd-";
 const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
+const PUBLIC_DIR: &str = "/app/public";
 pub(crate) const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_MANAGEMENT_BODY_BYTES: usize = 1024 * 1024;
 
@@ -99,6 +104,7 @@ fn router_with_usage_and_readiness(
             usage,
             proxy_readiness,
         })
+        .fallback_service(ui_service(PUBLIC_DIR))
 }
 
 pub fn router_with_management(
@@ -198,6 +204,78 @@ pub(crate) async fn reject_compressed_request(request: Request, next: Next) -> R
 
 async fn liveness() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Serve compiled UI assets and fall back to `index.html` for browser routes.
+fn ui_service(
+    public_dir: impl AsRef<Path>,
+) -> BoxCloneSyncService<Request<Body>, Response, Infallible> {
+    let public_dir = public_dir.as_ref();
+    let files = ServeDir::new(public_dir);
+    let index = public_dir.join("index.html");
+    BoxCloneSyncService::new(service_fn(move |request| {
+        serve_ui(request, files.clone(), index.clone())
+    }))
+}
+
+async fn serve_ui(
+    request: Request<Body>,
+    files: ServeDir,
+    index: PathBuf,
+) -> Result<Response, Infallible> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD)
+        || is_backend_path(request.uri().path())
+    {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+
+    let accepts_html = accepts_html(request.headers());
+    let method = request.method().clone();
+    let response = into_axum_response(files.oneshot(request).await);
+    if response.status() != StatusCode::NOT_FOUND || !accepts_html {
+        return Ok(response);
+    }
+
+    let request = Request::builder()
+        .method(method)
+        .uri("/")
+        .body(Body::empty())
+        .expect("static fallback request is valid");
+    Ok(into_axum_response(
+        ServeFile::new(index).oneshot(request).await,
+    ))
+}
+
+fn into_axum_response<T>(response: Result<T, Infallible>) -> Response
+where
+    T: IntoResponse,
+{
+    response
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|never| match never {})
+}
+
+fn is_backend_path(path: &str) -> bool {
+    ["/api", "/v1", "/healthz", "/livez", "/readyz"]
+        .iter()
+        .any(|prefix| {
+            path == *prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+}
+
+fn accepts_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .filter_map(|media_type| media_type.split(';').next())
+                .any(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+        })
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
@@ -993,9 +1071,12 @@ impl IntoResponse for HttpError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use axum::body::to_bytes;
     use futures_util::stream;
     use provider_auth::{ApiKeyId, AuthService, UserId};
     use provider_core::{
@@ -1009,6 +1090,117 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    struct TestPublicDir(PathBuf);
+
+    impl TestPublicDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("provider-core-ui-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).expect("create UI test directory");
+            fs::write(path.join("index.html"), "<main>provider ui</main>").expect("write UI index");
+            fs::write(path.join("app.js"), "console.log('provider ui')").expect("write UI asset");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestPublicDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        String::from_utf8(body.to_vec()).expect("response UTF-8")
+    }
+
+    #[tokio::test]
+    async fn serves_ui_assets_and_browser_routes() {
+        let public = TestPublicDir::new();
+        let service = ui_service(&public.0);
+
+        let asset = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .expect("asset request"),
+            )
+            .await
+            .expect("infallible asset response");
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(response_text(asset).await, "console.log('provider ui')");
+
+        let browser_route = service
+            .oneshot(
+                Request::builder()
+                    .uri("/providers/account-1")
+                    .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                    .body(Body::empty())
+                    .expect("browser route request"),
+            )
+            .await
+            .expect("infallible browser route response");
+        assert_eq!(browser_route.status(), StatusCode::OK);
+        assert_eq!(
+            response_text(browser_route).await,
+            "<main>provider ui</main>"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_backend_and_non_browser_misses_as_not_found() {
+        let public = TestPublicDir::new();
+        let service = ui_service(&public.0);
+
+        for uri in ["/api/v1/missing", "/v1/missing", "/readyz/missing"] {
+            let response = service
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::ACCEPT, "text/html")
+                        .body(Body::empty())
+                        .expect("backend request"),
+                )
+                .await
+                .expect("infallible backend response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .uri("/missing.json")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .expect("non-browser request"),
+            )
+            .await
+            .expect("infallible non-browser response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn missing_ui_directory_stays_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("provider-core-missing-ui-{}", uuid::Uuid::new_v4()));
+        let response = ui_service(missing)
+            .oneshot(
+                Request::builder()
+                    .uri("/providers")
+                    .header(header::ACCEPT, "text/html; charset=utf-8")
+                    .body(Body::empty())
+                    .expect("browser request"),
+            )
+            .await
+            .expect("infallible missing UI response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 
     async fn seed_group_label(
         repository: Arc<SqliteAccountRepository>,
