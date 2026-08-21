@@ -66,12 +66,15 @@ impl SqliteAccountRepository {
         ))
         .map_err(|error| repository_error("failed to parse test SQLite URI", error))?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
         // Migrate on the writer first and keep it open so the shared-memory DB
         // survives while the read pool attaches.
         let write = SqliteWriter::connect(options.clone())
             .await
-            .map_err(|error| repository_error("failed to open test SQLite write connection", error))?;
+            .map_err(|error| {
+                repository_error("failed to open test SQLite write connection", error)
+            })?;
         {
             let mut connection = write.lock().await;
             MIGRATOR

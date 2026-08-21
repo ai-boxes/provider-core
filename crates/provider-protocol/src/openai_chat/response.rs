@@ -343,7 +343,9 @@ impl ChatEventConverter {
             "stop"
         };
         output.push(self.chunk(serde_json::json!({}), Some(finish_reason)));
-        if self.include_usage && let Some(usage) = response.get("usage") {
+        if self.include_usage
+            && let Some(usage) = response.get("usage")
+        {
             output.push(sse_data(serde_json::json!({
                 "id": self.id(),
                 "object":"chat.completion.chunk",

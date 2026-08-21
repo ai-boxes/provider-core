@@ -59,9 +59,10 @@ impl AccountRepository for SqliteAccountRepository {
             .credential_cipher
             .encrypt(account_id, &update.credential_json)?;
 
-        let mut transaction = self.write.begin().await.map_err(|error| {
-            repository_error("failed to start credential transaction", error)
-        })?;
+        let mut transaction =
+            self.write.begin().await.map_err(|error| {
+                repository_error("failed to start credential transaction", error)
+            })?;
         let result = async {
             let result = sqlx::query(
                 r#"
@@ -113,10 +114,9 @@ impl AccountRepository for SqliteAccountRepository {
         .await;
         match result {
             Ok(outcome @ CredentialWriteOutcome::Updated { .. }) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| repository_error("failed to commit credential update", error))?;
+                transaction.commit().await.map_err(|error| {
+                    repository_error("failed to commit credential update", error)
+                })?;
                 Ok(outcome)
             }
             Ok(outcome) => {

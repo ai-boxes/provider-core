@@ -48,9 +48,7 @@ impl<'a> WriteTransaction<'a> {
     async fn begin(writer: &'a SqliteWriter) -> Result<Self, sqlx::Error> {
         let mut guard = writer.connection.lock().await;
         reclaim(&mut guard).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *guard)
-            .await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *guard).await?;
         Ok(Self {
             connection: Arc::clone(&writer.connection),
             guard: Some(guard),

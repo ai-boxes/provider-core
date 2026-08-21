@@ -80,22 +80,29 @@ fn rejects_invalid_include_usage() {
 
 #[test]
 fn reads_include_usage_only_when_explicitly_enabled() {
-    assert!(!include_usage(serde_json::json!({}).as_object().unwrap()).unwrap());
+    assert!(
+        !include_usage(
+            serde_json::json!({})
+                .as_object()
+                .expect("empty JSON object")
+        )
+        .expect("include_usage")
+    );
     assert!(
         !include_usage(
             serde_json::json!({"stream_options":{"include_usage":false}})
                 .as_object()
-                .unwrap()
+                .expect("false stream options object")
         )
-        .unwrap()
+        .expect("include_usage")
     );
     assert!(
         include_usage(
             serde_json::json!({"stream_options":{"include_usage":true}})
                 .as_object()
-                .unwrap()
+                .expect("true stream options object")
         )
-        .unwrap()
+        .expect("include_usage")
     );
 }
 

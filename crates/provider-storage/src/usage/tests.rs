@@ -550,12 +550,11 @@ async fn concurrent_quota_request_starts_serialize_without_database_lock_errors(
         "exclusive writer must not surface database lock errors: {failures:?}"
     );
 
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM api_key_quota_ledger WHERE api_key_id = 'key-1'",
-    )
-    .fetch_one(&repository.pool)
-    .await
-    .expect("count claims");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_key_quota_ledger WHERE api_key_id = 'key-1'")
+            .fetch_one(&repository.pool)
+            .await
+            .expect("count claims");
     assert_eq!(count, 32);
 }
 

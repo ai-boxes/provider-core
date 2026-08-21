@@ -92,6 +92,17 @@ enum OAuthSessionTarget {
     Reauthenticate,
 }
 
+struct OAuthSessionStart {
+    owner_user_id: String,
+    kind: ProviderKind,
+    label: String,
+    group_label: String,
+    priority: u32,
+    visibility: ProviderVisibility,
+    account_id: AccountId,
+    target: OAuthSessionTarget,
+}
+
 #[derive(Clone)]
 struct QuotaCacheEntry {
     credential_revision: u64,
@@ -212,16 +223,16 @@ impl ProviderManager {
         priority: u32,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
-        self.start_oauth_session_for_target(
-            owner_user_id,
+        self.start_oauth_session_for_target(OAuthSessionStart {
+            owner_user_id: owner_user_id.to_owned(),
             kind,
             label,
             group_label,
             priority,
             visibility,
-            generated_account_id(),
-            OAuthSessionTarget::Create,
-        )
+            account_id: generated_account_id(),
+            target: OAuthSessionTarget::Create,
+        })
         .await
     }
 
@@ -239,30 +250,33 @@ impl ProviderManager {
             ));
         }
 
-        self.start_oauth_session_for_target(
-            owner_user_id,
-            current.provider,
-            current.label,
-            current.group_label,
-            current.priority,
-            current.visibility,
-            account_id.clone(),
-            OAuthSessionTarget::Reauthenticate,
-        )
+        self.start_oauth_session_for_target(OAuthSessionStart {
+            owner_user_id: owner_user_id.to_owned(),
+            kind: current.provider,
+            label: current.label,
+            group_label: current.group_label,
+            priority: current.priority,
+            visibility: current.visibility,
+            account_id: account_id.clone(),
+            target: OAuthSessionTarget::Reauthenticate,
+        })
         .await
     }
 
     async fn start_oauth_session_for_target(
         &self,
-        owner_user_id: &str,
-        kind: ProviderKind,
-        label: String,
-        group_label: String,
-        priority: u32,
-        visibility: ProviderVisibility,
-        account_id: AccountId,
-        target: OAuthSessionTarget,
+        input: OAuthSessionStart,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        let OAuthSessionStart {
+            owner_user_id,
+            kind,
+            label,
+            group_label,
+            priority,
+            visibility,
+            account_id,
+            target,
+        } = input;
         if matches!(
             kind,
             ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible
@@ -284,7 +298,6 @@ impl ProviderManager {
             .await
             .map_err(ProviderManagerError::OAuthStart)?;
         let session_id = Uuid::new_v4().to_string();
-        let owner_user_id = owner_user_id.to_owned();
         let snapshot = OAuthSessionSnapshot {
             id: session_id.clone(),
             owner_user_id: owner_user_id.clone(),

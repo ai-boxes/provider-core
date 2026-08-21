@@ -97,10 +97,9 @@ impl AuthRepository for SqliteAccountRepository {
         .await;
         match result {
             Ok(InitialUserCreateOutcome::Created) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| auth_repository_error("failed to commit initial user", error))?;
+                transaction.commit().await.map_err(|error| {
+                    auth_repository_error("failed to commit initial user", error)
+                })?;
                 Ok(InitialUserCreateOutcome::Created)
             }
             Ok(outcome) => {
@@ -292,7 +291,9 @@ impl AuthRepository for SqliteAccountRepository {
             .bind(session.created_at)
             .execute(&mut *transaction)
             .await
-            .map_err(|error| auth_repository_error("failed to create registration session", error))?;
+            .map_err(|error| {
+                auth_repository_error("failed to create registration session", error)
+            })?;
             Ok(RegisterUserOutcome::Created)
         }
         .await;

@@ -109,7 +109,7 @@ impl UsageRepository for SqliteUsageRepository {
             .await
             .map_err(|error| usage_error("failed to start quota request transaction", error))?;
         let result = async {
-            let outcome = insert_logical_request(&mut *connection, start).await?;
+            let outcome = insert_logical_request(&mut connection, start).await?;
             sqlx::query(
                 r#"
                 INSERT INTO api_key_quota_ledger (
@@ -461,7 +461,7 @@ impl UsageRepository for SqliteUsageRepository {
                     })?;
                     if let Some(api_key_id) = api_key_id {
                         let cost_atoms = cost_atoms.to_string();
-                        add_api_key_spend(&mut *transaction, &api_key_id, &cost_atoms).await?;
+                        add_api_key_spend(&mut transaction, &api_key_id, &cost_atoms).await?;
                     }
                 }
             }
@@ -543,7 +543,7 @@ impl UsageRepository for SqliteUsageRepository {
                 .execute(&mut *connection)
                 .await
                 .map_err(|error| usage_error("failed to settle quota reservation", error))?;
-                add_api_key_spend(&mut *connection, &entry.api_key_id, settled_atoms).await?;
+                add_api_key_spend(&mut connection, &entry.api_key_id, settled_atoms).await?;
             } else {
                 sqlx::query(
                     r#"
@@ -654,7 +654,7 @@ impl UsageRepository for SqliteUsageRepository {
                         .map_err(|error| {
                             usage_error("failed to settle recovered quota claim", error)
                         })?;
-                        add_api_key_spend(&mut *connection, &api_key_id, &settled_atoms).await?;
+                        add_api_key_spend(&mut connection, &api_key_id, &settled_atoms).await?;
                     }
                     recovered = recovered.checked_add(1).ok_or_else(|| {
                         UsageRepositoryError::new("too many quota claims to recover")
@@ -669,9 +669,10 @@ impl UsageRepository for SqliteUsageRepository {
                     0
                 }
                 Ok(recovered) => {
-                    connection.commit().await.map_err(|error| {
-                        usage_error("failed to commit quota recovery", error)
-                    })?;
+                    connection
+                        .commit()
+                        .await
+                        .map_err(|error| usage_error("failed to commit quota recovery", error))?;
                     recovered
                 }
                 Err(error) => {
@@ -726,9 +727,10 @@ impl UsageRepository for SqliteUsageRepository {
     async fn recover_in_flight_requests(&self, now_ms: i64) -> Result<u64, UsageRepositoryError> {
         let mut total = 0_u64;
         loop {
-            let mut connection = self.write.begin().await.map_err(|error| {
-                usage_error("failed to start in-flight usage recovery", error)
-            })?;
+            let mut connection =
+                self.write.begin().await.map_err(|error| {
+                    usage_error("failed to start in-flight usage recovery", error)
+                })?;
             let result = async {
                 let rows = sqlx::query(
                     r#"
@@ -742,9 +744,7 @@ impl UsageRepository for SqliteUsageRepository {
                 .bind(RECOVERY_BATCH)
                 .fetch_all(&mut *connection)
                 .await
-                .map_err(|error| {
-                    usage_error("failed to load in-flight usage requests", error)
-                })?;
+                .map_err(|error| usage_error("failed to load in-flight usage requests", error))?;
                 if rows.is_empty() {
                     return Ok(0_u64);
                 }
@@ -776,9 +776,7 @@ impl UsageRepository for SqliteUsageRepository {
                     .bind(i64::try_from(count).expect("batch gap count fits i64"))
                     .execute(&mut *connection)
                     .await
-                    .map_err(|error| {
-                        usage_error("failed to record recovered usage gap", error)
-                    })?;
+                    .map_err(|error| usage_error("failed to record recovered usage gap", error))?;
                 }
 
                 // Same ordered LIMIT set selected above; exclusive writer keeps it stable.
@@ -824,9 +822,9 @@ impl UsageRepository for SqliteUsageRepository {
             if recovered == 0 {
                 break;
             }
-            total = total.checked_add(recovered).ok_or_else(|| {
-                UsageRepositoryError::new("in-flight usage count overflowed")
-            })?;
+            total = total
+                .checked_add(recovered)
+                .ok_or_else(|| UsageRepositoryError::new("in-flight usage count overflowed"))?;
             if recovered < RECOVERY_BATCH as u64 {
                 break;
             }

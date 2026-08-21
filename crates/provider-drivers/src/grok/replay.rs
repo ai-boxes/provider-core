@@ -1094,7 +1094,7 @@ mod tests {
         assert!(
             body["input"]
                 .as_array()
-                .unwrap()
+                .expect("input")
                 .iter()
                 .all(|item| item.get("type").and_then(Value::as_str) != Some("item_reference"))
         );

@@ -396,7 +396,10 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         let ciphertext = self
             .credential_cipher
             .encrypt(&account.id, &account.credential.credential_json)?;
-        let mut transaction = self.write.begin().await
+        let mut transaction = self
+            .write
+            .begin()
+            .await
             .map_err(|error| repository_error("failed to start account transaction", error))?;
         let result = async {
             let inserted = sqlx::query(
@@ -447,10 +450,9 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .await;
         match result {
             Ok(ProviderAccountCreateOutcome::Created) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| repository_error("failed to commit provider account", error))?;
+                transaction.commit().await.map_err(|error| {
+                    repository_error("failed to commit provider account", error)
+                })?;
                 Ok(ProviderAccountCreateOutcome::Created)
             }
             Ok(outcome) => {
@@ -682,9 +684,11 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 "discovered provider model must not be empty or contain surrounding whitespace",
             ));
         }
-        let mut transaction = self.write.begin().await.map_err(|error| {
-            repository_error("failed to start model transaction", error)
-        })?;
+        let mut transaction = self
+            .write
+            .begin()
+            .await
+            .map_err(|error| repository_error("failed to start model transaction", error))?;
         let result = async {
             let account_exists = sqlx::query("SELECT 1 FROM provider_accounts WHERE id = ?")
                 .bind(account_id.as_str())
@@ -768,9 +772,10 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         .await;
         match result {
             Ok(()) => {
-                transaction.commit().await.map_err(|error| {
-                    repository_error("failed to commit provider models", error)
-                })?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| repository_error("failed to commit provider models", error))?;
             }
             Err(error) => {
                 let _ = transaction.rollback().await;
