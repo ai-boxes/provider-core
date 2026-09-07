@@ -86,13 +86,23 @@ pub(super) fn primary_estimate<'a>(
         .starts_at
         .or_else(|| period.ends_at?.checked_sub(period.duration_seconds?))?
         .checked_mul(1000)?;
-    points.iter().find(|point| {
+    let previous = points.iter().find(|point| {
         point.group_key == group.key
             && point.metric_key == metric.key
             && (point.next_window_end_ms.is_some_and(|end| {
                 period.ends_at.and_then(|value| value.checked_mul(1000)) == Some(end)
             }) || (point.next_window_end_ms.is_none()
                 && point.window_end_ms == previous_window_end_ms))
+    });
+    previous.or_else(|| {
+        let current_window_end_ms = period.ends_at?.checked_mul(1000)?;
+        points.iter().find(|point| {
+            point.group_key == group.key
+                && point.metric_key == metric.key
+                && point.next_window_end_ms.is_none()
+                && point.window_end_ms == current_window_end_ms
+                && point.used_hundredths >= 10_000
+        })
     })
 }
 
@@ -192,6 +202,23 @@ mod tests {
         assert_eq!(estimate_json(&current)["sampling_incomplete"], true);
     }
 
+    #[test]
+    fn primary_estimate_falls_back_to_a_fully_used_current_window() {
+        let quota = quota_view(2_000, 1_000);
+        let current = estimate(1_000_000, 2_000_000);
+        assert_eq!(primary_estimate(&quota, &[current.clone()]), Some(&current));
+
+        let previous = estimate(0, 1_000_000);
+        assert_eq!(
+            primary_estimate(&quota, &[current.clone(), previous.clone()]),
+            Some(&previous)
+        );
+
+        let mut incomplete = current;
+        incomplete.used_hundredths = 9_999;
+        assert_eq!(primary_estimate(&quota, &[incomplete]), None);
+    }
+
     fn quota_view(window_end: i64, duration_seconds: i64) -> ProviderQuotaView {
         ProviderQuotaView {
             support: ProviderQuotaSupport::Supported,
@@ -241,7 +268,7 @@ mod tests {
             next_window_end_ms: None,
             sampling_incomplete: false,
             observed_at_ms: window_end_ms,
-            used_hundredths: 5_000,
+            used_hundredths: 10_000,
             observed_cost: UsdAtoms::from_atoms(20),
             estimated_limit_cost: UsdAtoms::from_atoms(40),
             completeness: QuotaEstimateCompleteness::Complete,
