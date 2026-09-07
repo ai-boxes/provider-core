@@ -439,6 +439,8 @@ fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryErr
 
 #[cfg(test)]
 mod tests {
+    mod quota_reset;
+
     use provider_core::{
         ProviderKind,
         usage::{
@@ -1642,6 +1644,59 @@ mod tests {
         assert_eq!(estimate.completeness, QuotaEstimateCompleteness::LowerBound);
         assert_eq!(estimate.priced_attempts, 2);
         assert_eq!(estimate.dispatched_attempts, 2);
+
+        for used_hundredths in [9999, 10000, 8000] {
+            sqlx::query(
+                "UPDATE provider_quota_window_observations SET used_hundredths = ? WHERE observed_at_ms = ?",
+            )
+            .bind(used_hundredths)
+            .bind(T0 + 30 * 60 * 1000)
+            .execute(&mut *repository.write.lock().await)
+            .await
+            .expect("update latest quota observation");
+            let current = repository
+                .provider_quota_estimates(
+                    &["account-1".to_owned()],
+                    TimeRange::new(T0, T0 + 30 * 60 * 1000).expect("current range"),
+                )
+                .await
+                .expect("current window estimates");
+            if used_hundredths < 10000 {
+                assert!(current.is_empty());
+            } else {
+                assert_eq!(current.len(), 1);
+                assert_eq!(current[0].window_end_ms, T0 + HOUR);
+                assert_eq!(current[0].used_hundredths, used_hundredths as u64);
+                assert_eq!(current[0].estimated_limit_cost, current[0].observed_cost);
+                assert_eq!(
+                    current[0].completeness,
+                    QuotaEstimateCompleteness::LowerBound
+                );
+                let before_observation = repository
+                    .provider_quota_estimates(
+                        &["account-1".to_owned()],
+                        TimeRange::new(T0, T0 + 29 * 60 * 1000).expect("earlier range"),
+                    )
+                    .await
+                    .expect("exclude future observation");
+                assert!(before_observation.is_empty());
+                let ended = repository
+                    .provider_quota_estimates(
+                        &["account-1".to_owned()],
+                        TimeRange::new(T0, T0 + HOUR).expect("ended range"),
+                    )
+                    .await
+                    .expect("ended exhausted window");
+                assert_eq!(ended, current);
+            }
+        }
+        sqlx::query(
+            "UPDATE provider_quota_window_observations SET used_hundredths = 5000 WHERE observed_at_ms = ?",
+        )
+        .bind(T0 + 30 * 60 * 1000)
+        .execute(&mut *repository.write.lock().await)
+        .await
+        .expect("restore quota observation");
 
         sqlx::query("UPDATE provider_credentials SET revision = 5 WHERE account_id = 'account-1'")
             .execute(&mut *repository.write.lock().await)

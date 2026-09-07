@@ -29,14 +29,34 @@ impl SqliteAccountRepository {
                 };
                 sqlx::query(
                     r#"
-                    INSERT INTO provider_quota_window_observations (
+                    WITH incoming (
                         account_id, credential_revision, credential_identity_revision,
                         observed_at_ms, group_key,
                         metric_key, metric_position, used_hundredths, period_kind,
                         starts_at_ms, ends_at_ms, duration_seconds
+                    ) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)), latest AS (
+                        SELECT o.* FROM provider_quota_window_observations o
+                        JOIN incoming i ON o.account_id = i.account_id
+                            AND o.credential_identity_revision = i.credential_identity_revision
+                            AND o.group_key = i.group_key AND o.metric_key = i.metric_key
+                        ORDER BY o.observation_sequence DESC LIMIT 1
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT DO NOTHING
+                    INSERT INTO provider_quota_window_observations (
+                        account_id, credential_revision, credential_identity_revision,
+                        observed_at_ms, group_key, metric_key, metric_position,
+                        used_hundredths, period_kind, starts_at_ms, ends_at_ms, duration_seconds
+                    )
+                    SELECT * FROM incoming
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM latest l JOIN incoming i
+                        ON l.credential_revision = i.credential_revision
+                        AND l.observed_at_ms = i.observed_at_ms
+                        AND l.metric_position = i.metric_position
+                        AND l.used_hundredths = i.used_hundredths
+                        AND l.period_kind = i.period_kind
+                        AND l.starts_at_ms = i.starts_at_ms AND l.ends_at_ms = i.ends_at_ms
+                        AND l.duration_seconds IS i.duration_seconds
+                    )
                     "#,
                 )
                 .bind(account_id.as_str())
@@ -86,10 +106,10 @@ fn quota_observation_row(metric: &QuotaMetric, observed_at_ms: i64) -> Option<Qu
         QuotaAmount::Decimal(value) => *value,
         QuotaAmount::DecimalString(value) => value.parse().ok()?,
     };
-    if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+    if !used.is_finite() || used < 0.0 {
         return None;
     }
-    let used_hundredths = (used * 100.0).round() as i64;
+    let used_hundredths = (used.min(100.0) * 100.0).round() as i64;
     let period = metric.period.as_ref()?;
     let period_kind = match period.kind {
         QuotaPeriodKind::Weekly => "weekly",
@@ -112,4 +132,43 @@ fn quota_observation_row(metric: &QuotaMetric, observed_at_ms: i64) -> Option<Qu
         ends_at_ms,
         duration_seconds: period.duration_seconds,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use provider_core::QuotaPeriod;
+
+    #[test]
+    fn exhausted_observations_are_capped_without_accepting_invalid_percentages() {
+        let mut metric = QuotaMetric {
+            key: "primary".to_owned(),
+            kind: QuotaMetricKind::Usage,
+            unit: QuotaUnit::Percent,
+            used: None,
+            remaining: None,
+            limit: None,
+            period: Some(QuotaPeriod {
+                kind: QuotaPeriodKind::Rolling,
+                starts_at: Some(100),
+                ends_at: Some(300),
+                duration_seconds: Some(200),
+            }),
+            breakdown: Vec::new(),
+        };
+        for (used, expected) in [
+            (99.99, Some(9999)),
+            (100.0, Some(10000)),
+            (125.0, Some(10000)),
+            (-1.0, None),
+            (f64::NAN, None),
+            (f64::INFINITY, None),
+        ] {
+            metric.used = Some(QuotaAmount::Decimal(used));
+            assert_eq!(
+                quota_observation_row(&metric, 200_000).map(|row| row.used_hundredths),
+                expected
+            );
+        }
+    }
 }

@@ -37,7 +37,7 @@ struct CapturedRequest {
 }
 
 async fn models() -> &'static str {
-    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"gpt-reserve","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.153.0","use_responses_lite":true}]}"#
 }
 
 async fn responses(State(state): State<CodexUpstreamState>, request: Request) -> Response<Body> {
@@ -219,6 +219,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert!(model_ids.contains(&"gpt-5.6-sol"));
     assert!(model_ids.contains(&"gpt-5.6-luna"));
     assert!(!model_ids.contains(&"codex-auto-review"));
+    assert!(!model_ids.contains(&"gpt-reserve"));
 
     let responses_body = client
         .post(format!("{server_url}/v1/responses"))
@@ -318,6 +319,16 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .expect("codex-auto-review response");
     assert_eq!(auto_review_response.status(), StatusCode::OK);
 
+    let reserve_response = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({ "model": "gpt-reserve", "stream": true, "input": "hello" }).to_string())
+        .send()
+        .await
+        .expect("gpt-reserve response");
+    assert_eq!(reserve_response.status(), StatusCode::OK);
+
     let unauthorized = client
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
@@ -334,7 +345,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .await
         .expect("unauthorized request");
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 7);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 8);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let rate_limited = client
@@ -356,7 +367,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     )
     .expect("rate limited response JSON");
     assert_eq!(rate_limited["error"]["type"], "rate_limit_error");
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 8);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 9);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let requests = upstream_state
@@ -386,9 +397,11 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[4].body["input"][0]["type"], "additional_tools");
     assert_eq!(requests[4].body["input"][0]["tools"][0]["name"], "exec");
     assert_eq!(requests[4].body["input"][1]["role"], "developer");
-    assert_eq!(requests[5].authorization, "Bearer old-access");
-    assert_eq!(requests[6].authorization, "Bearer new-access");
+    assert!(requests[5].responses_lite);
+    assert_eq!(requests[5].body["model"], "gpt-reserve");
+    assert_eq!(requests[6].authorization, "Bearer old-access");
     assert_eq!(requests[7].authorization, "Bearer new-access");
+    assert_eq!(requests[8].authorization, "Bearer new-access");
     drop(requests);
 
     runtime.shutdown();

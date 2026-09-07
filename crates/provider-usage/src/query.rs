@@ -32,6 +32,8 @@ pub struct QuotaLimitEstimatePoint {
     pub duration_seconds: Option<i64>,
     pub window_start_ms: i64,
     pub window_end_ms: i64,
+    pub next_window_end_ms: Option<i64>,
+    pub sampling_incomplete: bool,
     pub observed_at_ms: i64,
     pub used_hundredths: u64,
     pub observed_cost: UsdAtoms,

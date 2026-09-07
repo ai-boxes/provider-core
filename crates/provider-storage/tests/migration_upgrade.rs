@@ -172,7 +172,7 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
     sqlx::query(
         r#"
@@ -308,7 +308,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     drop(connection);
     // The whole directory: SQLite leaves -wal and -shm beside the database.
     let _ = std::fs::remove_dir_all(directory);

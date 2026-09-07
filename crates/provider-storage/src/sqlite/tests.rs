@@ -221,6 +221,24 @@ async fn provider_quota_observations_are_normalized_and_deduplicated() {
     assert_eq!(row.get::<i64, _>("credential_identity_revision"), 0);
     assert_eq!(row.get::<i64, _>("used_hundredths"), 3725);
     assert_eq!(row.get::<i64, _>("starts_at_ms"), 100_000);
+    let mut changed = observation.clone();
+    changed.groups[0].metrics[0].used = Some(QuotaAmount::Integer(0));
+    repository
+        .record_provider_quota_observation(&account_id, 0, &changed)
+        .await
+        .expect("same-second change");
+    repository
+        .record_provider_quota_observation(&account_id, 0, &changed)
+        .await
+        .expect("same-second duplicate");
+    repository
+        .record_provider_quota_observation(&account_id, 0, &observation)
+        .await
+        .expect("same-second return to previous value");
+    let values: Vec<i64> = sqlx::query_scalar(
+        "SELECT used_hundredths FROM provider_quota_window_observations ORDER BY observation_sequence",
+    ).fetch_all(&repository.pool).await.expect("ordered observations");
+    assert_eq!(values, vec![3725, 0, 3725]);
 }
 
 #[tokio::test]

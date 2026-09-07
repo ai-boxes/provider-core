@@ -107,9 +107,7 @@ fn normalize_models(
                 } else {
                     RESPONSES
                 };
-                let visible_for_routing =
-                    model.visibility.as_deref() == Some("list") || id == "codex-auto-review";
-                let routable = visible_for_routing
+                let routable = matches!(model.visibility.as_deref(), Some("list" | "hide"))
                     && model.supported_in_api
                     && compatible
                     && inference_contract.status.allows_production_routing();
@@ -398,6 +396,13 @@ mod tests {
                     "supported_in_api": true,
                     "minimal_client_version": "0.98.0",
                     "use_responses_lite": true
+                },
+                {
+                    "slug": "gpt-reserve",
+                    "visibility": "hide",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.153.0",
+                    "use_responses_lite": true
                 }
             ]
         }))
@@ -443,6 +448,7 @@ mod tests {
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
         assert!(model(&models, "codex-auto-review").routable);
+        assert!(model(&models, "gpt-reserve").routable);
     }
 
     #[test]
