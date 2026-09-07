@@ -82,28 +82,45 @@ pub(super) fn primary_estimate<'a>(
         metric.kind == QuotaMetricKind::Usage && metric.unit == QuotaUnit::Percent
     })?;
     let period = metric.period.as_ref()?;
-    let previous_window_end_ms = period
+    let current_window_start_ms = period
         .starts_at
         .or_else(|| period.ends_at?.checked_sub(period.duration_seconds?))?
         .checked_mul(1000)?;
-    let previous = points.iter().find(|point| {
+    let matching = |point: &&QuotaLimitEstimatePoint| {
         point.group_key == group.key
             && point.metric_key == metric.key
-            && (point.next_window_end_ms.is_some_and(|end| {
+            && point.period_kind == period_kind(period.kind)
+            && point.duration_seconds == period.duration_seconds
+    };
+    let previous = points
+        .iter()
+        .filter(matching)
+        .filter(|point| {
+            point.next_window_end_ms.is_some_and(|end| {
                 period.ends_at.and_then(|value| value.checked_mul(1000)) == Some(end)
             }) || (point.next_window_end_ms.is_none()
-                && point.window_end_ms == previous_window_end_ms))
-    });
+                && point.window_end_ms <= current_window_start_ms
+                && current_window_start_ms.saturating_sub(point.window_end_ms)
+                    <= 5 * 60 * 1000)
+        })
+        .max_by_key(|point| point.window_end_ms);
     previous.or_else(|| {
         let current_window_end_ms = period.ends_at?.checked_mul(1000)?;
-        points.iter().find(|point| {
-            point.group_key == group.key
-                && point.metric_key == metric.key
-                && point.next_window_end_ms.is_none()
+        points.iter().filter(matching).find(|point| {
+            point.next_window_end_ms.is_none()
                 && point.window_end_ms == current_window_end_ms
                 && point.used_hundredths >= 10_000
         })
     })
+}
+
+fn period_kind(kind: provider_core::QuotaPeriodKind) -> &'static str {
+    match kind {
+        provider_core::QuotaPeriodKind::Weekly => "weekly",
+        provider_core::QuotaPeriodKind::Monthly => "monthly",
+        provider_core::QuotaPeriodKind::Rolling => "rolling",
+        provider_core::QuotaPeriodKind::Unknown => "unknown",
+    }
 }
 
 pub(super) fn estimate_json(point: &QuotaLimitEstimatePoint) -> Value {
@@ -207,6 +224,18 @@ mod tests {
         let quota = quota_view(2_000, 1_000);
         let current = estimate(1_000_000, 2_000_000);
         assert_eq!(primary_estimate(&quota, &[current.clone()]), Some(&current));
+
+        let near_previous = estimate(0, 790_000);
+        let mut wrong_period = near_previous.clone();
+        wrong_period.period_kind = "weekly".to_owned();
+        wrong_period.duration_seconds = Some(604_800);
+        assert_eq!(
+            primary_estimate(
+                &quota,
+                &[current.clone(), wrong_period, near_previous.clone()],
+            ),
+            Some(&near_previous)
+        );
 
         let previous = estimate(0, 1_000_000);
         assert_eq!(
