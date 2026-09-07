@@ -27,6 +27,9 @@ impl TestPublicDir {
         fs::create_dir(&path).expect("create UI test directory");
         fs::write(path.join("index.html"), "<main>provider ui</main>").expect("write UI index");
         fs::write(path.join("app.js"), "console.log('provider ui')").expect("write UI asset");
+        fs::create_dir(path.join("assets")).expect("create UI assets directory");
+        fs::write(path.join("assets/app-HASH.js"), "console.log('hashed')")
+            .expect("write hashed UI asset");
         Self(path)
     }
 }
@@ -60,7 +63,24 @@ async fn serves_ui_assets_and_browser_routes() {
         .await
         .expect("infallible asset response");
     assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(asset.headers()[header::CACHE_CONTROL], "no-cache");
     assert_eq!(response_text(asset).await, "console.log('provider ui')");
+
+    let hashed_asset = service
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app-HASH.js")
+                .body(Body::empty())
+                .expect("hashed asset request"),
+        )
+        .await
+        .expect("infallible hashed asset response");
+    assert_eq!(hashed_asset.status(), StatusCode::OK);
+    assert_eq!(
+        hashed_asset.headers()[header::CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
 
     let browser_route = service
         .oneshot(
@@ -73,6 +93,7 @@ async fn serves_ui_assets_and_browser_routes() {
         .await
         .expect("infallible browser route response");
     assert_eq!(browser_route.status(), StatusCode::OK);
+    assert_eq!(browser_route.headers()[header::CACHE_CONTROL], "no-cache");
     assert_eq!(
         response_text(browser_route).await,
         "<main>provider ui</main>"
@@ -110,6 +131,7 @@ async fn keeps_backend_and_non_browser_misses_as_not_found() {
         .await
         .expect("infallible non-browser response");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 }
 
 #[tokio::test]

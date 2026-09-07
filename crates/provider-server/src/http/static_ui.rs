@@ -35,8 +35,14 @@ async fn serve_ui(
 
     let accepts_html = accepts_html(request.headers());
     let method = request.method().clone();
-    let response = into_axum_response(files.oneshot(request).await);
-    if response.status() != StatusCode::NOT_FOUND || !accepts_html {
+    let path = request.uri().path().to_owned();
+    let mut response = into_axum_response(files.oneshot(request).await);
+    if response.status() != StatusCode::NOT_FOUND {
+        apply_cache_policy(&mut response, &path, false);
+        return Ok(response);
+    }
+    if !accepts_html {
+        apply_cache_policy(&mut response, &path, false);
         return Ok(response);
     }
 
@@ -45,9 +51,25 @@ async fn serve_ui(
         .uri("/")
         .body(Body::empty())
         .expect("static fallback request is valid");
-    Ok(into_axum_response(
-        ServeFile::new(index).oneshot(request).await,
-    ))
+    let mut response = into_axum_response(ServeFile::new(index).oneshot(request).await);
+    apply_cache_policy(&mut response, &path, true);
+    Ok(response)
+}
+
+fn apply_cache_policy(response: &mut Response, path: &str, browser_fallback: bool) {
+    let value = if response.status() == StatusCode::NOT_FOUND {
+        "no-store"
+    } else if browser_fallback || path == "/" || path.ends_with(".html") {
+        "no-cache"
+    } else if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        value.parse().expect("valid cache policy"),
+    );
 }
 
 fn into_axum_response<T>(response: Result<T, Infallible>) -> Response
