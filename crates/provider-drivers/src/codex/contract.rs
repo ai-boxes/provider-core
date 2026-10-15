@@ -30,11 +30,11 @@ const ENDPOINTS: &[OfficialClientEndpointContract] = &[
 ];
 
 pub(crate) const BASELINE: OfficialClientBaseline = OfficialClientBaseline {
-    profile_id: "codex-rust-v0.155.0",
+    profile_id: "codex-rust-v0.162.1",
     official_client: "Codex CLI",
     reference_repository: "../../agent/codex",
-    reference_commit: "f0a1b8f0849d90960bc406b848f32e5a129b0457",
-    simulated_client_version: "0.155.0",
+    reference_commit: "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
+    simulated_client_version: "0.162.1",
     endpoint_contracts: ENDPOINTS,
 };
 
@@ -53,14 +53,14 @@ mod tests {
 
     #[test]
     fn baseline_and_endpoint_inventory_are_explicit() {
-        assert_eq!(BASELINE.profile_id, "codex-rust-v0.155.0");
+        assert_eq!(BASELINE.profile_id, "codex-rust-v0.162.1");
         assert_eq!(BASELINE.official_client, "Codex CLI");
         assert_eq!(BASELINE.reference_repository, "../../agent/codex");
         assert_eq!(
             BASELINE.reference_commit,
-            "f0a1b8f0849d90960bc406b848f32e5a129b0457"
+            "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d"
         );
-        assert_eq!(BASELINE.simulated_client_version, "0.155.0");
+        assert_eq!(BASELINE.simulated_client_version, "0.162.1");
 
         let ids = BASELINE
             .endpoint_contracts

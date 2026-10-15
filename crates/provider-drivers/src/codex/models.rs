@@ -332,12 +332,12 @@ mod tests {
             .expect("capture lock")
             .clone()
             .expect("captured models request");
-        assert_eq!(uri, "/backend-api/codex/models?client_version=0.155.0");
+        assert_eq!(uri, "/backend-api/codex/models?client_version=0.162.1");
         assert_eq!(header(&headers, "authorization"), "Bearer access-token");
         assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
         assert_eq!(header(&headers, "x-openai-fedramp"), "true");
         assert_eq!(header(&headers, "originator"), "codex_cli_rs");
-        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.155.0 ("));
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.162.1 ("));
         assert!(headers.get("version").is_none());
     }
 
@@ -388,10 +388,36 @@ mod tests {
                     "use_responses_lite": true
                 },
                 {
+                    "slug": "gpt-6.1-sol",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.153.0",
+                    "use_responses_lite": true,
+                    "prefer_websockets": true
+                },
+                {
+                    "slug": "current-string-version",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.162.1"
+                },
+                {
+                    "slug": "current-tuple-version",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": [0, 162, 1]
+                },
+                {
                     "slug": "future",
                     "visibility": "list",
                     "supported_in_api": true,
-                    "minimal_client_version": "0.156.0"
+                    "minimal_client_version": "0.162.2"
+                },
+                {
+                    "slug": "future-tuple-version",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": [0, 162, 2]
                 },
                 {
                     "slug": "invalid-version",
@@ -435,7 +461,7 @@ mod tests {
                 "status": "verified"
             })
         );
-        for slug in ["gpt-6-sol", "gpt-6-luna"] {
+        for slug in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
             let discovered = model(&models, slug);
             assert!(discovered.routable);
             let metadata: Value =
@@ -471,7 +497,10 @@ mod tests {
                 "status": "verified"
             })
         );
+        assert!(model(&models, "current-string-version").routable);
+        assert!(model(&models, "current-tuple-version").routable);
         assert!(!model(&models, "future").routable);
+        assert!(!model(&models, "future-tuple-version").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
         assert!(model(&models, "codex-auto-review").routable);
