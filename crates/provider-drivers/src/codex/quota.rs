@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(header(&headers, "authorization"), "Bearer access-token");
         assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
         assert_eq!(header(&headers, "x-openai-fedramp"), "true");
-        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.155.0 ("));
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.162.1 ("));
         assert!(headers.get("originator").is_none());
     }
 

@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(header(&headers, "originator"), "codex_cli_rs");
         assert!(
             header(&headers, reqwest::header::USER_AGENT.as_str())
-                .starts_with("codex_cli_rs/0.155.0 (")
+                .starts_with("codex_cli_rs/0.162.1 (")
         );
         let body: serde_json::Value = serde_json::from_slice(&body).expect("refresh request JSON");
         assert_eq!(

@@ -51,6 +51,13 @@ Failure logs include request ID, model, protocol, stage, and status, but do
 not log upstream error bodies. This contract covers inference HTTP rejection
 responses; OAuth, quota queries, and SSE error envelopes are not unified by it.
 
+## Codex OAuth model discovery
+
+Codex OAuth accounts discover their models using the verified Codex CLI
+`0.162.1` identity, including `gpt-6.1-sol` when the upstream lists it for that
+account. Deploy and restart the upgraded backend to refresh enabled accounts'
+model catalogs. Account catalogs can also be refreshed from the management UI.
+
 ## OpenAI-compatible upstreams
 
 Inbound `x-opencode-session` metadata is validated and preserved for

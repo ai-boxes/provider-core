@@ -462,7 +462,7 @@ mod tests {
         assert!(headers.get("version").is_none());
         assert!(
             header(headers, reqwest::header::USER_AGENT.as_str())
-                .starts_with("codex_cli_rs/0.155.0 (")
+                .starts_with("codex_cli_rs/0.162.1 (")
         );
         let session_id = header(headers, "session-id");
         assert_eq!(session_id, "session-1");
