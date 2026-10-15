@@ -36,8 +36,9 @@ struct CapturedRequest {
     body: Value,
 }
 
-async fn models() -> &'static str {
-    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"gpt-reserve","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.153.0","use_responses_lite":true}]}"#
+async fn models(request: Request) -> &'static str {
+    assert_eq!(request.uri().query(), Some("client_version=0.162.1"));
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"gpt-reserve","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.153.0","use_responses_lite":true},{"slug":"gpt-6.1-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.153.0","use_responses_lite":true,"prefer_websockets":true}]}"#
 }
 
 async fn responses(State(state): State<CodexUpstreamState>, request: Request) -> Response<Body> {
@@ -218,6 +219,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert!(model_ids.contains(&"gpt-5.4"));
     assert!(model_ids.contains(&"gpt-5.6-sol"));
     assert!(model_ids.contains(&"gpt-5.6-luna"));
+    assert!(model_ids.contains(&"gpt-6.1-sol"));
     assert!(!model_ids.contains(&"codex-auto-review"));
     assert!(!model_ids.contains(&"gpt-reserve"));
 
@@ -370,6 +372,21 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 9);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
+    let sol_response = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({ "model": "gpt-6.1-sol", "stream": true, "input": "hello" }).to_string())
+        .send()
+        .await
+        .expect("GPT-6.1 Sol response");
+    assert_eq!(sol_response.status(), StatusCode::OK);
+    let sol_body = sol_response.text().await.expect("GPT-6.1 Sol SSE");
+    assert!(sol_body.contains("response.output_text.delta"));
+    assert!(sol_body.contains("response.completed"));
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 10);
+    assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
+
     let requests = upstream_state
         .requests
         .lock()
@@ -402,6 +419,11 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[6].authorization, "Bearer old-access");
     assert_eq!(requests[7].authorization, "Bearer new-access");
     assert_eq!(requests[8].authorization, "Bearer new-access");
+    assert!(requests[9].responses_lite);
+    assert_eq!(requests[9].body["model"], "gpt-6.1-sol");
+    assert_eq!(requests[9].body["parallel_tool_calls"], false);
+    assert_eq!(requests[9].body["reasoning"]["context"], "all_turns");
+    assert_eq!(requests[9].body["input"][0]["type"], "additional_tools");
     drop(requests);
 
     runtime.shutdown();
